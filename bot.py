@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import traceback
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -29,6 +30,7 @@ from tools_project import inspect_project, project_structure
 from tools_check import safe_code_check
 from tools_system import get_allowed_services, read_journal
 from tools_preview import list_previews, preview_status, start_preview, stop_preview
+from tools_errors import error_summary, latest_error, mask_error_text, save_last_error
 from tools_write import (
     create_flask_site,
     create_static_site,
@@ -60,8 +62,8 @@ class SecretMaskingLogFilter(logging.Filter):
 for handler in logging.getLogger().handlers:
     handler.addFilter(SecretMaskingLogFilter())
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.0.145:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
@@ -346,6 +348,24 @@ def summarize_project_with_ollama(data: dict) -> str:
     return summary
 
 
+def pending_task_for_text(user_text: str) -> str | None:
+    lowered = user_text.lower()
+    has_create_intent = any(phrase in lowered for phrase in CREATE_PROJECT_PHRASES) or (
+        "в папке" in lowered and any(word in lowered for word in ("создай", "сделай"))
+    )
+    if has_create_intent:
+        return "create_workspace_project"
+    if any(phrase in lowered for phrase in EDIT_PROJECT_PHRASES):
+        return "edit_workspace_project"
+    if any(phrase in lowered for phrase in ("проверь код", "есть ли ошибка", "ошибки в проекте", "проверь проект", "check project")):
+        return "safe_code_check"
+    if any(phrase in lowered for phrase in ("посмотри проект", "изучи проект", "изучи код", "на чем остановились", "на чём остановились")):
+        return "inspect_project"
+    if any(phrase in lowered for phrase in ("preview", "превью", "запусти сайт", "запусти проект")):
+        return "preview"
+    return None
+
+
 def answer_user_text(
     user_text: str,
     use_agent: bool,
@@ -526,6 +546,53 @@ async def reply_long(message, text: str, limit: int = 4000):
 
     for start in range(0, len(text), limit):
         await message.reply_text(text[start : start + limit])
+
+
+async def progress(message, text: str):
+    safe_text = mask_error_text(text)[:900]
+    logging.info("progress %s", safe_text)
+    if message:
+        await message.reply_text(safe_text)
+
+
+def _error_context(update: Update | None) -> tuple[str, str, str]:
+    if not update:
+        return "", "", ""
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+    user_id = str(update.effective_user.id) if update.effective_user else ""
+    user_text = ""
+    if update.effective_message and getattr(update.effective_message, "text", None):
+        user_text = update.effective_message.text or ""
+    return chat_id, user_id, user_text
+
+
+async def _report_handler_error(
+    *,
+    update: Update | None,
+    handler: str,
+    error: BaseException,
+    user_text: str = "",
+) -> dict:
+    chat_id, user_id, detected_text = _error_context(update)
+    if not user_text:
+        user_text = detected_text
+    tb_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    saved = save_last_error(
+        chat_id=chat_id,
+        user_id=user_id,
+        handler=handler,
+        error=error,
+        user_text=user_text,
+        tb_text=tb_text,
+    )
+    logging.error("jarvis_handler_error %s\n%s", saved["error_type"], saved["traceback"])
+    message = update.effective_message if update and update.effective_message else None
+    if message:
+        try:
+            await message.reply_text(f"Ошибка Jarvis: {saved['error_type']}. Детали сохранены в /last_error")
+        except Exception:
+            logging.exception("failed_to_send_error_message")
+    return saved
 
 
 async def roots(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1026,6 +1093,36 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка /logs: {e}")
 
 
+async def bot_logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    try:
+        result = read_journal("jarvis-bot", lines=80)
+        await reply_long(update.message, mask_error_text(result["output"] or "journal пустой"))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /bot_logs: {e}")
+
+
+async def last_error_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    item = latest_error(chat_id)
+    if not item:
+        await update.message.reply_text("Ошибок нет.")
+        return
+    lines = [
+        f"timestamp: {item.get('timestamp')}",
+        f"handler: {item.get('handler')}",
+        f"error_type: {item.get('error_type')}",
+        f"error_message: {item.get('error_message')}",
+        f"user_text: {item.get('user_text') or '-'}",
+        "traceback:",
+        item.get("traceback") or "-",
+    ]
+    await reply_long(update.message, "\n".join(lines))
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -1056,6 +1153,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/preview_info <name> - как открыть/запустить проект",
                 "/workspace_tree [name] - дерево workspace или проекта",
                 "/logs <service> - последние 80 строк journal",
+                "/bot_logs - последние 80 строк journal jarvis-bot",
+                "/last_error - последняя ошибка Jarvis для этого чата",
                 "/memory - сохраненная память",
                 "/remember <text> - сохранить факт",
                 "/forget <key> - удалить memory",
@@ -1065,6 +1164,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/status - Ollama/STT/TTS/agent status",
                 "/agent_on, /agent_off - read-only agent mode",
                 "/agent_debug_on, /agent_debug_off - debug intent routing",
+                "/debug_on, /debug_off - aliases for debug mode",
                 "/debug_last_intent - последний intent",
                 "/tts_test - проверить TTS",
                 "/patch, /apply_patch, /test, /deploy - отключены на read-only этапе",
@@ -1193,13 +1293,23 @@ async def agent_debug_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Agent debug: off")
 
 
+async def debug_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await agent_debug_on(update, context)
+
+
+async def debug_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await agent_debug_off(update, context)
+
+
 async def debug_last_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await reply_long(update.message, str(context.user_data.get("last_intent") or "intent еще не распознавался"))
 
 
-async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, debug_info: dict):
+async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, debug_info: dict | None):
+    if debug_info is None or not isinstance(debug_info, dict):
+        debug_info = {}
     context.user_data["last_intent"] = debug_info
     if not context.user_data.get("agent_debug"):
         return
@@ -1208,11 +1318,13 @@ async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, d
         "intent debug:",
         f"detected_intent: {detected.get('intent')}",
         f"current_project: {debug_info.get('current_project') or debug_info.get('project') or detected.get('project') or '-'}",
+        f"pending_task: {debug_info.get('pending_task') or '-'}",
         f"resolved_path: {debug_info.get('resolved_path') or debug_info.get('project_data', {}).get('path') or '-'}",
         f"tools_called: {', '.join(debug_info.get('tools_called') or []) or '-'}",
         f"errors: {'; '.join(debug_info.get('errors') or []) or '-'}",
     ]
-    await message.reply_text("\n".join(lines))
+    if message:
+        await message.reply_text("\n".join(lines))
 
 
 def _check_ollama() -> str:
@@ -1254,9 +1366,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         roots_info = allowed_roots_info()
+        errors = error_summary()
+        try:
+            previews = list_previews()
+            previews_count = previews["count"]
+        except Exception:
+            previews_count = "unknown"
         text = "\n".join(
             [
                 "Jarvis status:",
+                "Polling ok: yes",
                 f"Ollama: {_check_ollama()}",
                 f"Ollama URL: {OLLAMA_URL}",
                 f"Ollama model: {MODEL}",
@@ -1272,7 +1391,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Write mode enabled: {config.env_bool('WRITE_MODE_ENABLED', config.WRITE_MODE_ENABLED)}",
                 f"Write root: {config.get_write_root()}",
                 f"Preview ports: {config.PREVIEW_PORT_MIN}..{config.PREVIEW_PORT_MAX}",
+                f"Previews count: {previews_count}",
                 f"Server host: {config.SERVER_HOST}",
+                f"Last errors count: {errors['count']}",
+                f"Last error: {errors['last_timestamp'] or '-'} {errors['last_type'] or ''}".strip(),
                 f"Allowed services: {', '.join(get_allowed_services())}",
                 "Allowed roots:",
                 *[f"- {root}" for root in roots_info["allowed_roots"]],
@@ -1323,38 +1445,58 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
 
-    user_text = update.message.text
-    chat_id, user_id = chat_user_ids(update)
-    recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
-    message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
-    use_agent = bool(context.user_data.get("agent_enabled"))
-
+    user_text = ""
+    debug_info = {"detected": {"intent": "unknown"}, "tools_called": [], "errors": []}
     try:
-        answer, debug_info = answer_user_text(
-            user_text,
-            use_agent,
-            chat_id=chat_id,
-            recent_messages=recent,
-            debug=bool(context.user_data.get("agent_debug")),
-        )
-    except requests.exceptions.ConnectionError:
-        answer = (
-            "Не могу подключиться к Ollama на AI-ПК.\n\n"
-            f"Проверь с сервера:\n"
-            f"curl {OLLAMA_URL}/api/version\n\n"
-            "Возможные причины: Windows-ПК выключен/уснул, сменился IP, "
-            "Ollama не запущена или firewall блокирует порт 11434."
-        )
-    except requests.exceptions.Timeout:
-        answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
-    except Exception as e:
-        answer = f"Ошибка обращения к Ollama: {e}"
-        debug_info = {"detected": {"intent": "error"}, "tools_called": [], "errors": [str(e)]}
+        user_text = update.message.text or ""
+        chat_id, user_id = chat_user_ids(update)
+        recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
+        message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
+        use_agent = bool(context.user_data.get("agent_enabled"))
+        pending_task = pending_task_for_text(user_text)
+        debug_info["pending_task"] = pending_task
 
-    await maybe_send_intent_debug(update.message, context, debug_info)
-    memory.save_message(chat_id, user_id, "assistant", answer, "text")
-    memory.save_memory_candidates(user_text, answer, message_id)
-    await reply_long(update.message, answer)
+        if pending_task:
+            await progress(update.message, f"Принял задачу: {pending_task}")
+            await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
+            await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")
+
+        try:
+            answer, debug_info = answer_user_text(
+                user_text,
+                use_agent,
+                chat_id=chat_id,
+                recent_messages=recent,
+                debug=bool(context.user_data.get("agent_debug")),
+            )
+            if not isinstance(debug_info, dict):
+                debug_info = {}
+            debug_info.setdefault("pending_task", pending_task)
+        except requests.exceptions.ConnectionError as e:
+            save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
+            answer = (
+                "Не могу подключиться к Ollama на AI-ПК.\n\n"
+                f"Проверь с сервера:\n"
+                f"curl {OLLAMA_URL}/api/version\n\n"
+                "Возможные причины: Windows-ПК выключен/уснул, сменился IP, "
+                "Ollama не запущена или firewall блокирует порт 11434."
+            )
+            debug_info = {"detected": {"intent": "connection_error"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
+        except requests.exceptions.Timeout as e:
+            save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
+            answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
+            debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
+
+        if pending_task:
+            await progress(update.message, "Шаг 3/4: проверяю результат...")
+            await progress(update.message, "Шаг 4/4: готовлю ответ...")
+
+        await maybe_send_intent_debug(update.message, context, debug_info)
+        memory.save_message(chat_id, user_id, "assistant", answer, "text")
+        memory.save_memory_candidates(user_text, answer, message_id)
+        await reply_long(update.message, answer)
+    except Exception as e:
+        await _report_handler_error(update=update, handler="handle_text", error=e, user_text=user_text)
 
 
 async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1362,6 +1504,8 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     message = update.message
+    recognized_text = ""
+    chat_id, user_id = chat_user_ids(update)
 
     try:
         if message.voice:
@@ -1397,12 +1541,16 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text("🎙 Не смог распознать голосовое сообщение.")
             return
 
-        chat_id, user_id = chat_user_ids(update)
         message_id = memory.save_message(chat_id, user_id, "user", recognized_text, "voice")
         await message.reply_text(f"🎙 Распознал:\n{memory.mask_secrets(recognized_text)[:1000]}")
 
         use_agent = bool(context.user_data.get("agent_enabled"))
         recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
+        pending_task = pending_task_for_text(recognized_text)
+        if pending_task:
+            await progress(message, f"Принял задачу: {pending_task}")
+            await progress(message, "Шаг 1/4: определяю проект и контекст...")
+            await progress(message, "Шаг 2/4: вызываю безопасные tools...")
         answer, debug_info = answer_user_text(
             recognized_text,
             use_agent,
@@ -1410,6 +1558,10 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
             recent_messages=recent,
             debug=bool(context.user_data.get("agent_debug")),
         )
+        if pending_task:
+            debug_info["pending_task"] = pending_task
+            await progress(message, "Шаг 3/4: проверяю результат...")
+            await progress(message, "Шаг 4/4: готовлю ответ...")
         await maybe_send_intent_debug(message, context, debug_info)
         memory.save_message(chat_id, user_id, "assistant", answer, "voice")
         memory.save_memory_candidates(recognized_text, answer, message_id)
@@ -1427,21 +1579,30 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
                 voice_path.unlink(missing_ok=True)
 
     except requests.exceptions.ConnectionError as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_voice_or_audio", error=e, user_text=recognized_text)
         await message.reply_text(
             "Ошибка STT/Ollama: не могу подключиться к локальному сервису.\n\n"
             f"STT: {STT_URL}\n"
             f"Ollama: {OLLAMA_URL}\n\n"
             f"Детали: {e}"
         )
-    except requests.exceptions.Timeout:
+    except requests.exceptions.Timeout as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_voice_or_audio", error=e, user_text=recognized_text)
         await message.reply_text("STT/Ollama не ответили вовремя.")
     except Exception as e:
-        await message.reply_text(f"Ошибка обработки голосового сообщения: {e}")
+        await _report_handler_error(update=update, handler="handle_voice_or_audio", error=e, user_text=recognized_text)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error or RuntimeError("Unknown Telegram application error")
+    tg_update = update if isinstance(update, Update) else None
+    await _report_handler_error(update=tg_update, handler="telegram_error_handler", error=error)
 
 
 def main():
     memory.init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -1467,6 +1628,8 @@ def main():
     app.add_handler(CommandHandler("preview_info", preview_info_command))
     app.add_handler(CommandHandler("workspace_tree", workspace_tree_command))
     app.add_handler(CommandHandler("logs", logs_command))
+    app.add_handler(CommandHandler("bot_logs", bot_logs_command))
+    app.add_handler(CommandHandler("last_error", last_error_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("forget", forget_command))
@@ -1478,6 +1641,8 @@ def main():
     app.add_handler(CommandHandler("agent_off", agent_off))
     app.add_handler(CommandHandler("agent_debug_on", agent_debug_on))
     app.add_handler(CommandHandler("agent_debug_off", agent_debug_off))
+    app.add_handler(CommandHandler("debug_on", debug_on))
+    app.add_handler(CommandHandler("debug_off", debug_off))
     app.add_handler(CommandHandler("debug_last_intent", debug_last_intent))
     app.add_handler(CommandHandler("tts_test", tts_test))
     app.add_handler(CommandHandler("patch", disabled_write_command))

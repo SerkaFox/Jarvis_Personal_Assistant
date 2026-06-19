@@ -11,6 +11,7 @@ models/
 data/*.db
 data/*.db-*
 data/previews.json
+data/last_errors.json
 workspace/
 jarvis_workspace/
 *.pid

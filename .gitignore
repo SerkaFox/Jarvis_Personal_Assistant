@@ -12,6 +12,7 @@ data/*.db
 data/*.db-*
 data/previews.json
 data/last_errors.json
+data/last_actions.json
 workspace/
 jarvis_workspace/
 *.pid

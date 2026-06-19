@@ -51,6 +51,29 @@ CHECK_PHRASES = (
     "check project",
 )
 
+WORKSPACE_WHERE_PHRASES = (
+    "где сайт",
+    "где папка",
+    "по какому адресу",
+    "где ты создал",
+    "я не вижу сайт",
+    "не создал папку",
+)
+
+WORKSPACE_PREVIEW_PHRASES = (
+    "на каком сервере",
+    "ты запустил сервер",
+    "запустил сервер",
+    "где сервер",
+)
+
+CREATE_WORKSPACE_PHRASES = (
+    "создай сайт",
+    "создай проект",
+    "создай страницу",
+    "сделай лендинг",
+)
+
 PROJECT_ALIASES = {
     "anna": (
         "anna",
@@ -114,12 +137,40 @@ def _project_from_context(
     return extract_mentioned_project(text) or current_project or _last_project_from_history(recent_messages or [])
 
 
+def _workspace_name_from_text(text: str) -> str | None:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", text)
+    stop = {
+        "create",
+        "project",
+        "site",
+        "landing",
+        "new",
+        "test",
+        "preview",
+        "server",
+    }
+    candidates = [word for word in words if word.lower() not in stop]
+    return candidates[-1] if candidates else None
+
+
 def detect_intent(
     text: str,
     recent_messages: list[dict[str, Any]] | None = None,
     current_project: str | None = None,
 ) -> dict[str, Any]:
     lowered = text.lower()
+
+    if any(phrase in lowered for phrase in CREATE_WORKSPACE_PHRASES):
+        project = _workspace_name_from_text(text)
+        if any(word in lowered for word in ("сервер", "preview", "превью")):
+            return {"intent": "create_and_preview", "project": project}
+        return {"intent": "create_site", "project": project}
+
+    if any(phrase in lowered for phrase in WORKSPACE_PREVIEW_PHRASES):
+        return {"intent": "preview_status", "project": _workspace_name_from_text(text)}
+
+    if any(phrase in lowered for phrase in WORKSPACE_WHERE_PHRASES):
+        return {"intent": "where_project", "project": _workspace_name_from_text(text)}
 
     if any(phrase in lowered for phrase in CHECK_PHRASES):
         project = _project_from_context(text, recent_messages, current_project)

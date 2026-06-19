@@ -127,7 +127,7 @@ def start_preview(project_name: str) -> dict[str, Any]:
     registry = _cleanup_stale(_load_registry())
     existing = registry.get(name)
     if existing and _is_own_preview_process(existing):
-        return {**existing, "already_running": True}
+        return {**existing, "success": True, "already_running": True}
 
     port = _select_port()
     env = {**os.environ, "PORT": str(port)}

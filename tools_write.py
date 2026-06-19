@@ -554,6 +554,10 @@ def verify_static_site(project_name: str) -> dict[str, Any]:
     }
 
 
+def verify_project_files(project_name: str) -> dict[str, Any]:
+    return verify_static_site(project_name)
+
+
 def write_flask_project(project_name: str) -> dict[str, Any]:
     return create_flask_site(project_name)
 

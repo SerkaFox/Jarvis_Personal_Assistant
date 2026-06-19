@@ -155,6 +155,60 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertTrue((Path(self.tmp.name) / "sitebota" / "index.html").exists())
         stop_preview("sitebota")
 
+    def test_where_missing_project_returns_exists_false(self):
+        from bot import workspace_where_answer
+
+        answer, debug = workspace_where_answer("missing_site", chat_id="test")
+        self.assertIn("exists: false", answer)
+        self.assertIn("Проект не найден в WRITE_ROOT", answer)
+        self.assertEqual(debug["detected"]["intent"], "where_project")
+
+    def test_create_site_workflow_creates_real_files_and_last_action(self):
+        from bot import create_site_workflow, get_last_action
+
+        answer, debug = create_site_workflow("sitebota_test", chat_id="test", with_preview=False)
+        self.assertIn("create_static_site", debug["tools_called"])
+        self.assertIn("verify_project_files", debug["tools_called"])
+        self.assertIn("Создал проект", answer)
+        self.assertTrue((Path(self.tmp.name) / "sitebota_test" / "index.html").is_file())
+        action = get_last_action("test")
+        self.assertTrue(action["success"])
+        self.assertEqual(action["project_name"], "sitebota_test")
+        self.assertTrue(action["path"].endswith("sitebota_test"))
+
+    def test_create_and_preview_workflow_starts_preview_and_last_action(self):
+        from bot import create_site_workflow, get_last_action
+        from tools_preview import stop_preview
+
+        answer, debug = create_site_workflow("sitebota_preview_test", chat_id="test", with_preview=True)
+        self.assertIn("start_preview", debug["tools_called"])
+        self.assertIn("curl_localhost", debug["tools_called"])
+        self.assertIn("preview_url:", answer)
+        action = get_last_action("test")
+        self.assertTrue(action["success"])
+        self.assertTrue(action["preview_url"].startswith("http://127.0.0.1:"))
+        stop_preview("sitebota_preview_test")
+
+    def test_workspace_where_reports_preview_url_after_create_and_preview(self):
+        from bot import create_site_workflow, workspace_where_answer
+        from tools_preview import stop_preview
+
+        create_site_workflow("sitebota_where_test", chat_id="test", with_preview=True)
+        answer, debug = workspace_where_answer("sitebota_where_test", chat_id="test")
+        self.assertIn("exists: true", answer)
+        self.assertIn("preview running: True", answer)
+        self.assertIn("url: http://127.0.0.1:", answer)
+        self.assertEqual(debug["detected"]["intent"], "where_project")
+        stop_preview("sitebota_where_test")
+
+    def test_no_fake_created_claim_without_tool_success(self):
+        from bot import save_last_action, workspace_where_answer
+
+        save_last_action("test", {"intent": "create_site", "project_name": "ghost", "success": False, "error": "tool failed"})
+        answer, _debug = workspace_where_answer(None, chat_id="test")
+        self.assertIn("Я не вижу подтверждения", answer)
+        self.assertNotIn("Создал проект", answer)
+
 
 if __name__ == "__main__":
     unittest.main()

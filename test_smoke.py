@@ -20,6 +20,23 @@ class JarvisSmokeTests(unittest.TestCase):
         self.assertEqual(detected["intent"], "safe_code_check")
         self.assertEqual(detected["project"], "anna")
 
+    def test_workspace_where_intent_does_not_list_repos(self):
+        detected = detect_intent("где сайт sitebota?")
+        self.assertEqual(detected["intent"], "where_project")
+        self.assertNotEqual(detected["intent"], "list_projects")
+        self.assertEqual(detected["project"], "sitebota")
+
+    def test_workspace_preview_status_intent_does_not_list_repos(self):
+        detected = detect_intent("ты запустил сервер sitebota?")
+        self.assertEqual(detected["intent"], "preview_status")
+        self.assertNotEqual(detected["intent"], "list_projects")
+        self.assertEqual(detected["project"], "sitebota")
+
+    def test_workspace_create_and_preview_intent(self):
+        detected = detect_intent("создай сайт sitebota и запусти сервер")
+        self.assertEqual(detected["intent"], "create_and_preview")
+        self.assertEqual(detected["project"], "sitebota")
+
     def test_safe_code_check_anna_is_structured_and_keeps_git_status(self):
         before = git_status("/home/seradmin/anna")["status_short"]
         result = safe_code_check("anna")

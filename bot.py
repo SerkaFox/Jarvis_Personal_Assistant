@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import re
 import shutil
@@ -39,6 +40,7 @@ from tools_write import (
     list_workspace,
     read_workspace_file,
     update_static_site_file,
+    verify_project_files,
     verify_static_site,
     write_text_file,
     workspace_tree,
@@ -202,6 +204,7 @@ def _wants_preview(text: str) -> bool:
         phrase in lowered
         for phrase in (
             "запусти временный сервер",
+            "запусти сервер",
             "временный сервер",
             "запусти preview",
             "запусти превью",
@@ -210,6 +213,127 @@ def _wants_preview(text: str) -> bool:
             "запусти сайт",
         )
     )
+
+
+def _last_action_path() -> Path:
+    path = Path(os.getenv("JARVIS_DB_PATH", config.JARVIS_DB_PATH)).resolve().parent / "last_actions.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_last_actions() -> dict:
+    path = _last_action_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_last_action(chat_id: str | None, action: dict) -> dict:
+    key = str(chat_id or "global")
+    payload = {
+        "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "intent": action.get("intent"),
+        "project_name": action.get("project_name"),
+        "success": bool(action.get("success")),
+        "path": action.get("path") or "",
+        "created_files": action.get("created_files") or [],
+        "preview_url": action.get("preview_url") or "",
+        "error": str(action.get("error") or ""),
+        "tools_called": action.get("tools_called") or [],
+    }
+    data = _load_last_actions()
+    data[key] = payload
+    _last_action_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def get_last_action(chat_id: str | None) -> dict | None:
+    data = _load_last_actions()
+    return data.get(str(chat_id or "global"))
+
+
+def _format_last_action(action: dict | None) -> str:
+    if not action:
+        return "last_action: нет сохраненных действий для этого чата"
+    lines = [
+        f"timestamp: {action.get('timestamp')}",
+        f"intent: {action.get('intent')}",
+        f"project_name: {action.get('project_name')}",
+        f"success: {action.get('success')}",
+        f"path: {action.get('path') or '-'}",
+        f"preview_url: {action.get('preview_url') or '-'}",
+        f"tools_called: {', '.join(action.get('tools_called') or []) or '-'}",
+        f"error: {action.get('error') or '-'}",
+        "created_files:",
+    ]
+    created = action.get("created_files") or []
+    lines.extend(f"- {item}" for item in created) if created else lines.append("-")
+    return "\n".join(lines)
+
+
+def _workspace_name_from_text(text: str) -> str | None:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", text)
+    stop = {
+        "create",
+        "project",
+        "site",
+        "landing",
+        "new",
+        "test",
+        "preview",
+        "server",
+        "workspace",
+    }
+    candidates = [word for word in words if word.lower() not in stop]
+    return candidates[-1] if candidates else None
+
+
+def _workspace_project_from_context(text: str, chat_id: str | None) -> str | None:
+    explicit = _workspace_name_from_text(text)
+    if explicit:
+        return explicit
+    try:
+        projects = list_workspace()["projects"]
+        lowered = text.lower()
+        for item in projects:
+            if item["name"].lower() in lowered:
+                return item["name"]
+    except Exception:
+        pass
+    action = get_last_action(chat_id)
+    if action and action.get("project_name"):
+        return str(action["project_name"])
+    current = memory.get_current_project(chat_id) if chat_id else None
+    if current and _workspace_project_exists(current):
+        return current
+    return None
+
+
+def _is_workspace_status_question(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "где сайт",
+            "где папка",
+            "на каком сервере",
+            "по какому адресу",
+            "ты запустил сервер",
+            "я не вижу сайт",
+            "где ты создал",
+            "не создал папку",
+            "почему не создал",
+        )
+    )
+
+
+def _wants_start_preview(text: str) -> bool:
+    lowered = text.lower()
+    return "запусти" in lowered and any(word in lowered for word in ("сервер", "preview", "превью"))
 
 
 def _format_write_success(
@@ -240,6 +364,203 @@ def _format_write_success(
     else:
         lines.append("preview command: /preview_start <project>")
     return "\n".join(lines)
+
+
+def workspace_where_answer(project_name: str | None, chat_id: str | None = None) -> tuple[str, dict]:
+    tools_called = ["verify_project_files", "preview_status"]
+    if not project_name:
+        action = get_last_action(chat_id)
+        if not action or not action.get("success"):
+            return (
+                "Я не вижу подтверждения, что сайт был создан. Проверяю workspace...\n"
+                f"WRITE_ROOT: {config.get_write_root()}\n"
+                "Проект не определен. Укажи имя: /where <project>",
+                {"detected": {"intent": "where_project"}, "tools_called": [], "errors": ["project not resolved"]},
+            )
+        project_name = str(action["project_name"])
+    verify = verify_project_files(project_name)
+    exists = Path(verify["path"]).is_dir()
+    status = preview_status(project_name)
+    if not exists:
+        answer = "\n".join(
+            [
+                "Я не вижу подтверждения, что сайт был создан. Проверяю workspace...",
+                f"project_name: {project_name}",
+                "exists: false",
+                f"path: {verify['path']}",
+                "Проект не найден в WRITE_ROOT",
+                f"preview running: {status.get('running', False)}",
+            ]
+        )
+    else:
+        required = {
+            "index": str(Path(verify["path"]) / "index.html"),
+            "css": str(Path(verify["path"]) / "assets" / "css" / "style.css"),
+            "js": str(Path(verify["path"]) / "assets" / "js" / "main.js"),
+            "readme": str(Path(verify["path"]) / "README.md"),
+        }
+        lines = [
+            f"project_name: {project_name}",
+            "exists: true",
+            f"path: {verify['path']}",
+            "files exist:",
+        ]
+        lines.extend(f"- {key}: {Path(path).is_file()} ({path})" for key, path in required.items())
+        lines.append(f"preview running: {status.get('running', False)}")
+        if status.get("url"):
+            lines.append(f"url: {status['url']}")
+        elif status.get("running") is False:
+            lines.append("url: -")
+        answer = "\n".join(lines)
+    return (
+        answer,
+        {
+            "detected": {"intent": "where_project", "project": project_name},
+            "tools_called": tools_called,
+            "errors": [] if exists else ["project not found"],
+            "resolved_path": verify.get("path"),
+            "project": project_name,
+        },
+    )
+
+
+def create_site_workflow(project_name: str, chat_id: str | None = None, with_preview: bool = False) -> tuple[str, dict]:
+    detected = {"intent": "create_and_preview" if with_preview else "create_site", "project": project_name}
+    tools_called: list[str] = []
+    action = {
+        "intent": detected["intent"],
+        "project_name": project_name,
+        "success": False,
+        "path": "",
+        "created_files": [],
+        "preview_url": "",
+        "error": "",
+        "tools_called": tools_called,
+    }
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        action["error"] = "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env"
+        saved = save_last_action(chat_id, action)
+        return (
+            saved["error"],
+            {"detected": detected, "tools_called": tools_called, "errors": [saved["error"]], "resolved_path": str(config.get_write_root())},
+        )
+    try:
+        created = create_static_site(
+            project_name,
+            title=project_name,
+            description="Landing page про Telegram/AI bot, созданный Jarvis в безопасной workspace-песочнице.",
+        )
+        tools_called.append("create_static_site")
+        if not created.get("success"):
+            raise RuntimeError("create_static_site не вернул success=True")
+        verify = verify_project_files(project_name)
+        tools_called.append("verify_project_files")
+        if not verify.get("success"):
+            raise RuntimeError("Файлы проекта не созданы: " + ", ".join(verify.get("missing") or []))
+        preview = None
+        if with_preview:
+            preview = start_preview(project_name)
+            tools_called.append("start_preview")
+            status = preview_status(project_name)
+            tools_called.append("preview_status")
+            if not preview.get("success") or not status.get("running"):
+                raise RuntimeError("Preview tool не подтвердил запущенный процесс")
+            response = requests.get(f"http://127.0.0.1:{preview['port']}/", timeout=5)
+            response.raise_for_status()
+            if project_name not in response.text:
+                raise RuntimeError("Preview HTTP-check не увидел HTML проекта")
+            tools_called.append("curl_localhost")
+        if chat_id:
+            memory.set_current_project(chat_id, created["project_name"])
+        action.update(
+            {
+                "project_name": created["project_name"],
+                "success": True,
+                "path": created["path"],
+                "created_files": created["created_files"],
+                "preview_url": preview["url"] if preview else "",
+                "tools_called": tools_called,
+            }
+        )
+        save_last_action(chat_id, action)
+        answer = _format_write_success(
+            "Создал проект в WRITE_ROOT." if not with_preview else "Создал проект в WRITE_ROOT и запустил preview.",
+            tools_called,
+            created["path"],
+            created=created["created_files"],
+            preview_url=preview["url"] if preview else None,
+        )
+        return (
+            answer,
+            {
+                "detected": detected,
+                "tools_called": tools_called,
+                "errors": [],
+                "resolved_path": created["path"],
+                "project": created["project_name"],
+                "preview_url": preview["url"] if preview else "",
+            },
+        )
+    except Exception as e:
+        action["error"] = str(e)
+        save_last_action(chat_id, action)
+        save_last_error(chat_id=chat_id or "", user_id="", handler="create_site_workflow", error=e, user_text=project_name)
+        return (
+            f"Не смог создать проект в WRITE_ROOT: {e}",
+            {"detected": detected, "tools_called": tools_called, "errors": [str(e)], "project": project_name},
+        )
+
+
+def workspace_status_answer(user_text: str, chat_id: str | None = None) -> tuple[str, dict] | None:
+    if not _is_workspace_status_question(user_text) and not _wants_start_preview(user_text):
+        return None
+    project = _workspace_project_from_context(user_text, chat_id)
+    if _wants_start_preview(user_text) and project:
+        tools_called = ["verify_project_files", "start_preview", "preview_status"]
+        try:
+            verify = verify_project_files(project)
+            if not Path(verify["path"]).is_dir() or not verify.get("success"):
+                raise RuntimeError("Проект не найден или файлы неполные")
+            preview = start_preview(project)
+            status = preview_status(project)
+            if not preview.get("success") or not status.get("running"):
+                raise RuntimeError("Preview tool не подтвердил запущенный процесс")
+            save_last_action(
+                chat_id,
+                {
+                    "intent": "start_preview",
+                    "project_name": project,
+                    "success": True,
+                    "path": verify["path"],
+                    "created_files": [],
+                    "preview_url": preview["url"],
+                    "tools_called": tools_called,
+                },
+            )
+            return (
+                _format_write_success(
+                    "Запустил preview для workspace-проекта.",
+                    tools_called,
+                    verify["path"],
+                    preview_url=preview["url"],
+                ),
+                {
+                    "detected": {"intent": "preview_start", "project": project},
+                    "tools_called": tools_called,
+                    "errors": [],
+                    "resolved_path": verify["path"],
+                    "project": project,
+                    "preview_url": preview["url"],
+                },
+            )
+        except Exception as e:
+            save_last_action(chat_id, {"intent": "start_preview", "project_name": project, "success": False, "error": str(e), "tools_called": tools_called})
+            save_last_error(chat_id=chat_id or "", user_id="", handler="workspace_status_answer", error=e, user_text=user_text)
+            return (
+                f"Preview не запущен: {e}",
+                {"detected": {"intent": "preview_start", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
+            )
+    return workspace_where_answer(project, chat_id=chat_id)
 
 
 def _workspace_project_exists(name: str) -> bool:
@@ -312,63 +633,39 @@ def write_mode_answer(user_text: str, chat_id: str | None = None) -> tuple[str, 
     )
     if not has_create_intent:
         return None
-    detected = {"intent": "create_workspace_project"}
-    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
-        return (
-            "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env",
-            {"detected": detected, "tools_called": [], "errors": [], "resolved_path": str(config.get_write_root())},
-        )
-    try:
-        name = _slug_from_text(user_text)
-        creator = create_flask_site if "flask" in lowered else create_static_site
-        tool_name = "create_flask_site" if "flask" in lowered else "create_static_site"
-        tools_called = [tool_name]
-        data = creator(
-            name,
-            title=name,
-            description="Landing page про Telegram/AI bot, созданный Jarvis в безопасной workspace-песочнице.",
-        )
-        if not data.get("success"):
-            raise RuntimeError(f"{tool_name} вернул success=False")
-        verify = verify_static_site(name) if tool_name == "create_static_site" else {"success": True, "files": data["created_files"], "missing": []}
-        tools_called.append("verify_static_site" if tool_name == "create_static_site" else "run_safe_project_check")
-        if not verify.get("success"):
-            raise RuntimeError("Файлы проекта не созданы: " + ", ".join(verify.get("missing") or []))
-        tree = workspace_tree(name)
-        tools_called.append("workspace_tree")
-        preview = None
-        if _wants_preview(user_text):
-            preview = start_preview(name)
-            tools_called.append("start_preview")
-            if not preview.get("pid") or not preview.get("url"):
-                raise RuntimeError("Preview tool не вернул pid/url")
-        if chat_id:
-            memory.set_current_project(chat_id, data["project_name"])
-        answer = _format_write_success(
-            "Создал проект в WRITE_ROOT.",
-            tools_called,
-            data["path"],
-            created=data["created_files"],
-            preview_url=preview["url"] if preview else None,
-        )
-        answer += f"\n\nworkspace_tree:\n{tree['tree']}"
-        return (
-            answer,
-            {
-                "detected": detected,
-                "tools_called": tools_called,
-                "errors": [],
-                "resolved_path": data["path"],
-                "project": data["project_name"],
-                "preview_url": preview["url"] if preview else "",
-            },
-        )
-    except Exception as e:
-        save_last_error(chat_id=chat_id or "", user_id="", handler="write_mode_answer", error=e, user_text=user_text)
-        return (
-            f"Не смог создать проект в WRITE_ROOT: {e}",
-            {"detected": detected, "tools_called": ["create_static_site"], "errors": [str(e)]},
-        )
+    name = _slug_from_text(user_text)
+    if "flask" in lowered:
+        detected = {"intent": "create_workspace_project", "project": name}
+        if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+            error = "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env"
+            save_last_action(chat_id, {"intent": "create_flask_site", "project_name": name, "success": False, "error": error})
+            return (error, {"detected": detected, "tools_called": [], "errors": [error], "resolved_path": str(config.get_write_root())})
+        try:
+            data = create_flask_site(name)
+            if not data.get("success"):
+                raise RuntimeError("create_flask_site не вернул success=True")
+            if chat_id:
+                memory.set_current_project(chat_id, data["project_name"])
+            save_last_action(
+                chat_id,
+                {
+                    "intent": "create_flask_site",
+                    "project_name": data["project_name"],
+                    "success": True,
+                    "path": data["path"],
+                    "created_files": data["created_files"],
+                    "tools_called": ["create_flask_site"],
+                },
+            )
+            return (
+                _format_write_success("Создал Flask-проект в WRITE_ROOT.", ["create_flask_site"], data["path"], created=data["created_files"]),
+                {"detected": detected, "tools_called": ["create_flask_site"], "errors": [], "resolved_path": data["path"], "project": data["project_name"]},
+            )
+        except Exception as e:
+            save_last_action(chat_id, {"intent": "create_flask_site", "project_name": name, "success": False, "error": str(e), "tools_called": ["create_flask_site"]})
+            save_last_error(chat_id=chat_id or "", user_id="", handler="write_mode_answer", error=e, user_text=user_text)
+            return (f"Не смог создать Flask-проект в WRITE_ROOT: {e}", {"detected": detected, "tools_called": ["create_flask_site"], "errors": [str(e)]})
+    return create_site_workflow(name, chat_id=chat_id, with_preview=_wants_preview(user_text))
 
 
 def summarize_project_with_ollama(data: dict) -> str:
@@ -415,6 +712,9 @@ def answer_user_text(
     if memory_status:
         detected = {"intent": "memory_status"}
         return memory_status, {"detected": detected, "tools_called": [], "errors": []}
+    status_answer = workspace_status_answer(user_text, chat_id=chat_id)
+    if status_answer:
+        return status_answer
     write_answer = write_mode_answer(user_text, chat_id=chat_id)
     if write_answer:
         return write_answer
@@ -928,6 +1228,17 @@ async def new_static_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             raise RuntimeError("create_static_site не подтвердил создание файлов")
         chat_id, _ = chat_user_ids(update)
         memory.set_current_project(chat_id, data["project_name"])
+        save_last_action(
+            chat_id,
+            {
+                "intent": "create_site",
+                "project_name": data["project_name"],
+                "success": True,
+                "path": data["path"],
+                "created_files": data["created_files"],
+                "tools_called": ["create_static_site", "verify_static_site"],
+            },
+        )
         await reply_long(
             update.message,
             _format_write_success(
@@ -1060,6 +1371,18 @@ async def preview_start_command(update: Update, context: ContextTypes.DEFAULT_TY
         status = preview_status(context.args[0])
         if not result.get("success") or not status.get("running"):
             raise RuntimeError("Preview tool не подтвердил запущенный процесс")
+        chat_id, _ = chat_user_ids(update)
+        save_last_action(
+            chat_id,
+            {
+                "intent": "start_preview",
+                "project_name": result["project"],
+                "success": True,
+                "path": result["path"],
+                "preview_url": result["url"],
+                "tools_called": ["start_preview", "preview_status"],
+            },
+        )
         await reply_long(
             update.message,
             _format_write_success(
@@ -1124,6 +1447,72 @@ async def preview_status_command(update: Update, context: ContextTypes.DEFAULT_T
         await reply_long(update.message, "\n".join(f"{key}: {value}" for key, value in result.items()))
     except Exception as e:
         await update.message.reply_text(f"Ошибка /preview_status: {e}")
+
+
+async def where_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    project = context.args[0] if context.args else None
+    try:
+        answer, debug = workspace_where_answer(project, chat_id=chat_id)
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="where_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /where: {e}")
+
+
+async def create_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /create_site <project>")
+        return
+    chat_id, _ = chat_user_ids(update)
+    await progress(update.message, f"Принял: создаю {context.args[0]}")
+    await progress(update.message, "Шаг 1/3: проверяю WRITE_ROOT")
+    await progress(update.message, "Шаг 2/3: создаю файлы")
+    try:
+        answer, debug = create_site_workflow(context.args[0], chat_id=chat_id, with_preview=False)
+        await progress(update.message, "Шаг 3/3: проверяю файлы")
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="create_site_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /create_site: {e}")
+
+
+async def create_and_preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /create_and_preview <project>")
+        return
+    chat_id, _ = chat_user_ids(update)
+    project = context.args[0]
+    await progress(update.message, f"Принял: создаю {project}")
+    await progress(update.message, "Шаг 1/4: проверяю WRITE_ROOT")
+    await progress(update.message, "Шаг 2/4: создаю файлы")
+    await progress(update.message, "Шаг 3/4: проверяю файлы")
+    await progress(update.message, "Шаг 4/4: запускаю preview")
+    try:
+        answer, debug = create_site_workflow(project, chat_id=chat_id, with_preview=True)
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="create_and_preview_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /create_and_preview: {e}")
+
+
+async def last_action_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    await reply_long(update.message, _format_last_action(get_last_action(chat_id)))
 
 
 def selftest_workspace_result() -> dict:
@@ -1248,6 +1637,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/workspace - WRITE_ROOT и тестовые проекты",
                 "/write_mode - состояние write sandbox",
                 "/new_static <name> - создать статический сайт в WRITE_ROOT",
+                "/create_site <project> - создать статический сайт и проверить файлы",
+                "/create_and_preview <project> - создать сайт, проверить файлы и запустить preview",
+                "/where <project> - показать путь, файлы и preview status проекта",
                 "/new_flask <name> - создать Flask-проект в WRITE_ROOT",
                 "/write_file <project>/<file> <content> - записать текстовый файл",
                 "/delete_file <project>/<file> - удалить файл из WRITE_ROOT",
@@ -1261,6 +1653,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/logs <service> - последние 80 строк journal",
                 "/bot_logs - последние 80 строк journal jarvis-bot",
                 "/last_error - последняя ошибка Jarvis для этого чата",
+                "/last_action - последнее write/preview действие для этого чата",
                 "/memory - сохраненная память",
                 "/remember <text> - сохранить факт",
                 "/forget <key> - удалить memory",
@@ -1567,10 +1960,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if pending_task == "create_workspace_project":
                 project_name = _slug_from_text(user_text)
                 await progress(update.message, f"Принял: создаю {project_name} в workspace")
-                await progress(update.message, "Шаг 1/4: создаю файлы")
-                await progress(update.message, "Шаг 2/4: проверяю структуру")
+                await progress(update.message, "Шаг 1/4: проверяю WRITE_ROOT")
+                await progress(update.message, "Шаг 2/4: создаю файлы")
+                await progress(update.message, "Шаг 3/4: проверяю файлы")
                 if _wants_preview(user_text):
-                    await progress(update.message, "Шаг 3/4: запускаю preview")
+                    await progress(update.message, "Шаг 4/4: запускаю preview")
             else:
                 await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
                 await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")
@@ -1601,7 +1995,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
             debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
 
-        if pending_task:
+        if pending_task and pending_task != "create_workspace_project":
             await progress(update.message, "Шаг 4/4: готовлю ответ...")
 
         await maybe_send_intent_debug(update.message, context, debug_info)
@@ -1731,6 +2125,9 @@ def main():
     app.add_handler(CommandHandler("workspace", workspace_command))
     app.add_handler(CommandHandler("write_mode", write_mode_command))
     app.add_handler(CommandHandler("new_static", new_static_command))
+    app.add_handler(CommandHandler("create_site", create_site_command))
+    app.add_handler(CommandHandler("create_and_preview", create_and_preview_command))
+    app.add_handler(CommandHandler("where", where_command))
     app.add_handler(CommandHandler("new_flask", new_flask_command))
     app.add_handler(CommandHandler("write_file", write_file_command))
     app.add_handler(CommandHandler("delete_file", delete_file_command))
@@ -1744,6 +2141,7 @@ def main():
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("bot_logs", bot_logs_command))
     app.add_handler(CommandHandler("last_error", last_error_command))
+    app.add_handler(CommandHandler("last_action", last_action_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("forget", forget_command))

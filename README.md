@@ -116,6 +116,12 @@ Shows configured roots and output limits.
 Finds git repositories under `ALLOWED_ROOTS` and shows path, branch, origin, and `git status --short`.
 
 ```text
+/projects
+```
+
+Alias for `/repos`. Normal text such as `какие есть у меня проекты сейчас?` is routed to server tools before Ollama.
+
+```text
 /git <repo_name_or_path>
 ```
 
@@ -175,6 +181,14 @@ Shows Ollama, STT, TTS, selected models, allowed services, and allowed roots.
 ```
 
 Enables or disables read-only tool use for normal text messages. If the model returns an invalid JSON plan, Jarvis falls back to the normal Ollama answer without tools.
+
+```text
+/agent_debug_on
+/agent_debug_off
+/debug_last_intent
+```
+
+Shows deterministic intent routing for normal messages: detected intent, selected project, tools called, and errors.
 
 ```text
 /patch <repo> <task>

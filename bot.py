@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 
 import config
 from agent import answer_with_tools
+from intent_router import detect_intent, handle_detected_intent
 import memory
 from tools_fs import allowed_roots_info, search_text, tree_summary
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
@@ -73,6 +74,8 @@ def get_system_prompt() -> str:
         "Помогай с Linux, Django, Python, сервером, Telegram-ботами, Ollama, Codex и администрированием. "
         "У тебя есть локальная память SQLite: используй историю диалога, memories и project_notes, когда они добавлены в контекст. "
         "Не говори, что у тебя нет доступа, если доступны read-only tools. "
+        "Если tools доступны, никогда не говори 'у меня нет доступа к файловой системе'. "
+        "Для серверных/проектных вопросов backend должен вызывать tools. Если ты видишь tool results — отвечай по ним. "
         "Если пользователь говорит 'это', 'он', 'там', 'проект' — используй последние сообщения для контекста. "
         "Не придумывай результаты команд. Если нужны логи или вывод команды — попроси пользователя выполнить команду или скажи, какую команду выполнить. "
         "Для опасных действий, таких как удаление файлов, миграции, рестарт сервисов, deploy, git push или изменения nginx/systemd, требуй явное подтверждение. "
@@ -115,16 +118,57 @@ def ask_ollama_messages(messages: list[dict[str, str]]) -> str:
     return r.json()["message"]["content"]
 
 
-def answer_user_text(user_text: str, use_agent: bool, chat_id: str | None = None) -> str:
+def memory_status_answer(user_text: str) -> str | None:
+    lowered = user_text.lower()
+    if not any(phrase in lowered for phrase in ("ты сохраняешь историю", "сохраняешь историю", "есть история")):
+        return None
+    if not config.MEMORY_ENABLED:
+        return "Memory сейчас выключена: MEMORY_ENABLED=false."
+    try:
+        memory.init_db()
+        return "Да, сохраняю последние сообщения в SQLite. База: data/jarvis.db."
+    except Exception as e:
+        return f"Memory недоступна: {e}"
+
+
+def summarize_project_with_ollama(data: dict) -> str:
+    summary = ask_ollama_messages(project_summary_prompt(data))
+    memory.save_project_note(
+        data["project_name"],
+        data["path"],
+        summary,
+        data["git"].get("last_commit", ""),
+    )
+    return summary
+
+
+def answer_user_text(
+    user_text: str,
+    use_agent: bool,
+    chat_id: str | None = None,
+    recent_messages: list[dict] | None = None,
+    debug: bool = False,
+) -> tuple[str, dict]:
     age = memory.age_answer(user_text)
     if age:
-        return age
+        detected = {"intent": "age"}
+        return age, {"detected": detected, "tools_called": [], "errors": []}
+    memory_status = memory_status_answer(user_text)
+    if memory_status:
+        detected = {"intent": "memory_status"}
+        return memory_status, {"detected": detected, "tools_called": [], "errors": []}
+
+    detected = detect_intent(user_text, recent_messages or [])
+    if detected.get("intent") != "normal_chat":
+        routed = handle_detected_intent(detected, summarize_project=summarize_project_with_ollama)
+        return routed["answer"], {"detected": detected, **routed}
+
     memory_context = memory.build_memory_context(chat_id, user_text) if chat_id else ""
     if use_agent:
         agent_answer = answer_with_tools(user_text, ask_ollama_messages, memory_context=memory_context)
         if agent_answer:
-            return agent_answer
-    return ask_ollama(user_text, chat_id=chat_id)
+            return agent_answer, {"detected": detected, "tools_called": ["agent"], "errors": []}
+    return ask_ollama(user_text, chat_id=chat_id), {"detected": detected, "tools_called": [], "errors": []}
 
 
 def transcribe_audio_file(path: str) -> dict:
@@ -311,6 +355,10 @@ async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_long(update.message, text)
 
 
+async def projects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await repos(update, context)
+
+
 def chat_user_ids(update: Update) -> tuple[str, str]:
     chat_id = str(update.effective_chat.id) if update.effective_chat else ""
     user_id = str(update.effective_user.id) if update.effective_user else ""
@@ -418,6 +466,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Jarvis commands:",
                 "/roots - разрешенные roots",
                 "/repos - найти git-репозитории",
+                "/projects - алиас /repos",
                 "/git <repo> - status, branch, remote",
                 "/diff <repo> - git diff",
                 "/find <query> - поиск по ALLOWED_ROOTS",
@@ -431,6 +480,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/project <repo> - inspection проекта",
                 "/status - Ollama/STT/TTS/agent status",
                 "/agent_on, /agent_off - read-only agent mode",
+                "/agent_debug_on, /agent_debug_off - debug intent routing",
+                "/debug_last_intent - последний intent",
                 "/tts_test - проверить TTS",
                 "/patch, /apply_patch, /test, /deploy - отключены на read-only этапе",
             ]
@@ -539,6 +590,41 @@ async def disabled_write_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+async def agent_debug_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    context.user_data["agent_debug"] = True
+    await update.message.reply_text("Agent debug: on")
+
+
+async def agent_debug_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    context.user_data["agent_debug"] = False
+    await update.message.reply_text("Agent debug: off")
+
+
+async def debug_last_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    await reply_long(update.message, str(context.user_data.get("last_intent") or "intent еще не распознавался"))
+
+
+async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, debug_info: dict):
+    context.user_data["last_intent"] = debug_info
+    if not context.user_data.get("agent_debug"):
+        return
+    detected = debug_info.get("detected", {})
+    lines = [
+        "intent debug:",
+        f"detected intent: {detected.get('intent')}",
+        f"selected project: {debug_info.get('project') or detected.get('project') or '-'}",
+        f"tools called: {', '.join(debug_info.get('tools_called') or []) or '-'}",
+        f"errors: {'; '.join(debug_info.get('errors') or []) or '-'}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
 def _check_ollama() -> str:
     try:
         response = requests.get(f"{OLLAMA_URL}/api/version", timeout=5)
@@ -645,11 +731,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text
     chat_id, user_id = chat_user_ids(update)
+    recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
     message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
     use_agent = bool(context.user_data.get("agent_enabled"))
 
     try:
-        answer = answer_user_text(user_text, use_agent, chat_id=chat_id)
+        answer, debug_info = answer_user_text(
+            user_text,
+            use_agent,
+            chat_id=chat_id,
+            recent_messages=recent,
+            debug=bool(context.user_data.get("agent_debug")),
+        )
     except requests.exceptions.ConnectionError:
         answer = (
             "Не могу подключиться к Ollama на AI-ПК.\n\n"
@@ -662,7 +755,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
     except Exception as e:
         answer = f"Ошибка обращения к Ollama: {e}"
+        debug_info = {"detected": {"intent": "error"}, "tools_called": [], "errors": [str(e)]}
 
+    await maybe_send_intent_debug(update.message, context, debug_info)
     memory.save_message(chat_id, user_id, "assistant", answer, "text")
     memory.save_memory_candidates(user_text, answer, message_id)
     await reply_long(update.message, answer)
@@ -713,7 +808,15 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(f"🎙 Распознал:\n{memory.mask_secrets(recognized_text)[:1000]}")
 
         use_agent = bool(context.user_data.get("agent_enabled"))
-        answer = answer_user_text(recognized_text, use_agent, chat_id=chat_id)
+        recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
+        answer, debug_info = answer_user_text(
+            recognized_text,
+            use_agent,
+            chat_id=chat_id,
+            recent_messages=recent,
+            debug=bool(context.user_data.get("agent_debug")),
+        )
+        await maybe_send_intent_debug(message, context, debug_info)
         memory.save_message(chat_id, user_id, "assistant", answer, "voice")
         memory.save_memory_candidates(recognized_text, answer, message_id)
         await reply_long(message, answer)
@@ -750,6 +853,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("roots", roots))
     app.add_handler(CommandHandler("repos", repos))
+    app.add_handler(CommandHandler("projects", projects_command))
     app.add_handler(CommandHandler("git", git_command))
     app.add_handler(CommandHandler("diff", diff_command))
     app.add_handler(CommandHandler("find", find_command))
@@ -764,6 +868,9 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("agent_on", agent_on))
     app.add_handler(CommandHandler("agent_off", agent_off))
+    app.add_handler(CommandHandler("agent_debug_on", agent_debug_on))
+    app.add_handler(CommandHandler("agent_debug_off", agent_debug_off))
+    app.add_handler(CommandHandler("debug_last_intent", debug_last_intent))
     app.add_handler(CommandHandler("tts_test", tts_test))
     app.add_handler(CommandHandler("patch", disabled_write_command))
     app.add_handler(CommandHandler("apply_patch", disabled_write_command))

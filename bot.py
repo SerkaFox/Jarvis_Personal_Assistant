@@ -34,10 +34,12 @@ from tools_errors import error_summary, latest_error, mask_error_text, save_last
 from tools_write import (
     create_flask_site,
     create_static_site,
+    delete_workspace_dir,
     delete_workspace_file,
     list_workspace,
     read_workspace_file,
     update_static_site_file,
+    verify_static_site,
     write_text_file,
     workspace_tree,
 )
@@ -194,6 +196,22 @@ def _slug_from_text(text: str, fallback: str = "test-site") -> str:
     return candidates[-1] if candidates else fallback
 
 
+def _wants_preview(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "запусти временный сервер",
+            "временный сервер",
+            "запусти preview",
+            "запусти превью",
+            "preview",
+            "превью",
+            "запусти сайт",
+        )
+    )
+
+
 def _format_write_success(
     action: str,
     tools_called: list[str],
@@ -297,40 +315,56 @@ def write_mode_answer(user_text: str, chat_id: str | None = None) -> tuple[str, 
     detected = {"intent": "create_workspace_project"}
     if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
         return (
-            "Write mode выключен: WRITE_MODE_ENABLED=false. "
-            "Чтобы создавать тестовые проекты, включи WRITE_MODE_ENABLED=true и задай WRITE_ROOT.",
+            "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env",
             {"detected": detected, "tools_called": [], "errors": [], "resolved_path": str(config.get_write_root())},
         )
     try:
         name = _slug_from_text(user_text)
         creator = create_flask_site if "flask" in lowered else create_static_site
         tool_name = "create_flask_site" if "flask" in lowered else "create_static_site"
+        tools_called = [tool_name]
         data = creator(
             name,
             title=name,
             description="Landing page про Telegram/AI bot, созданный Jarvis в безопасной workspace-песочнице.",
         )
+        if not data.get("success"):
+            raise RuntimeError(f"{tool_name} вернул success=False")
+        verify = verify_static_site(name) if tool_name == "create_static_site" else {"success": True, "files": data["created_files"], "missing": []}
+        tools_called.append("verify_static_site" if tool_name == "create_static_site" else "run_safe_project_check")
+        if not verify.get("success"):
+            raise RuntimeError("Файлы проекта не созданы: " + ", ".join(verify.get("missing") or []))
         tree = workspace_tree(name)
+        tools_called.append("workspace_tree")
+        preview = None
+        if _wants_preview(user_text):
+            preview = start_preview(name)
+            tools_called.append("start_preview")
+            if not preview.get("pid") or not preview.get("url"):
+                raise RuntimeError("Preview tool не вернул pid/url")
         if chat_id:
             memory.set_current_project(chat_id, data["project_name"])
         answer = _format_write_success(
             "Создал проект в WRITE_ROOT.",
-            [tool_name, "workspace_tree"],
+            tools_called,
             data["path"],
             created=data["created_files"],
+            preview_url=preview["url"] if preview else None,
         )
         answer += f"\n\nworkspace_tree:\n{tree['tree']}"
         return (
             answer,
             {
                 "detected": detected,
-                "tools_called": [tool_name, "workspace_tree"],
+                "tools_called": tools_called,
                 "errors": [],
                 "resolved_path": data["path"],
                 "project": data["project_name"],
+                "preview_url": preview["url"] if preview else "",
             },
         )
     except Exception as e:
+        save_last_error(chat_id=chat_id or "", user_id="", handler="write_mode_answer", error=e, user_text=user_text)
         return (
             f"Не смог создать проект в WRITE_ROOT: {e}",
             {"detected": detected, "tools_called": ["create_static_site"], "errors": [str(e)]},
@@ -889,18 +923,23 @@ async def new_static_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     try:
         data = create_static_site(context.args[0])
+        verify = verify_static_site(data["project_name"])
+        if not data.get("success") or not verify.get("success"):
+            raise RuntimeError("create_static_site не подтвердил создание файлов")
         chat_id, _ = chat_user_ids(update)
         memory.set_current_project(chat_id, data["project_name"])
         await reply_long(
             update.message,
             _format_write_success(
                 "Создал статический сайт в WRITE_ROOT.",
-                ["create_static_site"],
+                ["create_static_site", "verify_static_site"],
                 data["path"],
                 created=data["created_files"],
             ),
         )
     except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="new_static_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /new_static: {e}")
 
 
@@ -924,6 +963,8 @@ async def new_flask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
     except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="new_flask_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /new_flask: {e}")
 
 
@@ -1016,16 +1057,21 @@ async def preview_start_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     try:
         result = start_preview(context.args[0])
+        status = preview_status(context.args[0])
+        if not result.get("success") or not status.get("running"):
+            raise RuntimeError("Preview tool не подтвердил запущенный процесс")
         await reply_long(
             update.message,
             _format_write_success(
                 "Запустил preview для workspace-проекта.",
-                ["start_preview"],
+                ["start_preview", "preview_status"],
                 result["path"],
                 preview_url=result["url"],
             ),
         )
     except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_start_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /preview_start: {e}")
 
 
@@ -1049,6 +1095,8 @@ async def preview_stop_command(update: Update, context: ContextTypes.DEFAULT_TYP
             ),
         )
     except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_stop_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /preview_stop: {e}")
 
 
@@ -1076,6 +1124,63 @@ async def preview_status_command(update: Update, context: ContextTypes.DEFAULT_T
         await reply_long(update.message, "\n".join(f"{key}: {value}" for key, value in result.items()))
     except Exception as e:
         await update.message.reply_text(f"Ошибка /preview_status: {e}")
+
+
+def selftest_workspace_result() -> dict:
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        return {
+            "success": False,
+            "error": "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env",
+            "write_root": str(config.get_write_root()),
+        }
+    project = f"jarvis_selftest_{int(datetime.now().timestamp())}"
+    preview = None
+    cleanup = None
+    try:
+        created = create_static_site(project, title="Jarvis Selftest", description="Workspace selftest project")
+        verify = verify_static_site(project)
+        if not created.get("success") or not verify.get("success"):
+            raise RuntimeError("selftest files verification failed")
+        preview = start_preview(project)
+        response = requests.get(f"http://127.0.0.1:{preview['port']}/", timeout=5)
+        response.raise_for_status()
+        if "Jarvis Selftest" not in response.text:
+            raise RuntimeError("preview response does not contain expected HTML")
+        stopped = stop_preview(project)
+        cleanup = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        return {
+            "success": True,
+            "write_root": str(config.get_write_root()),
+            "project": project,
+            "created_files": created["created_files"],
+            "preview_url": preview["url"],
+            "stopped": stopped.get("stopped"),
+            "cleanup": cleanup.get("deleted"),
+        }
+    except Exception:
+        if preview:
+            try:
+                stop_preview(project)
+            except Exception:
+                pass
+        try:
+            cleanup = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        except Exception:
+            cleanup = None
+        raise
+
+
+async def selftest_workspace_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    await progress(update.message, "Принял: запускаю selftest workspace")
+    try:
+        result = selftest_workspace_result()
+        await reply_long(update.message, "\n".join(f"{key}: {value}" for key, value in result.items()))
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="selftest_workspace_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /selftest_workspace: {e}. Детали сохранены в /last_error")
 
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1150,6 +1255,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/preview_stop <project> - остановить preview",
                 "/preview_list - список preview",
                 "/preview_status <project> - статус preview",
+                "/selftest_workspace - проверить write/preview workspace",
                 "/preview_info <name> - как открыть/запустить проект",
                 "/workspace_tree [name] - дерево workspace или проекта",
                 "/logs <service> - последние 80 строк journal",
@@ -1458,8 +1564,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if pending_task:
             await progress(update.message, f"Принял задачу: {pending_task}")
-            await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
-            await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")
+            if pending_task == "create_workspace_project":
+                project_name = _slug_from_text(user_text)
+                await progress(update.message, f"Принял: создаю {project_name} в workspace")
+                await progress(update.message, "Шаг 1/4: создаю файлы")
+                await progress(update.message, "Шаг 2/4: проверяю структуру")
+                if _wants_preview(user_text):
+                    await progress(update.message, "Шаг 3/4: запускаю preview")
+            else:
+                await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
+                await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")
 
         try:
             answer, debug_info = answer_user_text(
@@ -1488,7 +1602,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
 
         if pending_task:
-            await progress(update.message, "Шаг 3/4: проверяю результат...")
             await progress(update.message, "Шаг 4/4: готовлю ответ...")
 
         await maybe_send_intent_debug(update.message, context, debug_info)
@@ -1625,6 +1738,7 @@ def main():
     app.add_handler(CommandHandler("preview_stop", preview_stop_command))
     app.add_handler(CommandHandler("preview_list", preview_list_command))
     app.add_handler(CommandHandler("preview_status", preview_status_command))
+    app.add_handler(CommandHandler("selftest_workspace", selftest_workspace_command))
     app.add_handler(CommandHandler("preview_info", preview_info_command))
     app.add_handler(CommandHandler("workspace_tree", workspace_tree_command))
     app.add_handler(CommandHandler("logs", logs_command))

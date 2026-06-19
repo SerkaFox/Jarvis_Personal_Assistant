@@ -468,7 +468,7 @@ def create_static_site(
         result = write_text_file(f"{name}/{relative}", content, overwrite=False)
         created.append(result["path"])
     check = run_safe_project_check(name)
-    return {"project_name": name, "path": project["path"], "created_files": created, "check": check}
+    return {"success": True, "project_name": name, "path": project["path"], "created_files": created, "check": check}
 
 
 def write_static_site(project_name: str, title: str = "", description: str = "", theme: str = "slate") -> dict[str, Any]:
@@ -532,7 +532,26 @@ def create_flask_site(
         result = write_text_file(f"{name}/{relative}", content, overwrite=False)
         created.append(result["path"])
     check = run_safe_project_check(name)
-    return {"project_name": name, "path": project["path"], "created_files": created, "check": check}
+    return {"success": True, "project_name": name, "path": project["path"], "created_files": created, "check": check}
+
+
+def verify_static_site(project_name: str) -> dict[str, Any]:
+    project = _validate_project_name(project_name)
+    root = resolve_write_path(project)
+    required = [
+        root / "index.html",
+        root / "assets" / "css" / "style.css",
+        root / "assets" / "js" / "main.js",
+        root / "README.md",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    return {
+        "success": not missing,
+        "project_name": project,
+        "path": str(root),
+        "files": [str(path) for path in required],
+        "missing": missing,
+    }
 
 
 def write_flask_project(project_name: str) -> dict[str, Any]:

@@ -154,6 +154,7 @@ def start_preview(project_name: str) -> dict[str, Any]:
         raise ToolError(f"Preview процесс завершился сразу: {process.returncode}")
 
     record = {
+        "success": True,
         "project": name,
         "path": str(project),
         "pid": process.pid,
@@ -177,7 +178,7 @@ def stop_preview(project_name: str) -> dict[str, Any]:
     if not _is_own_preview_process(record):
         registry.pop(name, None)
         _save_registry(registry)
-        return {"project": name, "stopped": False, "reason": "process not running or not owned preview"}
+        return {"success": False, "project": name, "stopped": False, "reason": "process not running or not owned preview"}
 
     pid = int(record["pid"])
     os.killpg(pid, signal.SIGTERM)
@@ -208,7 +209,7 @@ def stop_preview(project_name: str) -> dict[str, Any]:
             pass
     registry.pop(name, None)
     _save_registry(registry)
-    return {"project": name, "pid": pid, "stopped": True}
+    return {"success": True, "project": name, "pid": pid, "stopped": True}
 
 
 def list_previews() -> dict[str, Any]:

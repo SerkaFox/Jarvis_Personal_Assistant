@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -33,6 +34,21 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+
+BOT_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+
+class SecretMaskingLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = BOT_TOKEN_RE.sub("bot[MASKED]", str(record.msg))
+        if record.args:
+            record.args = tuple(BOT_TOKEN_RE.sub("bot[MASKED]", str(arg)) for arg in record.args)
+        return True
+
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(SecretMaskingLogFilter())
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))

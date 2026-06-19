@@ -10,6 +10,10 @@ __pycache__/
 models/
 data/*.db
 data/*.db-*
+data/previews.json
+workspace/
+jarvis_workspace/
+*.pid
 *.wav
 *.ogg
 *.mp3

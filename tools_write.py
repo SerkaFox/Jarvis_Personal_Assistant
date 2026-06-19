@@ -1,7 +1,10 @@
 import logging
 import os
+import py_compile
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +12,8 @@ import config
 from tools_fs import ToolError
 
 
-MAX_WRITE_CHARS = 120_000
+MAX_WRITE_CHARS = 180_000
+MAX_READ_CHARS = 80_000
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 FORBIDDEN_WRITE_NAMES = {
     ".env",
@@ -21,6 +25,7 @@ FORBIDDEN_WRITE_NAMES = {
 }
 FORBIDDEN_WRITE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db"}
 FORBIDDEN_WRITE_FRAGMENTS = {"secret", "token", "password", "passwd", "credential"}
+TREE_EXCLUDED = {".git", "__pycache__", "venv", ".venv"}
 
 
 def _write_mode_enabled() -> bool:
@@ -36,7 +41,16 @@ def _reject_path_traversal(path: str) -> None:
         raise ToolError(f"Path traversal запрещен: {path}")
 
 
-def _is_forbidden_write_file(path: Path) -> bool:
+def _validate_project_name(name: str) -> str:
+    cleaned = name.strip()
+    if not SAFE_NAME_RE.match(cleaned):
+        raise ToolError("Имя проекта может содержать только буквы, цифры, _, -, . и до 80 символов")
+    if cleaned.startswith("."):
+        raise ToolError("Скрытые project names запрещены")
+    return cleaned
+
+
+def _is_forbidden_workspace_file(path: Path) -> bool:
     lowered_name = path.name.lower()
     if lowered_name in FORBIDDEN_WRITE_NAMES:
         return True
@@ -52,6 +66,15 @@ def _ensure_text_content(content: str) -> None:
         raise ToolError("Бинарное содержимое запрещено")
     if len(content) > MAX_WRITE_CHARS:
         raise ToolError(f"Содержимое слишком большое: {len(content)} > {MAX_WRITE_CHARS}")
+
+
+def _ensure_text_file(path: Path) -> None:
+    if _is_forbidden_workspace_file(path):
+        raise ToolError(f"Операция с файлом запрещена политикой безопасности: {path.name}")
+    if path.exists() and path.is_file():
+        sample = path.read_bytes()[:4096]
+        if b"\x00" in sample:
+            raise ToolError(f"Бинарный файл запрещен: {path}")
 
 
 def _log_write(operation: str, path: Path | None = None, extra: dict[str, Any] | None = None) -> None:
@@ -85,13 +108,30 @@ def resolve_write_path(path: str) -> Path:
     return resolved
 
 
-def _validate_project_name(name: str) -> str:
-    cleaned = name.strip()
-    if not SAFE_NAME_RE.match(cleaned):
-        raise ToolError("Имя проекта может содержать только буквы, цифры, _, -, . и до 80 символов")
-    if cleaned.startswith("."):
-        raise ToolError("Скрытые project names запрещены")
-    return cleaned
+def list_workspace() -> dict[str, Any]:
+    enabled = _write_mode_enabled()
+    if enabled:
+        root = Path(ensure_write_root()["write_root"])
+    else:
+        root = _write_root()
+    projects = []
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if child.is_dir() and not child.name.startswith("."):
+                projects.append(
+                    {
+                        "name": child.name,
+                        "path": str(child),
+                        "is_git_repo": (child / ".git").exists(),
+                        "has_index": (child / "index.html").exists(),
+                        "has_flask_app": (child / "app.py").exists(),
+                    }
+                )
+    return {"write_root": str(root), "enabled": enabled, "projects": projects, "count": len(projects)}
+
+
+def list_write_projects() -> dict[str, Any]:
+    return list_workspace()
 
 
 def create_project_dir(name: str) -> dict[str, Any]:
@@ -109,8 +149,7 @@ def write_text_file(path: str, content: str, overwrite: bool = False) -> dict[st
     ensure_write_root()
     _ensure_text_content(content)
     file_path = resolve_write_path(path)
-    if _is_forbidden_write_file(file_path):
-        raise ToolError(f"Запись файла запрещена политикой безопасности: {file_path.name}")
+    _ensure_text_file(file_path)
     if file_path.exists() and not overwrite:
         raise ToolError(f"Файл уже существует: {file_path}")
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,8 +162,7 @@ def append_text_file(path: str, content: str) -> dict[str, Any]:
     ensure_write_root()
     _ensure_text_content(content)
     file_path = resolve_write_path(path)
-    if _is_forbidden_write_file(file_path):
-        raise ToolError(f"Запись файла запрещена политикой безопасности: {file_path.name}")
+    _ensure_text_file(file_path)
     existing_size = file_path.stat().st_size if file_path.exists() else 0
     if existing_size + len(content.encode("utf-8")) > MAX_WRITE_CHARS:
         raise ToolError("Итоговый файл будет слишком большим")
@@ -135,20 +173,41 @@ def append_text_file(path: str, content: str) -> dict[str, Any]:
     return {"path": str(file_path), "appended_chars": len(content)}
 
 
-def list_write_projects() -> dict[str, Any]:
-    root_info = ensure_write_root()
-    root = Path(root_info["write_root"])
-    projects = []
-    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-        if child.is_dir() and not child.name.startswith("."):
-            projects.append(
-                {
-                    "name": child.name,
-                    "path": str(child),
-                    "is_git_repo": (child / ".git").exists(),
-                }
-            )
-    return {"write_root": str(root), "enabled": True, "projects": projects, "count": len(projects)}
+def read_workspace_file(path: str) -> dict[str, Any]:
+    ensure_write_root()
+    file_path = resolve_write_path(path)
+    if not file_path.is_file():
+        raise ToolError(f"Файл не найден: {file_path}")
+    _ensure_text_file(file_path)
+    text = file_path.read_text(encoding="utf-8")
+    return {"path": str(file_path), "content": text[:MAX_READ_CHARS], "truncated": len(text) > MAX_READ_CHARS}
+
+
+def delete_workspace_file(path: str) -> dict[str, Any]:
+    ensure_write_root()
+    file_path = resolve_write_path(path)
+    if not file_path.is_file():
+        raise ToolError(f"Файл не найден: {file_path}")
+    _ensure_text_file(file_path)
+    file_path.unlink()
+    _log_write("delete_workspace_file", file_path)
+    return {"path": str(file_path), "deleted": True}
+
+
+def delete_workspace_dir(path: str, confirm_token: str | None = None) -> dict[str, Any]:
+    ensure_write_root()
+    directory = resolve_write_path(path)
+    root = _write_root().resolve()
+    if directory == root:
+        raise ToolError("Удалять WRITE_ROOT запрещено")
+    if not directory.is_dir() or directory.is_symlink():
+        raise ToolError(f"Директория не найдена или является symlink: {directory}")
+    expected = f"DELETE:{directory.name}"
+    if confirm_token != expected:
+        raise ToolError(f"Для удаления директории нужен confirm_token={expected}")
+    shutil.rmtree(directory)
+    _log_write("delete_workspace_dir", directory)
+    return {"path": str(directory), "deleted": True}
 
 
 def init_git(path: str) -> dict[str, Any]:
@@ -173,8 +232,17 @@ def init_git(path: str) -> dict[str, Any]:
     }
 
 
-def _static_site_files(title: str, description: str, theme: str) -> dict[str, str]:
-    accent = "#2563eb" if theme != "emerald" else "#059669"
+def _theme_values(theme: str | None) -> dict[str, str]:
+    themes = {
+        "emerald": {"accent": "#059669", "accent2": "#2563eb", "soft": "#ecfdf5"},
+        "violet": {"accent": "#7c3aed", "accent2": "#0891b2", "soft": "#f5f3ff"},
+        "slate": {"accent": "#0f766e", "accent2": "#334155", "soft": "#f8fafc"},
+    }
+    return themes.get((theme or "slate").lower(), themes["slate"])
+
+
+def _static_site_files(title: str, description: str, theme: str | None) -> dict[str, str]:
+    values = _theme_values(theme)
     return {
         "index.html": f"""<!doctype html>
 <html lang="ru">
@@ -186,26 +254,53 @@ def _static_site_files(title: str, description: str, theme: str) -> dict[str, st
 </head>
 <body>
   <header class="hero">
-    <nav class="nav">
+    <nav class="nav" aria-label="Главная навигация">
       <strong>{title}</strong>
-      <a href="#contact">Контакты</a>
+      <div>
+        <a href="#features">Возможности</a>
+        <a href="#workflow">Процесс</a>
+        <a href="#contact">Контакт</a>
+      </div>
     </nav>
     <section class="hero__content">
-      <p class="eyebrow">Тестовый проект Jarvis</p>
+      <p class="eyebrow">Telegram / AI Automation</p>
       <h1>{title}</h1>
       <p>{description}</p>
-      <a class="button" href="#features">Смотреть</a>
+      <div class="hero__actions">
+        <a class="button" href="#contact">Запустить проект</a>
+        <a class="button button--ghost" href="#use-cases">Сценарии</a>
+      </div>
     </section>
   </header>
   <main>
-    <section id="features" class="cards">
-      <article><span>01</span><h2>Быстро</h2><p>Готовый адаптивный каркас без внешних CDN.</p></article>
-      <article><span>02</span><h2>Чисто</h2><p>HTML, CSS и JavaScript разделены по папкам.</p></article>
-      <article><span>03</span><h2>Расширяемо</h2><p>Можно использовать как основу для эксперимента.</p></article>
+    <section id="features" class="section cards">
+      <article><span>01</span><h2>Диалоги</h2><p>Бот отвечает клиентам, уточняет детали и передает заявки команде.</p></article>
+      <article><span>02</span><h2>Автоматизация</h2><p>AI-помощник соединяет Telegram, CRM и внутренние процессы.</p></article>
+      <article><span>03</span><h2>Контроль</h2><p>Логи, сценарии и настройки остаются под управлением владельца.</p></article>
     </section>
-    <section id="contact" class="panel">
-      <h2>Следующий шаг</h2>
-      <p>Открой index.html в браузере или запусти локальный static server внутри проекта.</p>
+    <section id="workflow" class="section split">
+      <div>
+        <p class="eyebrow">Workflow</p>
+        <h2>От сообщения до готовой заявки</h2>
+      </div>
+      <ol class="steps">
+        <li><strong>Понять запрос</strong><span>AI классифицирует намерение и собирает вводные.</span></li>
+        <li><strong>Согласовать действие</strong><span>Бот предлагает следующий шаг без ручной рутины.</span></li>
+        <li><strong>Передать результат</strong><span>Команда получает структурированные данные.</span></li>
+      </ol>
+    </section>
+    <section id="use-cases" class="section use-cases">
+      <h2>Где применить</h2>
+      <div class="case-grid">
+        <article><h3>Запись клиентов</h3><p>Салоны, сервисы, консультации и частные специалисты.</p></article>
+        <article><h3>Поддержка</h3><p>Первичная линия ответов с маршрутизацией сложных вопросов.</p></article>
+        <article><h3>Продажи</h3><p>Квалификация лидов и аккуратная передача менеджеру.</p></article>
+      </div>
+    </section>
+    <section id="contact" class="section cta">
+      <h2>Готово к тестовому запуску</h2>
+      <p>Этот landing создан Jarvis внутри безопасного WRITE_ROOT и не использует внешние CDN.</p>
+      <a class="button" href="mailto:hello@example.local">Обсудить запуск</a>
     </section>
   </main>
   <script src="assets/js/main.js"></script>
@@ -214,27 +309,31 @@ def _static_site_files(title: str, description: str, theme: str) -> dict[str, st
 """,
         "assets/css/style.css": f""":root {{
   color-scheme: light;
-  --accent: {accent};
+  --accent: {values['accent']};
+  --accent-2: {values['accent2']};
   --ink: #111827;
-  --muted: #5b6472;
-  --line: #d7dde7;
-  --surface: #f7f9fc;
+  --muted: #566174;
+  --line: #d9e0ea;
+  --surface: #f8fafc;
+  --soft: {values['soft']};
 }}
 * {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
 body {{
   margin: 0;
   font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: var(--ink);
-  background: #ffffff;
+  background: #fff;
 }}
 .hero {{
-  min-height: 84vh;
-  padding: 28px clamp(20px, 6vw, 72px);
+  min-height: 88vh;
+  padding: 28px clamp(20px, 6vw, 76px);
   display: grid;
   grid-template-rows: auto 1fr;
   background:
-    linear-gradient(135deg, rgba(37, 99, 235, .16), rgba(5, 150, 105, .12)),
-    var(--surface);
+    radial-gradient(circle at 78% 22%, rgba(15, 118, 110, .18), transparent 28%),
+    linear-gradient(135deg, var(--soft), #fff 58%);
+  overflow: hidden;
 }}
 .nav {{
   display: flex;
@@ -242,42 +341,81 @@ body {{
   align-items: center;
   gap: 20px;
 }}
-.nav a {{ color: var(--ink); text-decoration: none; }}
+.nav div {{ display: flex; gap: 18px; flex-wrap: wrap; }}
+.nav a {{ color: var(--ink); text-decoration: none; font-weight: 650; }}
 .hero__content {{
   align-self: center;
-  max-width: 780px;
+  max-width: 860px;
   animation: rise .7s ease both;
 }}
-.eyebrow {{ color: var(--accent); font-weight: 700; text-transform: uppercase; }}
-h1 {{ font-size: clamp(42px, 8vw, 92px); line-height: .95; margin: 0 0 24px; }}
-p {{ color: var(--muted); font-size: 18px; line-height: 1.65; }}
+.eyebrow {{
+  color: var(--accent);
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}}
+h1 {{
+  font-size: clamp(44px, 8vw, 94px);
+  line-height: .95;
+  margin: 0 0 24px;
+  max-width: 900px;
+}}
+h2 {{ font-size: clamp(28px, 4vw, 52px); line-height: 1.05; margin: 0 0 18px; }}
+h3 {{ margin-bottom: 8px; }}
+p, li span {{ color: var(--muted); font-size: 18px; line-height: 1.65; }}
+.hero__actions {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 24px; }}
 .button {{
   display: inline-flex;
-  margin-top: 18px;
+  align-items: center;
+  justify-content: center;
+  min-height: 46px;
   padding: 12px 18px;
   border-radius: 8px;
   background: var(--accent);
   color: white;
   text-decoration: none;
-  font-weight: 700;
+  font-weight: 800;
+  transition: transform .2s ease, box-shadow .2s ease;
 }}
-.cards {{
+.button:hover {{ transform: translateY(-2px); box-shadow: 0 14px 30px rgba(15, 23, 42, .14); }}
+.button--ghost {{ color: var(--ink); background: white; border: 1px solid var(--line); }}
+.section {{ padding: 62px clamp(20px, 6vw, 76px); }}
+.cards, .case-grid {{
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
-  padding: 56px clamp(20px, 6vw, 72px);
 }}
-.cards article, .panel {{
+.cards article, .case-grid article, .cta {{
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 24px;
+  background: white;
 }}
-.cards span {{ color: var(--accent); font-weight: 800; }}
-.panel {{ margin: 0 clamp(20px, 6vw, 72px) 56px; }}
+.cards span {{ color: var(--accent); font-weight: 900; }}
+.split {{
+  display: grid;
+  grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+  gap: 32px;
+  background: var(--surface);
+}}
+.steps {{ margin: 0; padding-left: 22px; }}
+.steps li {{ margin-bottom: 18px; }}
+.steps strong {{ display: block; margin-bottom: 4px; }}
+.use-cases {{ background: white; }}
+.cta {{
+  margin: 0 clamp(20px, 6vw, 76px) 64px;
+  background: linear-gradient(135deg, var(--ink), #233044);
+  color: white;
+}}
+.cta p {{ color: #dbe3ef; }}
 @keyframes rise {{ from {{ opacity: 0; transform: translateY(18px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-@media (max-width: 760px) {{
-  .cards {{ grid-template-columns: 1fr; }}
-  .hero {{ min-height: 76vh; }}
+@media (max-width: 820px) {{
+  .cards, .case-grid, .split {{ grid-template-columns: 1fr; }}
+  .hero {{ min-height: 78vh; }}
+  .nav {{ align-items: flex-start; flex-direction: column; }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+  *, *::before, *::after {{ animation-duration: .01ms !important; scroll-behavior: auto !important; transition: none !important; }}
 }}
 """,
         "assets/js/main.js": """document.querySelectorAll('a[href^="#"]').forEach((link) => {
@@ -287,6 +425,17 @@ p {{ color: var(--muted); font-size: 18px; line-height: 1.65; }}
     event.preventDefault();
     target.scrollIntoView({ behavior: "smooth", block: "start" });
   });
+});
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach((entry) => {
+    if (entry.isIntersecting) entry.target.classList.add("is-visible");
+  });
+}, { threshold: 0.16 });
+
+document.querySelectorAll(".cards article, .case-grid article, .steps li").forEach((item) => {
+  item.classList.add("reveal");
+  observer.observe(item);
 });
 """,
         "README.md": f"""# {title}
@@ -298,17 +447,22 @@ p {{ color: var(--muted); font-size: 18px; line-height: 1.65; }}
 Open `index.html` in a browser, or run inside this directory:
 
 ```bash
-python3 -m http.server 8000
+python3 -m http.server 8700
 ```
 """,
     }
 
 
-def write_static_site(project_name: str, title: str = "", description: str = "", theme: str = "blue") -> dict[str, Any]:
+def create_static_site(
+    project_name: str,
+    title: str = "",
+    description: str = "",
+    theme: str | None = None,
+) -> dict[str, Any]:
     project = create_project_dir(project_name)
     name = project["project_name"]
     site_title = title or name.replace("-", " ").replace("_", " ").title()
-    site_description = description or "Современный статический сайт, созданный в безопасной workspace-песочнице."
+    site_description = description or "Landing page для Telegram/AI bot автоматизации."
     created = []
     for relative, content in _static_site_files(site_title, site_description, theme).items():
         result = write_text_file(f"{name}/{relative}", content, overwrite=False)
@@ -317,9 +471,12 @@ def write_static_site(project_name: str, title: str = "", description: str = "",
     return {"project_name": name, "path": project["path"], "created_files": created, "check": check}
 
 
-def _flask_files(project_name: str) -> dict[str, str]:
-    title = project_name.replace("-", " ").replace("_", " ").title()
-    static = _static_site_files(title, "Минимальный Flask-проект в безопасной workspace-песочнице.", "emerald")
+def write_static_site(project_name: str, title: str = "", description: str = "", theme: str = "slate") -> dict[str, Any]:
+    return create_static_site(project_name, title, description, theme)
+
+
+def _flask_files(project_name: str, title: str, description: str, theme: str | None) -> dict[str, str]:
+    static = _static_site_files(title, description, theme)
     return {
         "app.py": '''import os
 
@@ -338,12 +495,14 @@ if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
 ''',
         "requirements.txt": "Flask>=3.0,<4.0\n",
-        "templates/index.html": static["index.html"].replace('href="assets/css/style.css"', 'href="{{ url_for(\'static\', filename=\'css/style.css\') }}"').replace('src="assets/js/main.js"', 'src="{{ url_for(\'static\', filename=\'js/main.js\') }}"'),
+        "templates/index.html": static["index.html"]
+        .replace('href="assets/css/style.css"', 'href="{{ url_for(\'static\', filename=\'css/style.css\') }}"')
+        .replace('src="assets/js/main.js"', 'src="{{ url_for(\'static\', filename=\'js/main.js\') }}"'),
         "static/css/style.css": static["assets/css/style.css"],
         "static/js/main.js": static["assets/js/main.js"],
         "README.md": f"""# {title}
 
-Minimal Flask project created inside Jarvis WRITE_ROOT.
+{description}
 
 ## Run
 
@@ -358,15 +517,37 @@ Set `FLASK_DEBUG=1` only for local debugging.
     }
 
 
-def write_flask_project(project_name: str) -> dict[str, Any]:
+def create_flask_site(
+    project_name: str,
+    title: str = "",
+    description: str = "",
+    theme: str | None = None,
+) -> dict[str, Any]:
     project = create_project_dir(project_name)
     name = project["project_name"]
+    site_title = title or name.replace("-", " ").replace("_", " ").title()
+    site_description = description or "Минимальный Flask-сайт для Telegram/AI bot автоматизации."
     created = []
-    for relative, content in _flask_files(name).items():
+    for relative, content in _flask_files(name, site_title, site_description, theme).items():
         result = write_text_file(f"{name}/{relative}", content, overwrite=False)
         created.append(result["path"])
     check = run_safe_project_check(name)
     return {"project_name": name, "path": project["path"], "created_files": created, "check": check}
+
+
+def write_flask_project(project_name: str) -> dict[str, Any]:
+    return create_flask_site(project_name)
+
+
+def update_static_site_file(
+    project_name: str,
+    relative_path: str,
+    content: str,
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    project = _validate_project_name(project_name)
+    _reject_path_traversal(relative_path)
+    return write_text_file(f"{project}/{relative_path}", content, overwrite=overwrite)
 
 
 def run_safe_project_check(path: str) -> dict[str, Any]:
@@ -382,30 +563,26 @@ def run_safe_project_check(path: str) -> dict[str, Any]:
     }
     py_files = [p for p in files if p.suffix == ".py"][:100]
     if py_files:
-        compile_result = subprocess.run(
-            ["python3", "-m", "py_compile", *[str(path) for path in py_files]],
-            cwd=str(project),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-        result["python_compile"] = {
-            "returncode": compile_result.returncode,
-            "stdout": compile_result.stdout.strip()[:4000],
-            "stderr": compile_result.stderr.strip()[:4000],
-        }
+        errors = []
+        with tempfile.TemporaryDirectory(prefix="jarvis_workspace_py_compile_") as tmp:
+            tmp_path = Path(tmp)
+            for index, py_file in enumerate(py_files):
+                try:
+                    py_compile.compile(str(py_file), cfile=str(tmp_path / f"{index}.pyc"), doraise=True)
+                except py_compile.PyCompileError as e:
+                    errors.append({"path": str(py_file), "error": e.msg[:2000]})
+        result["python_compile"] = {"returncode": 1 if errors else 0, "errors": errors}
     return result
 
 
-def workspace_tree(project_name: str, depth: int = 3) -> dict[str, Any]:
+def workspace_tree(path: str | None = None, depth: int = 3) -> dict[str, Any]:
     ensure_write_root()
-    project = resolve_write_path(_validate_project_name(project_name))
-    if not project.is_dir():
-        raise ToolError(f"Проект не найден: {project}")
+    root = _write_root().resolve()
+    target = resolve_write_path(path) if path else root
+    if not target.is_dir():
+        raise ToolError(f"Директория не найдена: {target}")
     depth = max(1, min(int(depth), 5))
-    lines = [project.name]
+    lines = [target.name or str(target)]
 
     def walk(directory: Path, current_depth: int, prefix: str) -> None:
         if current_depth >= depth:
@@ -413,7 +590,7 @@ def workspace_tree(project_name: str, depth: int = 3) -> dict[str, Any]:
         children = [
             child
             for child in sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-            if child.name not in {".git", "__pycache__", "venv", ".venv"}
+            if child.name not in TREE_EXCLUDED and not child.name.startswith(".")
         ][:80]
         for index, child in enumerate(children):
             connector = "`-- " if index == len(children) - 1 else "|-- "
@@ -421,5 +598,5 @@ def workspace_tree(project_name: str, depth: int = 3) -> dict[str, Any]:
             if child.is_dir():
                 walk(child, current_depth + 1, prefix + ("    " if index == len(children) - 1 else "|   "))
 
-    walk(project, 0, "")
-    return {"path": str(project), "tree": "\n".join(lines)}
+    walk(target, 0, "")
+    return {"path": str(target), "tree": "\n".join(lines)}

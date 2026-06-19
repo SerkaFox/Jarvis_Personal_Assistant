@@ -110,6 +110,9 @@ Default configuration:
 ```env
 WRITE_MODE_ENABLED=false
 WRITE_ROOT=/home/seradmin/jarvis_workspace
+PREVIEW_PORT_MIN=8700
+PREVIEW_PORT_MAX=8799
+SERVER_HOST=http://192.168.0.XXX
 ```
 
 `WRITE_MODE_ENABLED` is disabled by default. Set it to `true` only when you want Jarvis to create files in the sandbox. `WRITE_ROOT` is the only directory where write tools can create directories, write text files, and run `git init`. Paths with `..` are rejected, and secret-like files such as `.env`, keys, PEM files, sqlite/db files, and token/password filenames are blocked.
@@ -120,13 +123,19 @@ Allowed write workspace operations:
 create_project_dir(name)
 write_text_file(path, content, overwrite=false)
 append_text_file(path, content)
-list_write_projects()
+read_workspace_file(path)
+delete_workspace_file(path)
+delete_workspace_dir(path, confirm_token)
+list_workspace()
 init_git(path)
-write_static_site(project_name, title, description, theme)
+create_static_site(project_name, title, description, theme)
+create_flask_site(project_name, title, description, theme)
 run_safe_project_check(path)
 ```
 
-The write tools do not deploy, do not use sudo, do not install dependencies, and do not write outside `WRITE_ROOT`.
+The write tools do not deploy, do not use sudo, do not install dependencies, and do not write outside `WRITE_ROOT`. Jarvis must not say that it created, wrote, deleted, or started something unless the corresponding tool completed successfully.
+
+Preview tools run only direct local preview processes from projects inside `WRITE_ROOT`. They do not open nginx/systemd and do not kill processes unless Jarvis started and recorded them in `data/previews.json`.
 
 ### Commands
 
@@ -195,6 +204,27 @@ Creates a static test site inside `WRITE_ROOT` with `index.html`, `assets/css/st
 ```
 
 Creates a minimal Flask project inside `WRITE_ROOT` with `app.py`, `requirements.txt`, templates, static assets, and `README.md`. The generated app uses `FLASK_DEBUG=1` only when explicitly set in the environment.
+
+```text
+/write_file <project>/<file> <content>
+```
+
+Writes a text file inside `WRITE_ROOT`. Existing files are overwritten only through this explicit command path.
+
+```text
+/delete_file <project>/<file>
+```
+
+Deletes one file inside `WRITE_ROOT`. Directory deletion is not exposed as a Telegram command.
+
+```text
+/preview_start <project>
+/preview_stop <project>
+/preview_list
+/preview_status <project>
+```
+
+Starts, stops, lists, and checks direct preview processes for workspace projects. Static projects run with `python3 -m http.server` on a port from `PREVIEW_PORT_MIN..PREVIEW_PORT_MAX`. Flask projects are started only when a `venv` already exists; dependencies are not installed automatically.
 
 ```text
 /preview_info <name>
@@ -285,6 +315,12 @@ These commands are intentionally disabled at the current read-only stage. They d
 ```
 
 Creates a static site in `WRITE_ROOT` when `WRITE_MODE_ENABLED=true`; otherwise Jarvis explains that write mode is disabled.
+
+```text
+создай сайт в папке Botosite
+```
+
+Creates real files under `/home/seradmin/jarvis_workspace/Botosite` when write mode is enabled, then replies with `tools_called`, actual path, created files, and preview instructions.
 
 ```text
 запомни, мой день рождения 13 октября 1982

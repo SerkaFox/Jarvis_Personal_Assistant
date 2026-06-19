@@ -27,6 +27,7 @@ from action_schemas import extract_json_object, validate_create_static_site_acti
 from agent import answer_with_tools
 from intent_router import detect_intent, extract_mentioned_project, format_workspace_inventory, handle_detected_intent
 import memory
+import semantic_router
 from tools_fs import ToolError, allowed_roots_info, search_text, tree_summary
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
 from tools_project import inspect_project, project_structure
@@ -755,55 +756,185 @@ def fixture_site_spec(user_text: str, project_name: str) -> dict:
     }
 
 
+def _preview_start_workflow(project: str, chat_id: str | None, user_text: str = "") -> tuple[str, dict]:
+    tools_called = ["verify_project_files", "start_preview", "preview_status"]
+    try:
+        verify = verify_project_files(project)
+        if not Path(verify["path"]).is_dir() or not verify.get("success"):
+            raise RuntimeError("Проект не найден или файлы неполные")
+        preview = start_preview(project)
+        status = preview_status(project)
+        if not preview.get("success") or not status.get("running"):
+            raise RuntimeError("Preview tool не подтвердил запущенный процесс")
+        save_last_action(
+            chat_id,
+            {
+                "intent": "start_preview",
+                "project_name": project,
+                "success": True,
+                "path": verify["path"],
+                "created_files": [],
+                "preview_url": preview["url"],
+                "tools_called": tools_called,
+            },
+        )
+        return (
+            _format_write_success(
+                "Запустил preview для workspace-проекта.",
+                tools_called,
+                verify["path"],
+                preview_url=preview["url"],
+            ),
+            {
+                "detected": {"intent": "preview_start", "project": project},
+                "tools_called": tools_called,
+                "errors": [],
+                "resolved_path": verify["path"],
+                "project": project,
+                "preview_url": preview["url"],
+            },
+        )
+    except Exception as e:
+        save_last_action(chat_id, {"intent": "start_preview", "project_name": project, "success": False, "error": str(e), "tools_called": tools_called})
+        save_last_error(chat_id=chat_id or "", user_id="", handler="preview_start_workflow", error=e, user_text=user_text)
+        return (
+            f"Preview не запущен: {e}",
+            {"detected": {"intent": "preview_start", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
+        )
+
+
+def _preview_stop_workflow(project: str, chat_id: str | None, user_text: str = "") -> tuple[str, dict]:
+    tools_called = ["stop_preview"]
+    try:
+        result = stop_preview(project)
+        save_last_action(
+            chat_id,
+            {
+                "intent": "stop_preview",
+                "project_name": project,
+                "success": bool(result.get("success")),
+                "path": result.get("path", ""),
+                "error": result.get("error", ""),
+                "tools_called": tools_called,
+                "verification": result.get("checks"),
+            },
+        )
+        return (
+            _format_stop_result("stop_preview result:", result),
+            {
+                "detected": {"intent": "stop_preview", "project": project},
+                "tools_called": tools_called,
+                "errors": [] if result.get("success") else [result.get("error", "")],
+            },
+        )
+    except Exception as e:
+        save_last_error(chat_id=chat_id or "", user_id="", handler="preview_stop_workflow", error=e, user_text=user_text)
+        return (
+            f"Не смог остановить preview: {e}",
+            {"detected": {"intent": "stop_preview", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
+        )
+
+
+def _preview_stop_by_port_workflow(port: int, chat_id: str | None, user_text: str = "") -> tuple[str, dict]:
+    tools_called = ["stop_preview_by_port"]
+    try:
+        result = stop_preview_by_port(port)
+        save_last_action(
+            chat_id,
+            {
+                "intent": "stop_preview_by_port",
+                "project_name": f"port:{port}",
+                "success": bool(result.get("success")),
+                "path": result.get("cwd", ""),
+                "error": result.get("error", ""),
+                "tools_called": tools_called,
+                "verification": result.get("checks"),
+            },
+        )
+        return (
+            _format_stop_result("stop_preview_by_port result:", result),
+            {
+                "detected": {"intent": "stop_preview_by_port", "port": port},
+                "tools_called": tools_called,
+                "errors": [] if result.get("success") else [result.get("error", "")],
+            },
+        )
+    except Exception as e:
+        save_last_error(chat_id=chat_id or "", user_id="", handler="preview_stop_by_port_workflow", error=e, user_text=user_text)
+        return (
+            f"Не смог остановить preview на порту {port}: {e}",
+            {"detected": {"intent": "stop_preview_by_port", "port": port}, "tools_called": tools_called, "errors": [str(e)]},
+        )
+
+
+def _preview_stop_all_workflow(chat_id: str | None) -> tuple[str, dict]:
+    rows = _stop_all_previews()
+    save_last_action(
+        chat_id,
+        {
+            "intent": "preview_stop_all",
+            "project_name": ", ".join(row["project"] for row in rows) or "-",
+            "success": all(row["stopped"] for row in rows) if rows else True,
+            "tools_called": ["stop_preview"] * len(rows),
+            "verification": rows,
+        },
+    )
+    return (
+        _format_stop_all_table(rows),
+        {"detected": {"intent": "preview_stop_all"}, "tools_called": ["stop_preview"] * len(rows), "errors": []},
+    )
+
+
+def _workspace_delete_workflow(project: str | None, chat_id: str | None, user_text: str = "") -> tuple[str, dict]:
+    if not project:
+        try:
+            projects = [item["name"] for item in list_workspace()["projects"]]
+        except Exception:
+            projects = []
+        listing = ", ".join(projects) or "-"
+        return (
+            "Нужно явно указать проект для удаления (опасное действие).\n"
+            f"Доступные workspace-проекты: {listing}\n"
+            "Используй: /workspace_delete <project>",
+            {"detected": {"intent": "delete_workspace_dir"}, "tools_called": [], "errors": ["project not specified"]},
+        )
+    tools_called = ["delete_workspace_dir"]
+    try:
+        result = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        save_last_action(
+            chat_id,
+            {
+                "intent": "delete_workspace_dir",
+                "project_name": result.get("project_name", project),
+                "success": bool(result.get("success")),
+                "path": result.get("path", ""),
+                "error": result.get("error", ""),
+                "tools_called": tools_called,
+                "verification": result.get("verification"),
+            },
+        )
+        return (
+            _format_delete_result(result),
+            {
+                "detected": {"intent": "delete_workspace_dir", "project": project},
+                "tools_called": tools_called,
+                "errors": [] if result.get("success") else [result.get("error", "")],
+            },
+        )
+    except Exception as e:
+        save_last_error(chat_id=chat_id or "", user_id="", handler="workspace_delete_workflow", error=e, user_text=user_text)
+        return (
+            f"Не смог удалить проект {project}: {e}",
+            {"detected": {"intent": "delete_workspace_dir", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
+        )
+
+
 def workspace_status_answer(user_text: str, chat_id: str | None = None) -> tuple[str, dict] | None:
     if not _is_workspace_status_question(user_text) and not _wants_start_preview(user_text):
         return None
     project = _workspace_project_from_context(user_text, chat_id)
     if _wants_start_preview(user_text) and project:
-        tools_called = ["verify_project_files", "start_preview", "preview_status"]
-        try:
-            verify = verify_project_files(project)
-            if not Path(verify["path"]).is_dir() or not verify.get("success"):
-                raise RuntimeError("Проект не найден или файлы неполные")
-            preview = start_preview(project)
-            status = preview_status(project)
-            if not preview.get("success") or not status.get("running"):
-                raise RuntimeError("Preview tool не подтвердил запущенный процесс")
-            save_last_action(
-                chat_id,
-                {
-                    "intent": "start_preview",
-                    "project_name": project,
-                    "success": True,
-                    "path": verify["path"],
-                    "created_files": [],
-                    "preview_url": preview["url"],
-                    "tools_called": tools_called,
-                },
-            )
-            return (
-                _format_write_success(
-                    "Запустил preview для workspace-проекта.",
-                    tools_called,
-                    verify["path"],
-                    preview_url=preview["url"],
-                ),
-                {
-                    "detected": {"intent": "preview_start", "project": project},
-                    "tools_called": tools_called,
-                    "errors": [],
-                    "resolved_path": verify["path"],
-                    "project": project,
-                    "preview_url": preview["url"],
-                },
-            )
-        except Exception as e:
-            save_last_action(chat_id, {"intent": "start_preview", "project_name": project, "success": False, "error": str(e), "tools_called": tools_called})
-            save_last_error(chat_id=chat_id or "", user_id="", handler="workspace_status_answer", error=e, user_text=user_text)
-            return (
-                f"Preview не запущен: {e}",
-                {"detected": {"intent": "preview_start", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
-            )
+        return _preview_start_workflow(project, chat_id, user_text)
     return workspace_where_answer(project, chat_id=chat_id)
 
 
@@ -948,52 +1079,10 @@ def stop_delete_answer(user_text: str, chat_id: str | None = None) -> tuple[str,
     if wants_stop:
         port = _extract_port(lowered)
         if port is not None:
-            tools_called = ["stop_preview_by_port"]
-            try:
-                result = stop_preview_by_port(port)
-                save_last_action(
-                    chat_id,
-                    {
-                        "intent": "stop_preview_by_port",
-                        "project_name": f"port:{port}",
-                        "success": bool(result.get("success")),
-                        "path": result.get("cwd", ""),
-                        "error": result.get("error", ""),
-                        "tools_called": tools_called,
-                        "verification": result.get("checks"),
-                    },
-                )
-                return (
-                    _format_stop_result("stop_preview_by_port result:", result),
-                    {
-                        "detected": {"intent": "stop_preview_by_port", "port": port},
-                        "tools_called": tools_called,
-                        "errors": [] if result.get("success") else [result.get("error", "")],
-                    },
-                )
-            except Exception as e:
-                save_last_error(chat_id=chat_id or "", user_id="", handler="stop_delete_answer", error=e, user_text=user_text)
-                return (
-                    f"Не смог остановить preview на порту {port}: {e}",
-                    {"detected": {"intent": "stop_preview_by_port", "port": port}, "tools_called": tools_called, "errors": [str(e)]},
-                )
+            return _preview_stop_by_port_workflow(port, chat_id, user_text)
 
         if any(phrase in lowered for phrase in STOP_ALL_PHRASES):
-            rows = _stop_all_previews()
-            save_last_action(
-                chat_id,
-                {
-                    "intent": "preview_stop_all",
-                    "project_name": ", ".join(row["project"] for row in rows) or "-",
-                    "success": all(row["stopped"] for row in rows) if rows else True,
-                    "tools_called": ["stop_preview"] * len(rows),
-                    "verification": rows,
-                },
-            )
-            return (
-                _format_stop_all_table(rows),
-                {"detected": {"intent": "preview_stop_all"}, "tools_called": ["stop_preview"] * len(rows), "errors": []},
-            )
+            return _preview_stop_all_workflow(chat_id)
 
         if any(word in lowered for word in ("сервер", "preview", "превью")):
             project = _workspace_project_from_context(user_text, chat_id)
@@ -1002,35 +1091,7 @@ def stop_delete_answer(user_text: str, chat_id: str | None = None) -> tuple[str,
                     "Не понял, какой проект остановить. Укажи имя: /preview_stop <project> или назови порт.",
                     {"detected": {"intent": "stop_preview"}, "tools_called": [], "errors": ["project not resolved"]},
                 )
-            tools_called = ["stop_preview"]
-            try:
-                result = stop_preview(project)
-                save_last_action(
-                    chat_id,
-                    {
-                        "intent": "stop_preview",
-                        "project_name": project,
-                        "success": bool(result.get("success")),
-                        "path": result.get("path", ""),
-                        "error": result.get("error", ""),
-                        "tools_called": tools_called,
-                        "verification": result.get("checks"),
-                    },
-                )
-                return (
-                    _format_stop_result("stop_preview result:", result),
-                    {
-                        "detected": {"intent": "stop_preview", "project": project},
-                        "tools_called": tools_called,
-                        "errors": [] if result.get("success") else [result.get("error", "")],
-                    },
-                )
-            except Exception as e:
-                save_last_error(chat_id=chat_id or "", user_id="", handler="stop_delete_answer", error=e, user_text=user_text)
-                return (
-                    f"Не смог остановить preview: {e}",
-                    {"detected": {"intent": "stop_preview", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
-                )
+            return _preview_stop_workflow(project, chat_id, user_text)
 
     if wants_delete and any(word in lowered for word in ("папк", "сайт", "проект", "workspace")):
         explicit_name = _workspace_name_from_text(user_text)
@@ -1040,47 +1101,7 @@ def stop_delete_answer(user_text: str, chat_id: str | None = None) -> tuple[str,
             project = _workspace_project_from_context(user_text, chat_id)
             if project and not _workspace_project_exists(project):
                 project = None
-        if not project:
-            try:
-                projects = [item["name"] for item in list_workspace()["projects"]]
-            except Exception:
-                projects = []
-            listing = ", ".join(projects) or "-"
-            return (
-                "Нужно явно указать проект для удаления (опасное действие).\n"
-                f"Доступные workspace-проекты: {listing}\n"
-                "Используй: /workspace_delete <project>",
-                {"detected": {"intent": "delete_workspace_dir"}, "tools_called": [], "errors": ["project not specified"]},
-            )
-        tools_called = ["delete_workspace_dir"]
-        try:
-            result = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
-            save_last_action(
-                chat_id,
-                {
-                    "intent": "delete_workspace_dir",
-                    "project_name": result.get("project_name", project),
-                    "success": bool(result.get("success")),
-                    "path": result.get("path", ""),
-                    "error": result.get("error", ""),
-                    "tools_called": tools_called,
-                    "verification": result.get("verification"),
-                },
-            )
-            return (
-                _format_delete_result(result),
-                {
-                    "detected": {"intent": "delete_workspace_dir", "project": project},
-                    "tools_called": tools_called,
-                    "errors": [] if result.get("success") else [result.get("error", "")],
-                },
-            )
-        except Exception as e:
-            save_last_error(chat_id=chat_id or "", user_id="", handler="stop_delete_answer", error=e, user_text=user_text)
-            return (
-                f"Не смог удалить проект {project}: {e}",
-                {"detected": {"intent": "delete_workspace_dir", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
-            )
+        return _workspace_delete_workflow(project, chat_id, user_text)
 
     return None
 
@@ -1116,6 +1137,193 @@ def pending_task_for_text(user_text: str) -> str | None:
     return None
 
 
+def semantic_router_answer(
+    user_text: str,
+    chat_id: str | None = None,
+    recent_messages: list[dict] | None = None,
+    current_project: str | None = None,
+) -> tuple[str, dict] | None:
+    last_action = get_last_action(chat_id)
+    classification = semantic_router.classify_intent(
+        user_text,
+        recent_messages=recent_messages,
+        current_project=current_project,
+        last_action=last_action,
+        ask_model=ask_ollama_messages,
+    )
+    intent = classification.get("intent", "unknown")
+    confidence = float(classification.get("confidence") or 0.0)
+    action_like = semantic_router.is_action_like(user_text)
+
+    if semantic_router.is_router_failure(classification):
+        if action_like:
+            return (
+                semantic_router.CLARIFY_MESSAGE,
+                {"detected": {"intent": "unknown"}, "tools_called": [], "errors": ["router_failed"], "router": classification},
+            )
+        return None
+
+    if intent == "unknown":
+        if action_like:
+            return (
+                semantic_router.CLARIFY_MESSAGE,
+                {"detected": {"intent": "unknown"}, "tools_called": [], "errors": ["router_uncertain"], "router": classification},
+            )
+        intent = "normal_chat"
+
+    if intent != "normal_chat" and confidence < semantic_router.LOW_CONFIDENCE_THRESHOLD and action_like:
+        return (
+            semantic_router.CLARIFY_MESSAGE,
+            {"detected": {"intent": intent}, "tools_called": [], "errors": ["low_confidence"], "router": classification},
+        )
+
+    project = classification.get("project_name") or current_project
+    start_preview_flag = intent == "create_and_preview" or bool(classification.get("start_preview"))
+
+    if intent == "normal_chat":
+        answer = ask_ollama(user_text, chat_id=chat_id)
+        return answer, {"detected": {"intent": "normal_chat"}, "tools_called": [], "errors": [], "router": classification}
+
+    if intent == "workspace_inventory":
+        routed = handle_detected_intent({"intent": "workspace_inventory"})
+        return routed["answer"], {**routed, "detected": {"intent": "workspace_inventory"}, "router": classification}
+
+    if intent in ("create_static_site", "create_and_preview"):
+        name = project or _slug_from_text(user_text)
+        answer, debug_info = create_site_workflow(
+            user_text, project_name=name, chat_id=chat_id, start_preview_requested=start_preview_flag
+        )
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "where_project":
+        proj = project or _workspace_project_from_context(user_text, chat_id)
+        answer, debug_info = workspace_where_answer(proj, chat_id=chat_id)
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "preview_start":
+        proj = project or _workspace_project_from_context(user_text, chat_id)
+        if not proj:
+            return (
+                semantic_router.CLARIFY_MESSAGE,
+                {"detected": {"intent": "preview_start"}, "tools_called": [], "errors": ["project not resolved"], "router": classification},
+            )
+        answer, debug_info = _preview_start_workflow(proj, chat_id, user_text)
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "preview_stop":
+        proj = project or _workspace_project_from_context(user_text, chat_id)
+        if not proj:
+            return (
+                semantic_router.CLARIFY_MESSAGE,
+                {"detected": {"intent": "preview_stop"}, "tools_called": [], "errors": ["project not resolved"], "router": classification},
+            )
+        answer, debug_info = _preview_stop_workflow(proj, chat_id, user_text)
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "preview_stop_all":
+        answer, debug_info = _preview_stop_all_workflow(chat_id)
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "workspace_delete":
+        answer, debug_info = _workspace_delete_workflow(project, chat_id, user_text)
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "project_inspect":
+        proj = project or extract_mentioned_project(user_text) or current_project
+        if not proj:
+            return None
+        routed = handle_detected_intent({"intent": "inspect_project", "project": proj}, summarize_project=summarize_project_with_ollama)
+        return routed["answer"], {**routed, "detected": {"intent": "inspect_project", "project": proj}, "router": classification}
+
+    if intent == "safe_code_check":
+        proj = project or current_project or extract_mentioned_project(user_text)
+        if not proj:
+            return None
+        routed = handle_detected_intent({"intent": "safe_code_check", "project": proj})
+        return routed["answer"], {**routed, "detected": {"intent": "safe_code_check", "project": proj}, "router": classification}
+
+    if intent == "git_repos":
+        routed = handle_detected_intent({"intent": "list_projects"})
+        return routed["answer"], {**routed, "detected": {"intent": "list_projects"}, "router": classification}
+
+    if intent == "git_status":
+        proj = project or current_project or extract_mentioned_project(user_text)
+        if not proj:
+            return None
+        routed = handle_detected_intent({"intent": "git_status", "project": proj})
+        return routed["answer"], {**routed, "detected": {"intent": "git_status", "project": proj}, "router": classification}
+
+    if intent == "git_diff":
+        proj = project or current_project or extract_mentioned_project(user_text)
+        if not proj:
+            return None
+        routed = handle_detected_intent({"intent": "git_diff", "project": proj})
+        return routed["answer"], {**routed, "detected": {"intent": "git_diff", "project": proj}, "router": classification}
+
+    if intent == "memory_save":
+        candidates = memory.extract_memory_candidates(user_text)
+        if not candidates:
+            candidates = [{"kind": "note", "key": "_".join(user_text.lower().split()[:5])[:80], "value": user_text, "confidence": 0.8}]
+        for candidate in candidates:
+            memory.upsert_memory(**candidate)
+        answer = "Запомнил: " + ", ".join(candidate["key"] for candidate in candidates)
+        return answer, {
+            "detected": {"intent": "memory_save"},
+            "tools_called": ["extract_memory_candidates", "upsert_memory"],
+            "errors": [],
+            "router": classification,
+        }
+
+    if intent == "memory_query":
+        rows = memory.list_memories(20)
+        answer = "Память пуста." if not rows else "\n".join(
+            f"{row['key']}: {row['value']} ({row['kind']}, {row['confidence']})" for row in rows
+        )
+        return answer, {
+            "detected": {"intent": "memory_query"},
+            "tools_called": ["list_memories"],
+            "errors": [],
+            "router": classification,
+        }
+
+    if intent == "last_action":
+        answer = _format_last_action(get_last_action(chat_id))
+        return answer, {
+            "detected": {"intent": "last_action"},
+            "tools_called": ["get_last_action"],
+            "errors": [],
+            "router": classification,
+        }
+
+    if intent == "last_error":
+        item = latest_error(chat_id)
+        if not item:
+            answer = "Ошибок нет."
+        else:
+            answer = "\n".join(
+                [
+                    f"timestamp: {item.get('timestamp')}",
+                    f"handler: {item.get('handler')}",
+                    f"error_type: {item.get('error_type')}",
+                    f"error_message: {item.get('error_message')}",
+                ]
+            )
+        return answer, {
+            "detected": {"intent": "last_error"},
+            "tools_called": ["latest_error"],
+            "errors": [],
+            "router": classification,
+        }
+
+    return None
+
+
 def answer_user_text(
     user_text: str,
     use_agent: bool,
@@ -1131,6 +1339,20 @@ def answer_user_text(
     if memory_status:
         detected = {"intent": "memory_status"}
         return memory_status, {"detected": detected, "tools_called": [], "errors": []}
+
+    current_project = memory.get_current_project(chat_id) if chat_id else None
+
+    router_answer = semantic_router_answer(user_text, chat_id=chat_id, recent_messages=recent_messages, current_project=current_project)
+    if router_answer:
+        answer, debug_info = router_answer
+        router_project = (debug_info.get("router") or {}).get("project_name") or debug_info.get("detected", {}).get("project")
+        if router_project and chat_id:
+            memory.set_current_project(chat_id, router_project)
+        return answer, debug_info
+
+    # Fallback: the semantic router failed outright on a non-action message, or
+    # explicitly deferred (e.g. could not resolve a project for a read-only intent).
+    # The old deterministic phrase matching below only runs in that case.
     status_answer = workspace_status_answer(user_text, chat_id=chat_id)
     if status_answer:
         return status_answer
@@ -1141,7 +1363,6 @@ def answer_user_text(
     if write_answer:
         return write_answer
 
-    current_project = memory.get_current_project(chat_id) if chat_id else None
     mentioned_project = extract_mentioned_project(user_text)
     if mentioned_project and chat_id:
         memory.set_current_project(chat_id, mentioned_project)
@@ -2346,6 +2567,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/agent_debug_on, /agent_debug_off - debug intent routing",
                 "/debug_on, /debug_off - aliases for debug mode",
                 "/debug_last_intent - последний intent",
+                "/router_test <text> - semantic router classify_intent без выполнения tools",
                 "/tts_test - проверить TTS",
                 "/patch, /apply_patch, /test, /deploy - отключены на read-only этапе",
             ]
@@ -2487,6 +2709,39 @@ async def debug_last_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_long(update.message, str(context.user_data.get("last_intent") or "intent еще не распознавался"))
 
 
+async def router_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Использование: /router_test <text>")
+        return
+    chat_id, _ = chat_user_ids(update)
+    current_project = memory.get_current_project(chat_id) if chat_id else None
+    last_action = get_last_action(chat_id)
+    recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT) if chat_id else None
+    try:
+        classification = semantic_router.classify_intent(
+            text,
+            recent_messages=recent,
+            current_project=current_project,
+            last_action=last_action,
+            ask_model=ask_ollama_messages,
+        )
+        lines = [
+            f"intent: {classification.get('intent')}",
+            f"confidence: {classification.get('confidence')}",
+            f"project_name: {classification.get('project_name') or '-'}",
+            f"needs_tool: {classification.get('needs_tool')}",
+            f"start_preview: {classification.get('start_preview')}",
+            f"language: {classification.get('language')}",
+            f"reason: {classification.get('reason') or '-'}",
+        ]
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /router_test: {e}")
+
+
 async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, debug_info: dict | None):
     if debug_info is None or not isinstance(debug_info, dict):
         debug_info = {}
@@ -2503,6 +2758,18 @@ async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, d
         f"tools_called: {', '.join(debug_info.get('tools_called') or []) or '-'}",
         f"errors: {'; '.join(debug_info.get('errors') or []) or '-'}",
     ]
+    router = debug_info.get("router")
+    if router:
+        lines.append(
+            "router_intent: {} confidence={} project={} needs_tool={} language={} reason={}".format(
+                router.get("intent"),
+                router.get("confidence"),
+                router.get("project_name") or "-",
+                router.get("needs_tool"),
+                router.get("language"),
+                router.get("reason") or "-",
+            )
+        )
     if message:
         await message.reply_text("\n".join(lines))
 
@@ -2845,6 +3112,7 @@ def main():
     app.add_handler(CommandHandler("debug_on", debug_on))
     app.add_handler(CommandHandler("debug_off", debug_off))
     app.add_handler(CommandHandler("debug_last_intent", debug_last_intent))
+    app.add_handler(CommandHandler("router_test", router_test_command))
     app.add_handler(CommandHandler("tts_test", tts_test))
     app.add_handler(CommandHandler("patch", disabled_write_command))
     app.add_handler(CommandHandler("apply_patch", disabled_write_command))

@@ -4,7 +4,7 @@ from typing import Any, Callable
 import config
 from tools_check import safe_code_check
 from tools_fs import tree_summary
-from tools_git import find_git_repos, git_status, resolve_repo
+from tools_git import find_git_repos, git_diff, git_status, resolve_repo
 from tools_preview import list_previews, scan_listening_ports
 from tools_project import inspect_project, project_structure
 from tools_write import workspace_inventory
@@ -411,6 +411,26 @@ def handle_detected_intent(
                     f"branch: {status.get('branch') or '-'}",
                     f"remote:\n{status.get('remote') or '-'}",
                     f"status:\n{status.get('status_short') or 'clean'}",
+                ]
+            )
+            return {
+                "answer": answer,
+                "tools_called": tools_called,
+                "errors": errors,
+                "project": repo.name,
+                "resolved_path": str(repo),
+            }
+
+        if intent == "git_diff":
+            project = detected.get("project")
+            repo = resolve_repo(project)
+            diff = git_diff(str(repo))
+            tools_called = ["resolve_repo", "git_diff"]
+            answer = "\n".join(
+                [
+                    f"repo: {diff.get('path')}",
+                    f"diff (truncated={diff.get('truncated')}):",
+                    diff.get("diff") or "(пусто)",
                 ]
             )
             return {

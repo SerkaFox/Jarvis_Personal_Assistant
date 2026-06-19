@@ -60,6 +60,34 @@ Jarvis online. Голосовой ответ работает.
 
 If TTS is unavailable, the bot returns a text error for the missing component: disabled TTS, missing Piper, missing model/config, or missing ffmpeg.
 
+## Semantic Intent Router
+
+Jarvis classifies free-text messages by meaning, not by matching fixed Russian phrases. `semantic_router.py` sends a small, fast classification prompt to Ollama and requires a single strict JSON object back:
+
+```json
+{
+  "intent": "where_project",
+  "confidence": 0.92,
+  "project_name": "sitebota",
+  "target": null,
+  "needs_tool": true,
+  "start_preview": false,
+  "language": "en",
+  "reason": "asks where to open an existing project"
+}
+```
+
+How it works:
+
+- **Ollama only classifies, it never acts.** The model's only job is to pick one of a fixed list of intents (`workspace_inventory`, `create_and_preview`, `where_project`, `preview_stop`, `git_repos`, `memory_save`, `normal_chat`, ...) and extract a project name if one is mentioned. It cannot return shell commands or file content, and its classification JSON is never shown to the user as-is.
+- **The backend executes the real tool.** `bot.semantic_router_answer()` reads the classified intent and calls the corresponding safe tool function (`workspace_inventory()`, `create_site_workflow()`, `stop_preview()`, `delete_workspace_dir()`, `find_git_repos()`, etc.) the same way the old phrase-matching code did. The user-visible answer always comes from a real tool result or formatter, never from the router's own text.
+- **Works across languages.** Because classification is by meaning, "какие проекты в твоей папке?", "what sites are in your workspace?", and "qué proyectos tienes en tu carpeta de trabajo?" all resolve to the same `workspace_inventory` intent and the same backend call.
+- **Regex/phrase matching (`intent_router.detect_intent`, `bot.workspace_status_answer`, `bot.stop_delete_answer`, `bot.write_mode_answer`) is now a fallback, not the primary path.** It only runs when the router itself fails — invalid/unparseable JSON, an unlisted intent, or no model response — and the message isn't clearly action-like; in that case the old deterministic Russian-phrase matching still applies so the bot doesn't go fully silent.
+- **No fake actions.** If the router fails AND the message looks like an action request (contains verbs like create/start/stop/delete in ru/en/es), or if the router itself returns a confident-but-low-confidence (<0.55) action intent, Jarvis replies with a clarification prompt instead of guessing:
+  `"Не смог надёжно распознать действие. Уточни командой /create_and_preview <name> или /workspace_status."`
+- **`/router_test <text>`** runs only the classifier (no tool execution) and shows `intent`, `confidence`, `project_name`, `needs_tool`, `start_preview`, `language`, `reason` — useful for tuning the router prompt.
+- **`/debug_on`** (alias `/agent_debug_on`) shows the router's classification alongside the regular intent debug line for every message.
+
 ## Read-Only Server/Code Agent
 
 Jarvis can optionally inspect local projects, git status, and selected service logs through a read-only tool layer. The tool layer does not expose arbitrary shell commands and does not write files.
@@ -220,11 +248,22 @@ Deletes one file inside `WRITE_ROOT`. Directory deletion is not exposed as a Tel
 ```text
 /preview_start <project>
 /preview_stop <project>
+/preview_stop_port <port>
+/preview_stop_all
 /preview_list
 /preview_status <project>
 ```
 
-Starts, stops, lists, and checks direct preview processes for workspace projects. Static projects run with `python3 -m http.server` on a port from `PREVIEW_PORT_MIN..PREVIEW_PORT_MAX`. Flask projects are started only when a `venv` already exists; dependencies are not installed automatically.
+Starts, stops, lists, and checks direct preview processes for workspace projects. Static projects run with `python3 -m http.server` on a port from `PREVIEW_PORT_MIN..PREVIEW_PORT_MAX`. Flask projects are started only when a `venv` already exists; dependencies are not installed automatically. Stop commands only report success after verifying the process/port/curl are actually down.
+
+```text
+/workspace_status
+/ports
+/workspace_delete <project>
+/workspace_clean_stopped
+```
+
+`/workspace_status` (also the body of `/workspace`) shows a full WRITE_ROOT inventory: every project's files, required-file checklist, preview registration, live port-listening state, and curl status — not just what's cached in memory. `/ports` lists registered previews, real listening ports in `PREVIEW_PORT_MIN..PREVIEW_PORT_MAX`, and any unregistered `http.server` process as suspicious. `/workspace_delete` removes a project from `WRITE_ROOT` only after verifying the folder is actually gone. `/workspace_clean_stopped` prunes dead entries from the preview registry.
 
 ```text
 /preview_info <name>
@@ -279,9 +318,10 @@ Enables or disables read-only tool use for normal text messages. If the model re
 /agent_debug_on
 /agent_debug_off
 /debug_last_intent
+/router_test <text>
 ```
 
-Shows deterministic intent routing for normal messages: detected intent, selected project, tools called, and errors.
+`/agent_debug_on` (alias `/debug_on`) shows, per message: the semantic router's classification (intent, confidence, project, language, reason) plus the detected intent, selected project, tools called, and errors from whichever backend workflow handled it. `/router_test <text>` runs only the semantic router classifier on arbitrary text without executing any tool, for tuning and debugging the router prompt.
 
 ```text
 /patch <repo> <task>

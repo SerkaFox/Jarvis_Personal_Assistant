@@ -1,7 +1,8 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from intent_router import detect_intent
+from intent_router import detect_intent, handle_detected_intent
 from tools_check import safe_code_check
 from tools_fs import is_excluded_dir, is_forbidden_file
 from tools_git import find_git_repos, git_status
@@ -52,6 +53,39 @@ class JarvisSmokeTests(unittest.TestCase):
             path = Path(repo["path"])
             self.assertTrue((path / ".git").exists(), repo["path"])
             self.assertNotIn(".git-credentials", repo["path"])
+
+    def test_workspace_phrases_route_to_workspace_inventory_not_repos(self):
+        cases = [
+            "проверь, есть ли папки с сайтами, какие у тебя в твоем рабочем каталоге и на каких портах они висят",
+            "какие проекты в твоей папке",
+            "какие сайты в рабочей папке",
+            "есть ли папки с сайтами",
+            "на каких портах они висят",
+        ]
+        for text in cases:
+            detected = detect_intent(text)
+            self.assertEqual(detected["intent"], "workspace_inventory", text)
+
+    def test_explicit_git_phrase_still_routes_to_repo_listing(self):
+        detected = detect_intent("какие git репозитории")
+        self.assertEqual(detected["intent"], "list_projects")
+
+    def test_git_status_with_project_name_routes_to_git_status_intent(self):
+        detected = detect_intent("git status anna")
+        self.assertEqual(detected["intent"], "git_status")
+        self.assertEqual(detected["project"], "anna")
+
+    def test_existing_workspace_specific_intents_unaffected_by_inventory_routing(self):
+        self.assertEqual(detect_intent("где сайт sitebota?")["intent"], "where_project")
+        self.assertEqual(detect_intent("ты запустил сервер sitebota?")["intent"], "preview_status")
+        self.assertEqual(detect_intent("создай сайт sitebota и запусти сервер")["intent"], "create_and_preview")
+
+    def test_workspace_inventory_handler_does_not_call_find_git_repos(self):
+        with patch("intent_router.find_git_repos") as mocked:
+            result = handle_detected_intent({"intent": "workspace_inventory"})
+        mocked.assert_not_called()
+        self.assertIn("WRITE_ROOT", result["answer"])
+        self.assertEqual(result["tools_called"], ["workspace_inventory", "list_previews", "scan_listening_ports"])
 
     def test_secret_and_hidden_paths_are_blocked(self):
         self.assertTrue(is_forbidden_file(Path("/home/seradmin/.env")))

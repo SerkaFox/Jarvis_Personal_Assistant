@@ -26,6 +26,7 @@ FORBIDDEN_WRITE_NAMES = {
 FORBIDDEN_WRITE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db"}
 FORBIDDEN_WRITE_FRAGMENTS = {"secret", "token", "password", "passwd", "credential"}
 TREE_EXCLUDED = {".git", "__pycache__", "venv", ".venv"}
+RESERVED_WORKSPACE_NAMES = {"data", ".git", "__pycache__", "venv", ".venv"}
 
 
 def _write_mode_enabled() -> bool:
@@ -117,7 +118,7 @@ def list_workspace() -> dict[str, Any]:
     projects = []
     if root.is_dir():
         for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if child.is_dir() and not child.name.startswith("."):
+            if child.is_dir() and not child.name.startswith(".") and child.name not in RESERVED_WORKSPACE_NAMES:
                 projects.append(
                     {
                         "name": child.name,
@@ -639,6 +640,67 @@ def run_safe_project_check(path: str) -> dict[str, Any]:
                     errors.append({"path": str(py_file), "error": e.msg[:2000]})
         result["python_compile"] = {"returncode": 1 if errors else 0, "errors": errors}
     return result
+
+
+def workspace_inventory() -> dict[str, Any]:
+    root = _write_root()
+    exists = root.is_dir()
+    writable = exists and os.access(root, os.W_OK)
+    projects: list[dict[str, Any]] = []
+
+    if exists:
+        import tools_preview
+
+        registry = tools_preview.get_registry_snapshot()
+        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir() or child.name.startswith(".") or child.name in RESERVED_WORKSPACE_NAMES:
+                continue
+            files = [p for p in child.rglob("*") if p.is_file()]
+            dirs = [p for p in child.rglob("*") if p.is_dir()]
+            required_files = {
+                "index.html": (child / "index.html").is_file(),
+                "assets/css/style.css": (child / "assets" / "css" / "style.css").is_file(),
+                "assets/js/main.js": (child / "assets" / "js" / "main.js").is_file(),
+                "README.md": (child / "README.md").is_file(),
+            }
+            record = registry.get(child.name)
+            preview_port = int(record["port"]) if record and record.get("port") else None
+            preview_pid = int(record["pid"]) if record and record.get("pid") else None
+            port_listening = bool(preview_port) and tools_preview.port_is_listening(preview_port)
+            running = bool(record) and tools_preview.is_own_preview_process(record)
+            curl_status: Any = None
+            url = None
+            if preview_port and port_listening:
+                curl = tools_preview.curl_check(preview_port)
+                curl_status = curl.get("status") if curl.get("success") else (curl.get("error") or "failed")
+                url = record.get("url") if record else None
+
+            projects.append(
+                {
+                    "project_name": child.name,
+                    "path": str(child),
+                    "exists": True,
+                    "files_count": len(files),
+                    "dirs_count": len(dirs),
+                    "has_index_html": required_files["index.html"],
+                    "required_files": required_files,
+                    "preview_registered": record is not None,
+                    "preview_port": preview_port,
+                    "preview_pid": preview_pid,
+                    "port_listening": port_listening,
+                    "running": running,
+                    "curl_status": curl_status,
+                    "url": url,
+                }
+            )
+
+    return {
+        "write_root": str(root),
+        "exists": exists,
+        "writable": writable,
+        "projects": projects,
+        "count": len(projects),
+    }
 
 
 def workspace_tree(path: str | None = None, depth: int = 3) -> dict[str, Any]:

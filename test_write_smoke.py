@@ -359,6 +359,77 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertTrue(result["checks"]["folder_gone"])
         self.assertFalse((Path(self.tmp.name) / "__jarvis_stop_delete_test__").exists())
 
+    def test_workspace_inventory_reports_real_project_and_preview_fields(self):
+        from tools_preview import stop_preview, start_preview
+        from tools_write import create_static_site, workspace_inventory
+
+        create_static_site("invproj")
+        started = start_preview("invproj")
+        data = workspace_inventory()
+        self.assertEqual(data["write_root"], self.tmp.name)
+        self.assertTrue(data["exists"])
+        self.assertTrue(data["writable"])
+        project = next(p for p in data["projects"] if p["project_name"] == "invproj")
+        self.assertTrue(project["exists"])
+        self.assertTrue(project["has_index_html"])
+        self.assertTrue(project["required_files"]["index.html"])
+        self.assertTrue(project["preview_registered"])
+        self.assertEqual(project["preview_port"], started["port"])
+        self.assertTrue(project["port_listening"])
+        self.assertTrue(project["running"])
+        self.assertEqual(project["curl_status"], 200)
+        stop_preview("invproj")
+
+    def test_workspace_inventory_empty_write_root_has_no_projects(self):
+        from tools_write import workspace_inventory
+
+        data = workspace_inventory()
+        self.assertEqual(data["projects"], [])
+        self.assertEqual(data["count"], 0)
+
+    def test_workspace_status_text_works_with_empty_previews_json(self):
+        import bot
+
+        text = bot._workspace_status_text()
+        self.assertIn("WRITE_ROOT:", text)
+        self.assertIn(self.tmp.name, text)
+        self.assertIn("нет проектов", text)
+
+    def test_scan_listening_ports_structure(self):
+        from tools_preview import scan_listening_ports
+
+        ports = scan_listening_ports()
+        self.assertIn("range", ports)
+        self.assertIsInstance(ports["listening"], list)
+        self.assertIsInstance(ports["registered_previews"], list)
+
+    def test_scan_listening_ports_flags_unregistered_preview_as_suspicious(self):
+        from tools_preview import scan_listening_ports, stop_preview
+        from tools_write import create_static_site, delete_workspace_dir
+
+        create_static_site("suspectproj")
+        from tools_preview import start_preview
+
+        started = start_preview("suspectproj")
+        port = started["port"]
+        registry_path = Path(self.tmp.name) / "data" / "previews.json"
+        import json as json_module
+
+        registry_data = json_module.loads(registry_path.read_text(encoding="utf-8"))
+        del registry_data["suspectproj"]
+        registry_path.write_text(json_module.dumps(registry_data), encoding="utf-8")
+
+        ports = scan_listening_ports()
+        match = next((item for item in ports["listening"] if item["port"] == port), None)
+        self.assertIsNotNone(match)
+        self.assertTrue(match["suspicious"])
+        self.assertFalse(match["registered"])
+
+        import os as os_module
+        import signal as signal_module
+
+        os_module.killpg(started["pid"], signal_module.SIGKILL)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -169,6 +169,58 @@ def port_is_listening(port: int) -> bool:
     return _port_listening(int(port))
 
 
+def get_registry_snapshot() -> dict[str, Any]:
+    return _load_registry()
+
+
+def curl_check(port: int) -> dict[str, Any]:
+    return _curl_localhost(int(port))
+
+
+def is_own_preview_process(record: dict[str, Any]) -> bool:
+    return _is_own_preview_process(record)
+
+
+def scan_listening_ports() -> dict[str, Any]:
+    min_port = config.env_int("PREVIEW_PORT_MIN", config.PREVIEW_PORT_MIN)
+    max_port = config.env_int("PREVIEW_PORT_MAX", config.PREVIEW_PORT_MAX)
+    registry = _load_registry()
+    registered_by_port: dict[int, str] = {}
+    for name, record in registry.items():
+        port = record.get("port")
+        if port:
+            registered_by_port[int(port)] = name
+
+    listening = []
+    for port in range(min_port, max_port + 1):
+        if not _port_listening(port):
+            continue
+        pid = _find_listening_pid(port)
+        cwd = _proc_cwd(pid) if pid else None
+        cmdline = _proc_cmdline(pid) if pid else ""
+        registered_project = registered_by_port.get(port)
+        listening.append(
+            {
+                "port": port,
+                "pid": pid,
+                "cwd": str(cwd) if cwd else "",
+                "cmdline": cmdline.strip(),
+                "registered_project": registered_project,
+                "registered": registered_project is not None,
+                "in_write_root": bool(cwd) and _path_in_write_root(cwd),
+                "suspicious": registered_project is None and "http.server" in cmdline,
+            }
+        )
+
+    return {
+        "range": [min_port, max_port],
+        "listening": listening,
+        "registered_previews": [
+            {"project": name, "port": int(record.get("port") or 0)} for name, record in registry.items()
+        ],
+    }
+
+
 def _project_path(project_name: str) -> Path:
     ensure_write_root()
     path = resolve_write_path(project_name)

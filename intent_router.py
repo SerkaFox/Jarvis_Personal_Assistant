@@ -4,8 +4,41 @@ from typing import Any, Callable
 import config
 from tools_check import safe_code_check
 from tools_fs import tree_summary
-from tools_git import find_git_repos
+from tools_git import find_git_repos, git_status, resolve_repo
+from tools_preview import list_previews, scan_listening_ports
 from tools_project import inspect_project, project_structure
+from tools_write import workspace_inventory
+
+
+WORKSPACE_INVENTORY_PHRASES = (
+    "твоя папка",
+    "твоей папке",
+    "твоей папки",
+    "рабочая папка",
+    "рабочей папке",
+    "рабочий каталог",
+    "рабочем каталоге",
+    "workspace",
+    "папки с сайтами",
+    "папка с сайтами",
+    "сайты в твоей папке",
+    "сайтами, какие у тебя",
+    "на каких портах",
+    "портах висят",
+    "какие сайты",
+    "проекты в твоей папке",
+    "sitebota",
+    "test-site",
+)
+
+GIT_WORD_RE = re.compile(r"\bgit\b", re.IGNORECASE)
+GIT_STATUS_PATTERN = re.compile(r"git\s+status\s+([A-Za-zА-Яа-я0-9_.-]+)", re.IGNORECASE)
+
+
+def _has_explicit_git_phrase(lowered: str) -> bool:
+    if GIT_WORD_RE.search(lowered):
+        return True
+    return any(word in lowered for word in ("репозитор", "ветки", "ветк"))
 
 
 LIST_PROJECT_PHRASES = (
@@ -160,6 +193,10 @@ def detect_intent(
 ) -> dict[str, Any]:
     lowered = text.lower()
 
+    git_status_match = GIT_STATUS_PATTERN.search(text)
+    if git_status_match:
+        return {"intent": "git_status", "project": git_status_match.group(1).strip(" .,;:!?")}
+
     if any(phrase in lowered for phrase in CREATE_WORKSPACE_PHRASES):
         project = _workspace_name_from_text(text)
         if any(word in lowered for word in ("сервер", "preview", "превью")):
@@ -191,6 +228,9 @@ def detect_intent(
         if project:
             return {"intent": "inspect_project", "project": project}
 
+    if any(phrase in lowered for phrase in WORKSPACE_INVENTORY_PHRASES) and not _has_explicit_git_phrase(lowered):
+        return {"intent": "workspace_inventory"}
+
     has_project_word = any(word in lowered for word in ("проект", "проекты", "репозитории", "git", "папки"))
     has_list_word = any(word in lowered for word in ("какие", "покажи", "есть", "сервер", "где"))
     if any(phrase in lowered for phrase in LIST_PROJECT_PHRASES) or (has_project_word and has_list_word):
@@ -214,6 +254,48 @@ def _format_projects() -> tuple[str, list[str]]:
             )
         )
     return "\n".join(lines), ["find_git_repos"]
+
+
+def format_workspace_inventory(data: dict[str, Any], ports: dict[str, Any]) -> str:
+    lines = [
+        f"WRITE_ROOT: {data.get('write_root')}",
+        f"exists: {data.get('exists')}",
+        f"writable: {data.get('writable')}",
+    ]
+    projects = data.get("projects") or []
+    if not projects:
+        lines.append("Projects: нет проектов в WRITE_ROOT")
+    else:
+        lines.append("Projects:")
+        for project in projects:
+            preview_state = "running" if project.get("running") else "stopped"
+            lines.append(f"- {project.get('project_name')}")
+            lines.append(f"  path: {project.get('path')}")
+            lines.append(f"  files: {project.get('files_count')}")
+            lines.append(f"  index.html: {'yes' if project.get('has_index_html') else 'no'}")
+            lines.append(f"  preview: {preview_state}")
+            port = project.get("preview_port")
+            if port:
+                lines.append(f"  port: {port}")
+                lines.append(f"  url: {project.get('url') or '-'}")
+                curl_status = project.get("curl_status")
+                lines.append(f"  curl: {curl_status if curl_status is not None else 'failed'}")
+            else:
+                lines.append("  port: -")
+
+    listening = ports.get("listening") or []
+    port_range = ports.get("range") or [None, None]
+    lines.append(
+        f"Listening preview ports ({port_range[0]}-{port_range[1]}): "
+        + (", ".join(str(item["port"]) for item in listening) or "нет")
+    )
+    suspicious = [item for item in listening if item.get("suspicious")]
+    if suspicious:
+        lines.append(
+            "Suspicious (не зарегистрированы в previews.json, но слушают http.server): "
+            + ", ".join(str(item["port"]) for item in suspicious)
+        )
+    return "\n".join(lines)
 
 
 def _format_structure(data: dict[str, Any]) -> str:
@@ -303,6 +385,41 @@ def handle_detected_intent(
         if intent == "list_projects":
             answer, tools_called = _format_projects()
             return {"answer": answer, "tools_called": tools_called, "errors": errors}
+
+        if intent == "workspace_inventory":
+            data = workspace_inventory()
+            previews = list_previews()
+            ports = scan_listening_ports()
+            tools_called = ["workspace_inventory", "list_previews", "scan_listening_ports"]
+            return {
+                "answer": format_workspace_inventory(data, ports),
+                "tools_called": tools_called,
+                "errors": errors,
+                "inventory": data,
+                "previews": previews,
+                "ports": ports,
+            }
+
+        if intent == "git_status":
+            project = detected.get("project")
+            repo = resolve_repo(project)
+            status = git_status(str(repo))
+            tools_called = ["resolve_repo", "git_status"]
+            answer = "\n".join(
+                [
+                    f"repo: {status.get('path')}",
+                    f"branch: {status.get('branch') or '-'}",
+                    f"remote:\n{status.get('remote') or '-'}",
+                    f"status:\n{status.get('status_short') or 'clean'}",
+                ]
+            )
+            return {
+                "answer": answer,
+                "tools_called": tools_called,
+                "errors": errors,
+                "project": repo.name,
+                "resolved_path": str(repo),
+            }
 
         if intent == "inspect_project":
             project = detected.get("project")

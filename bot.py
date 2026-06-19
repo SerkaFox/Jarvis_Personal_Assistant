@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 import config
 from action_schemas import extract_json_object, validate_create_static_site_action
 from agent import answer_with_tools
-from intent_router import detect_intent, extract_mentioned_project, handle_detected_intent
+from intent_router import detect_intent, extract_mentioned_project, format_workspace_inventory, handle_detected_intent
 import memory
 from tools_fs import ToolError, allowed_roots_info, search_text, tree_summary
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
@@ -37,6 +37,7 @@ from tools_preview import (
     list_previews,
     port_is_listening,
     preview_status,
+    scan_listening_ports,
     start_preview,
     stop_preview,
     stop_preview_by_port,
@@ -53,6 +54,7 @@ from tools_write import (
     update_static_site_file,
     verify_project_files,
     verify_static_site,
+    workspace_inventory,
     write_project_text_file,
     write_text_file,
     workspace_tree,
@@ -1636,20 +1638,59 @@ async def write_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(_write_mode_status_text())
 
 
-async def workspace_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _workspace_status_text() -> str:
+    data = workspace_inventory()
+    ports = scan_listening_ports()
+    return format_workspace_inventory(data, ports)
+
+
+async def workspace_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
+    chat_id, user_id = chat_user_ids(update)
     try:
-        data = list_workspace()
+        await reply_long(update.message, _workspace_status_text())
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="workspace_status_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /workspace_status: {e}")
+
+
+async def workspace_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await workspace_status_command(update, context)
+
+
+async def ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, user_id = chat_user_ids(update)
+    try:
+        ports = scan_listening_ports()
+        registered = ports.get("registered_previews") or []
+        listening = ports.get("listening") or []
+        port_range = ports.get("range") or [None, None]
+        suspicious = [item for item in listening if item.get("suspicious")]
         lines = [
-            f"WRITE_ROOT: {data['write_root']}",
-            f"WRITE_MODE_ENABLED: {data['enabled']}",
-            f"Проектов: {data['count']}",
+            f"Preview port range: {port_range[0]}-{port_range[1]}",
+            "Registered previews (previews.json):",
         ]
-        lines.extend(f"- {item['name']} ({item['path']})" for item in data["projects"])
+        if registered:
+            lines.extend(f"- {item['project']}: port {item['port']}" for item in registered)
+        else:
+            lines.append("- нет зарегистрированных preview")
+        lines.append("Реально слушающие порты:")
+        if listening:
+            for item in listening:
+                tag = item.get("registered_project") or ("suspicious" if item.get("suspicious") else "unknown")
+                lines.append(f"- {item['port']} pid={item.get('pid')} owner={tag}")
+        else:
+            lines.append("- нет активных preview")
+        if suspicious:
+            lines.append("Suspicious (слушают http.server, но не зарегистрированы):")
+            lines.extend(f"- {item['port']} pid={item.get('pid')} cwd={item.get('cwd') or '-'}" for item in suspicious)
         await reply_long(update.message, "\n".join(lines))
     except Exception as e:
-        await update.message.reply_text(f"Ошибка /workspace: {e}")
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="ports_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /ports: {e}")
 
 
 async def new_static_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2267,7 +2308,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/tree <path> - краткое дерево",
                 "/structure <repo> - структура и счетчики проекта",
                 "/check <repo> - безопасная read-only проверка кода",
-                "/workspace - WRITE_ROOT и тестовые проекты",
+                "/workspace - алиас /workspace_status",
+                "/workspace_status - полная инвентаризация WRITE_ROOT: файлы, preview, порты, curl",
+                "/ports - registered/listening/suspicious preview-порты",
                 "/write_mode - состояние write sandbox",
                 "/new_static <name> - создать статический сайт в WRITE_ROOT",
                 "/create_site <project> - создать статический сайт и проверить файлы",
@@ -2762,6 +2805,8 @@ def main():
     app.add_handler(CommandHandler("structure", structure_command))
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("workspace", workspace_command))
+    app.add_handler(CommandHandler("workspace_status", workspace_status_command))
+    app.add_handler(CommandHandler("ports", ports_command))
     app.add_handler(CommandHandler("write_mode", write_mode_command))
     app.add_handler(CommandHandler("new_static", new_static_command))
     app.add_handler(CommandHandler("create_site", create_site_command))

@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any, Callable
 
+import config
 from tools_fs import (
     ToolError,
     list_dir,
@@ -9,8 +10,8 @@ from tools_fs import (
     search_text,
     tree_summary,
 )
-from tools_git import find_git_repos, git_status
-from tools_shell import read_journal, service_status
+from tools_git import find_git_repos, git_diff, git_status
+from tools_system import read_journal, service_status
 
 
 TOOL_REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
@@ -19,6 +20,7 @@ TOOL_REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
     "search_text": search_text,
     "find_git_repos": find_git_repos,
     "git_status": git_status,
+    "git_diff": git_diff,
     "tree_summary": tree_summary,
     "service_status": service_status,
     "read_journal": read_journal,
@@ -29,15 +31,18 @@ PLANNER_SYSTEM_PROMPT = """
 Верни только валидный JSON, без Markdown.
 Если инструменты не нужны, верни {"use_tools": false, "reason": "...", "tools": []}.
 Если нужны, верни {"use_tools": true, "reason": "...", "tools": [{"name": "...", "args": {...}}]}.
+Также можно вернуть один action: {"action": "search_text", "args": {...}}.
 Доступные tools:
 - list_dir(path)
 - read_file(path, max_chars)
 - search_text(root, query, glob)
 - find_git_repos(root)
 - git_status(repo_path)
+- git_diff(repo_path, max_chars)
 - tree_summary(path, depth)
 - service_status(name)
-- read_journal(service_name, lines)
+- read_journal(name, lines)
+- final_answer(answer)
 Правила: только чтение, не планируй записи, sudo, restart, deploy, rm/mv/cp, git pull/push/commit.
 """.strip()
 
@@ -69,6 +74,14 @@ def build_planner_messages(user_text: str) -> list[dict[str, str]]:
 
 
 def execute_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    if plan.get("action") == "final_answer":
+        return []
+    if plan.get("action") and "tools" not in plan:
+        plan = {
+            "use_tools": True,
+            "tools": [{"name": plan.get("action"), "args": plan.get("args") or {}}],
+        }
+
     if not plan.get("use_tools"):
         return []
 
@@ -138,13 +151,20 @@ def build_final_messages(
 
 
 def answer_with_tools(user_text: str, ask_model: Callable[[list[dict[str, str]]], str]) -> str | None:
+    if not config.AGENT_TOOLS_ENABLED:
+        return None
+
     planner_response = ask_model(build_planner_messages(user_text))
     try:
         plan = _extract_json(planner_response)
     except (json.JSONDecodeError, ValueError):
         return None
 
-    if not plan.get("use_tools"):
+    if plan.get("action") == "final_answer":
+        answer = plan.get("answer")
+        return answer if isinstance(answer, str) and answer.strip() else None
+
+    if not plan.get("use_tools") and not plan.get("action"):
         return None
 
     try:

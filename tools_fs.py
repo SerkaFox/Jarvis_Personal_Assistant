@@ -1,14 +1,10 @@
 import json
 import logging
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
-
-DEFAULT_ALLOWED_ROOTS = "/home/seradmin,/home/seradmin/jelec,/var/www"
-DEFAULT_MAX_FILE_CHARS = 12000
-DEFAULT_MAX_SEARCH_RESULTS = 50
+import config
 
 EXCLUDED_DIR_NAMES = {
     ".cache",
@@ -45,10 +41,14 @@ FORBIDDEN_SUFFIXES = {
 }
 
 FORBIDDEN_NAME_FRAGMENTS = {
+    "key",
+    "password",
     "secret",
+    "token",
 }
 
 FORBIDDEN_PATH_PARTS = {
+    ".git",
     "media",
     "uploads",
 }
@@ -56,16 +56,6 @@ FORBIDDEN_PATH_PARTS = {
 
 class ToolError(ValueError):
     pass
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return max(1, int(value))
-    except ValueError:
-        return default
 
 
 def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -77,28 +67,17 @@ def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 
 def max_file_chars() -> int:
-    return _env_int("MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS)
+    return config.MAX_FILE_CHARS
 
 
 def max_search_results() -> int:
-    return _env_int("MAX_SEARCH_RESULTS", DEFAULT_MAX_SEARCH_RESULTS)
+    return config.MAX_SEARCH_RESULTS
 
 
 def get_allowed_roots() -> list[Path]:
-    raw_roots = os.getenv("ALLOWED_ROOTS", DEFAULT_ALLOWED_ROOTS)
-    roots = []
-
-    for raw_root in raw_roots.split(","):
-        raw_root = raw_root.strip()
-        if not raw_root:
-            continue
-        root = Path(raw_root).expanduser().resolve()
-        if root.exists() and root.is_dir():
-            roots.append(root)
-
+    roots = config.get_allowed_roots()
     if not roots:
         raise ToolError("Нет доступных ALLOWED_ROOTS")
-
     return roots
 
 
@@ -294,7 +273,7 @@ def search_text(root: str, query: str, glob: str | None = None) -> dict[str, Any
 
 
 def tree_summary(path: str, depth: int = 2) -> dict[str, Any]:
-    depth = max(0, min(int(depth), 5))
+    depth = _coerce_int(depth, 2, 0, 5)
     log_tool_call("tree_summary", {"path": path, "depth": depth})
 
     root = resolve_allowed_path(path)

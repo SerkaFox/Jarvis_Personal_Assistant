@@ -18,10 +18,11 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
+import config
 from agent import answer_with_tools
-from tools_fs import allowed_roots_info
-from tools_git import find_git_repos
-from tools_shell import get_allowed_services
+from tools_fs import allowed_roots_info, search_text, tree_summary
+from tools_git import find_git_repos, git_diff, git_status, resolve_repo
+from tools_system import get_allowed_services, read_journal
 
 load_dotenv()
 logging.basicConfig(
@@ -284,7 +285,7 @@ async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [
                         f"- {repo.get('path')}",
                         f"  branch: {repo.get('branch') or '-'}",
-                        f"  origin: {repo.get('remote_origin') or '-'}",
+                        f"  remote: {repo.get('remote') or '-'}",
                         f"  status: {status[:500]}",
                     ]
                 )
@@ -294,6 +295,131 @@ async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"Ошибка /repos: {e}"
 
     await reply_long(update.message, text)
+
+
+def _format_git_status(repo: dict) -> str:
+    return "\n".join(
+        [
+            f"repo: {repo.get('path')}",
+            f"branch: {repo.get('branch') or '-'}",
+            f"remote:\n{repo.get('remote') or '-'}",
+            f"status:\n{repo.get('status_short') or 'clean'}",
+        ]
+    )
+
+
+async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /git <repo_name_or_path>")
+        return
+
+    try:
+        repo_path = resolve_repo(" ".join(context.args))
+        await reply_long(update.message, _format_git_status(git_status(str(repo_path))))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /git: {e}")
+
+
+async def diff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /diff <repo_name_or_path>")
+        return
+
+    try:
+        repo_path = resolve_repo(" ".join(context.args))
+        result = git_diff(str(repo_path))
+        diff_text = result["diff"] or "diff пустой"
+        suffix = "\n\n[truncated]" if result.get("truncated") else ""
+        await reply_long(update.message, f"repo: {result['path']}\n\n{diff_text}{suffix}")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /diff: {e}")
+
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Использование: /find <query>")
+        return
+
+    try:
+        lines = [f"query: {query}"]
+        for root in config.get_allowed_roots():
+            result = search_text(str(root), query)
+            lines.append(f"\n{root} ({result['count']}):")
+            lines.extend(result["results"] or ["ничего не найдено"])
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /find: {e}")
+
+
+async def tree_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    path = " ".join(context.args).strip() if context.args else str(config.get_allowed_roots()[0])
+    try:
+        result = tree_summary(path)
+        await reply_long(update.message, result["tree"])
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /tree: {e}")
+
+
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /logs <service>")
+        return
+
+    try:
+        result = read_journal(context.args[0], lines=80)
+        await reply_long(update.message, result["output"] or "journal пустой")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /logs: {e}")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    await update.message.reply_text(
+        "\n".join(
+            [
+                "Jarvis commands:",
+                "/roots - разрешенные roots",
+                "/repos - найти git-репозитории",
+                "/git <repo> - status, branch, remote",
+                "/diff <repo> - git diff",
+                "/find <query> - поиск по ALLOWED_ROOTS",
+                "/tree <path> - краткое дерево",
+                "/logs <service> - последние 80 строк journal",
+                "/status - Ollama/STT/TTS/agent status",
+                "/agent_on, /agent_off - read-only agent mode",
+                "/tts_test - проверить TTS",
+                "/patch, /apply_patch, /test, /deploy - отключены на read-only этапе",
+            ]
+        )
+    )
+
+
+async def disabled_write_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    await update.message.reply_text(
+        "Этот режим пока отключен: текущий этап только read-only. "
+        "Никаких patch/apply/test/deploy без отдельного подтвержденного режима записи."
+    )
 
 
 def _check_ollama() -> str:
@@ -346,6 +472,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"TTS enabled: {TTS_ENABLED}",
                 f"TTS engine: {TTS_ENGINE}",
                 f"Piper model: {PIPER_MODEL}",
+                f"Agent tools enabled: {config.AGENT_TOOLS_ENABLED}",
                 f"Allowed services: {', '.join(get_allowed_services())}",
                 "Allowed roots:",
                 *[f"- {root}" for root in roots_info["allowed_roots"]],
@@ -491,12 +618,22 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("roots", roots))
     app.add_handler(CommandHandler("repos", repos))
+    app.add_handler(CommandHandler("git", git_command))
+    app.add_handler(CommandHandler("diff", diff_command))
+    app.add_handler(CommandHandler("find", find_command))
+    app.add_handler(CommandHandler("tree", tree_command))
+    app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("agent_on", agent_on))
     app.add_handler(CommandHandler("agent_off", agent_off))
     app.add_handler(CommandHandler("tts_test", tts_test))
+    app.add_handler(CommandHandler("patch", disabled_write_command))
+    app.add_handler(CommandHandler("apply_patch", disabled_write_command))
+    app.add_handler(CommandHandler("test", disabled_write_command))
+    app.add_handler(CommandHandler("deploy", disabled_write_command))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_or_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

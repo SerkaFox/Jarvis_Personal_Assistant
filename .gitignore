@@ -11,6 +11,8 @@ models/
 *.wav
 *.ogg
 *.mp3
+*.log
+/tmp/
 
 # Legacy local scratch file; replaced by tools_fs.py/tools_git.py/tools_shell.py.
 server_tools.py

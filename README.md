@@ -71,6 +71,7 @@ ALLOWED_ROOTS=/home/seradmin,/home/seradmin/jelec,/var/www
 ALLOWED_SERVICES=jarvis-bot,j-listoya-stt
 MAX_FILE_CHARS=12000
 MAX_SEARCH_RESULTS=50
+AGENT_TOOLS_ENABLED=true
 ```
 
 `ALLOWED_ROOTS` is a comma-separated allowlist. File and directory tools only work inside these roots after resolving symlinks. Paths with `..` are rejected. Secret-like files such as `.env`, keys, PEM files, sqlite/db files, and `media`/`uploads` content are not readable.
@@ -112,6 +113,36 @@ Shows configured roots and output limits.
 Finds git repositories under `ALLOWED_ROOTS` and shows path, branch, origin, and `git status --short`.
 
 ```text
+/git <repo_name_or_path>
+```
+
+Shows branch, remotes, and `git status --short` for one repository.
+
+```text
+/diff <repo_name_or_path>
+```
+
+Shows read-only `git diff` for one repository with an output limit.
+
+```text
+/find <query>
+```
+
+Searches text across all `ALLOWED_ROOTS` with ripgrep.
+
+```text
+/tree <path>
+```
+
+Shows a short directory tree, excluding virtualenvs, caches, git internals, media, uploads, and staticfiles.
+
+```text
+/logs <service>
+```
+
+Shows the last 80 journal lines for a service from `ALLOWED_SERVICES`.
+
+```text
 /status
 ```
 
@@ -123,6 +154,15 @@ Shows Ollama, STT, TTS, selected models, allowed services, and allowed roots.
 ```
 
 Enables or disables read-only tool use for normal text messages. If the model returns an invalid JSON plan, Jarvis falls back to the normal Ollama answer without tools.
+
+```text
+/patch <repo> <task>
+/apply_patch <id>
+/test <repo>
+/deploy <repo>
+```
+
+These commands are intentionally disabled at the current read-only stage. They do not change files, run deploys, or commit anything.
 
 ### Example Requests
 

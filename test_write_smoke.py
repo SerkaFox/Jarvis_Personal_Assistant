@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch
@@ -250,6 +251,113 @@ class WriteSandboxSmokeTests(unittest.TestCase):
                 },
                 expected_project_name="bad",
             )
+
+    def test_stop_preview_verifies_port_and_process_closed(self):
+        from tools_preview import preview_status, start_preview, stop_preview
+        from tools_write import create_static_site
+
+        create_static_site("stopcheck")
+        started = start_preview("stopcheck")
+        port = started["port"]
+        result = stop_preview("stopcheck")
+        self.assertTrue(result["success"])
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["checks"]["process_alive"])
+        self.assertFalse(result["checks"]["port_listening"])
+        self.assertFalse(result["checks"]["curl_responds"])
+        self.assertFalse(preview_status("stopcheck")["running"])
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2)
+
+    def test_stop_preview_missing_project_raises(self):
+        from tools_preview import stop_preview
+
+        with self.assertRaises(ToolError):
+            stop_preview("does-not-exist")
+
+    def test_stop_preview_by_port_rejects_out_of_range_port(self):
+        from tools_preview import stop_preview_by_port
+
+        with self.assertRaises(ToolError):
+            stop_preview_by_port(22)
+
+    def test_stop_preview_by_port_stops_registered_preview(self):
+        from tools_preview import port_is_listening, start_preview, stop_preview_by_port
+        from tools_write import create_static_site
+
+        create_static_site("portstop")
+        started = start_preview("portstop")
+        port = started["port"]
+        self.assertTrue(port_is_listening(port))
+        result = stop_preview_by_port(port)
+        self.assertTrue(result["success"])
+        self.assertFalse(port_is_listening(port))
+
+    def test_delete_workspace_dir_verifies_folder_gone(self):
+        from tools_write import create_project_dir, delete_workspace_dir
+
+        create_project_dir("deletecheck")
+        self.assertTrue((Path(self.tmp.name) / "deletecheck").is_dir())
+        result = delete_workspace_dir("deletecheck", confirm_token="DELETE:deletecheck")
+        self.assertTrue(result["success"])
+        self.assertTrue(result["verification"]["exists_after"] is False)
+        self.assertFalse((Path(self.tmp.name) / "deletecheck").exists())
+
+    def test_delete_workspace_dir_rejects_path_traversal_and_special_names(self):
+        from tools_write import delete_workspace_dir
+
+        for bad_name in ("..", ".", "/", "a/b", ""):
+            with self.assertRaises(ToolError):
+                delete_workspace_dir(bad_name, confirm_token=f"DELETE:{bad_name}")
+
+    def test_delete_workspace_dir_stops_running_preview_first(self):
+        from tools_preview import port_is_listening, preview_status, start_preview
+        from tools_write import create_static_site, delete_workspace_dir
+
+        create_static_site("deletewithpreview")
+        started = start_preview("deletewithpreview")
+        port = started["port"]
+        result = delete_workspace_dir("deletewithpreview", confirm_token="DELETE:deletewithpreview")
+        self.assertTrue(result["success"])
+        self.assertFalse(port_is_listening(port))
+        self.assertFalse(preview_status("deletewithpreview")["running"])
+
+    def test_preview_stop_command_does_not_claim_success_on_failure(self):
+        import bot
+
+        with patch("bot.stop_preview", return_value={"success": False, "stopped": False, "project": "ghost", "checks": {"process_alive": True, "port_listening": True, "curl_responds": True}, "error": "still running"}):
+            text = bot._format_stop_result("stop_preview result:", bot.stop_preview("ghost"))
+        self.assertIn("success: False", text)
+        self.assertNotIn("Остановил", text)
+        self.assertNotIn("остановлен", text.lower())
+
+    def test_stop_delete_answer_routes_stop_phrase_instead_of_chat(self):
+        import bot
+
+        bot.create_static_site("nlstop")
+        bot.start_preview("nlstop")
+        bot.memory.set_current_project("nl_test_chat", "nlstop")
+        answer, debug = bot.stop_delete_answer("останови сервер", chat_id="nl_test_chat")
+        self.assertEqual(debug["detected"]["intent"], "stop_preview")
+        self.assertIn("success:", answer)
+        self.assertFalse(bot.preview_status("nlstop")["running"])
+
+    def test_stop_delete_answer_requires_explicit_project_for_vague_delete(self):
+        import bot
+
+        answer, debug = bot.stop_delete_answer("удали папки сайтов", chat_id="nl_test_chat_2")
+        self.assertIn("явно указать проект", answer)
+        self.assertEqual(debug["errors"], ["project not specified"])
+
+    def test_selftest_stop_delete_result_success(self):
+        from bot import selftest_stop_delete_result
+
+        result = selftest_stop_delete_result()
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["checks"]["stop_success"])
+        self.assertTrue(result["checks"]["delete_success"])
+        self.assertTrue(result["checks"]["folder_gone"])
+        self.assertFalse((Path(self.tmp.name) / "__jarvis_stop_delete_test__").exists())
 
 
 if __name__ == "__main__":

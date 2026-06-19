@@ -9,6 +9,7 @@ import traceback
 import requests
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -26,12 +27,20 @@ from action_schemas import extract_json_object, validate_create_static_site_acti
 from agent import answer_with_tools
 from intent_router import detect_intent, extract_mentioned_project, handle_detected_intent
 import memory
-from tools_fs import allowed_roots_info, search_text, tree_summary
+from tools_fs import ToolError, allowed_roots_info, search_text, tree_summary
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
 from tools_project import inspect_project, project_structure
 from tools_check import safe_code_check
 from tools_system import get_allowed_services, read_journal
-from tools_preview import list_previews, preview_status, start_preview, stop_preview
+from tools_preview import (
+    cleanup_stale_previews,
+    list_previews,
+    port_is_listening,
+    preview_status,
+    start_preview,
+    stop_preview,
+    stop_preview_by_port,
+)
 from tools_errors import error_summary, latest_error, mask_error_text, save_last_error
 from tools_write import (
     create_flask_site,
@@ -117,7 +126,7 @@ def get_system_prompt() -> str:
         "Не говори 'выполнил команду', если backend не запускал такую команду. "
         "Если использовался встроенный tool, говори 'Проверил через встроенный tool' или 'По данным read-only анализа'. "
         "Не выдумывай команды вроде ls -la, если реально использовался tree_summary/project_structure/safe_code_check. "
-        "Не говори 'создал', 'записал', 'удалил' или 'запустил', если write/preview tool не вернул успешный результат. "
+        "Не говори 'создал', 'записал', 'удалил', 'остановил' или 'запустил', если write/preview tool не вернул успешный результат с подтвержденной проверкой (process/port/curl/exists). "
         "После write/preview действия всегда показывай tools_called, actual_path и созданные/измененные/удаленные файлы или preview_url. "
         "Для опасных действий, таких как удаление файлов, миграции, рестарт сервисов, deploy, git push или изменения nginx/systemd, требуй явное подтверждение. "
         "Не говори, что ты облачный сервис. Ты локальный Jarvis, подключенный к Ollama."
@@ -247,6 +256,7 @@ def save_last_action(chat_id: str | None, action: dict) -> dict:
         "preview_url": action.get("preview_url") or "",
         "error": str(action.get("error") or ""),
         "tools_called": action.get("tools_called") or [],
+        "verification": action.get("verification"),
     }
     data = _load_last_actions()
     data[key] = payload
@@ -270,6 +280,7 @@ def _format_last_action(action: dict | None) -> str:
         f"path: {action.get('path') or '-'}",
         f"preview_url: {action.get('preview_url') or '-'}",
         f"tools_called: {', '.join(action.get('tools_called') or []) or '-'}",
+        f"verification: {action.get('verification') or '-'}",
         f"error: {action.get('error') or '-'}",
         "created_files:",
     ]
@@ -432,6 +443,100 @@ def _format_write_success(
     return "\n".join(lines)
 
 
+def _format_stop_result(label: str, result: dict) -> str:
+    checks = result.get("checks") or {}
+    lines = [label, f"success: {bool(result.get('success'))}"]
+    if "project" in result:
+        lines.append(f"project: {result.get('project')}")
+    if "port" in result:
+        lines.append(f"port: {result.get('port')}")
+    if "pid" in result:
+        lines.append(f"pid: {result.get('pid')}")
+    path_value = result.get("path") or result.get("cwd") or "-"
+    lines.append(f"path: {path_value}")
+    if result.get("success"):
+        if checks:
+            lines.append("verification: процесс завершен, порт закрыт, curl больше не отвечает")
+        else:
+            lines.append(f"verification: {result.get('reason') or 'нечего было останавливать'}")
+    else:
+        lines.append(
+            "verification: process_alive={} port_listening={} curl_responds={}".format(
+                checks.get("process_alive"), checks.get("port_listening"), checks.get("curl_responds")
+            )
+        )
+        if result.get("error"):
+            lines.append(f"error: {result['error']}")
+    return "\n".join(lines)
+
+
+def _format_delete_result(result: dict) -> str:
+    verification = result.get("verification") or {}
+    lines = [
+        "delete_workspace_dir result:",
+        f"project_name: {result.get('project_name')}",
+        f"path: {result.get('path')}",
+        f"success: {bool(result.get('success'))}",
+    ]
+    if result.get("success"):
+        lines.append("verification: папка отсутствует")
+    else:
+        lines.append(f"verification: exists_after={verification.get('exists_after')}")
+        if result.get("error"):
+            lines.append(f"error: {result['error']}")
+    preview_stop = result.get("preview_stop")
+    if preview_stop is not None:
+        lines.append(f"preview_stop.success: {bool(preview_stop.get('success'))}")
+    return "\n".join(lines)
+
+
+def _stop_all_previews() -> list[dict]:
+    rows = []
+    for item in list_previews()["previews"]:
+        name = item["project"]
+        try:
+            result = stop_preview(name)
+            rows.append(
+                {
+                    "project": name,
+                    "port": item.get("port"),
+                    "was_running": True,
+                    "stopped": bool(result.get("success")),
+                    "verification": result.get("checks") or {},
+                    "error": result.get("error"),
+                }
+            )
+        except Exception as e:
+            rows.append(
+                {
+                    "project": name,
+                    "port": item.get("port"),
+                    "was_running": True,
+                    "stopped": False,
+                    "verification": {},
+                    "error": str(e),
+                }
+            )
+    return rows
+
+
+def _format_stop_all_table(rows: list[dict]) -> str:
+    if not rows:
+        return "preview_stop_all result:\nнет зарегистрированных preview процессов"
+    lines = ["preview_stop_all result:", "project | port | was_running | stopped | verification"]
+    for row in rows:
+        checks = row.get("verification") or {}
+        verification = (
+            "process_alive={} port_listening={} curl_responds={}".format(
+                checks.get("process_alive"), checks.get("port_listening"), checks.get("curl_responds")
+            )
+            if checks
+            else (row.get("error") or "-")
+        )
+        lines.append(f"{row['project']} | {row.get('port')} | {row['was_running']} | {row['stopped']} | {verification}")
+    return "\n".join(lines)
+
+
 def workspace_where_answer(project_name: str | None, chat_id: str | None = None) -> tuple[str, dict]:
     tools_called = ["verify_project_files", "preview_status"]
     if not project_name:
@@ -447,6 +552,8 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
     verify = verify_project_files(project_name)
     exists = Path(verify["path"]).is_dir()
     status = preview_status(project_name)
+    port = status.get("port")
+    port_listening = bool(port) and port_is_listening(int(port))
     if not exists:
         answer = "\n".join(
             [
@@ -455,7 +562,8 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
                 "exists: false",
                 f"path: {verify['path']}",
                 "Проект не найден в WRITE_ROOT",
-                f"preview running: {status.get('running', False)}",
+                f"preview registered: {status.get('registered', False)}",
+                f"port listening: {port_listening}",
             ]
         )
     else:
@@ -472,10 +580,17 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
             "files exist:",
         ]
         lines.extend(f"- {key}: {Path(path).is_file()} ({path})" for key, path in required.items())
+        lines.append(f"preview registered: {status.get('registered', False)}")
         lines.append(f"preview running: {status.get('running', False)}")
-        if status.get("url"):
+        lines.append(f"port listening: {port_listening}")
+        curl_check = status.get("curl_check")
+        if curl_check:
+            lines.append(f"curl status: {curl_check}")
+        else:
+            lines.append("curl status: -")
+        if status.get("running") and status.get("url"):
             lines.append(f"url: {status['url']}")
-        elif status.get("running") is False:
+        else:
             lines.append("url: -")
         answer = "\n".join(lines)
     return (
@@ -795,6 +910,179 @@ def write_mode_answer(user_text: str, chat_id: str | None = None) -> tuple[str, 
     return create_site_workflow(user_text, project_name=name, chat_id=chat_id, start_preview_requested=True)
 
 
+STOP_WORDS = ("останови", "остановить", "отключи", "отключить", "выключи", "выключить", "стопни", "stop")
+DELETE_WORDS = ("удали", "удалить", "снеси", "снести", "delete")
+STOP_ALL_PHRASES = (
+    "оба сервера",
+    "оба preview",
+    "обе превью",
+    "все сервера",
+    "все серверы",
+    "все preview",
+    "все превью",
+)
+DELETE_VAGUE_PHRASES = (
+    "папки сайтов",
+    "папку сайтов",
+    "все сайты",
+    "все папки",
+    "все проекты workspace",
+)
+PORT_RE = re.compile(r"порт[ауе]?\s*:?\s*(\d{2,5})")
+
+
+def _extract_port(text: str) -> int | None:
+    match = PORT_RE.search(text.lower())
+    return int(match.group(1)) if match else None
+
+
+def stop_delete_answer(user_text: str, chat_id: str | None = None) -> tuple[str, dict] | None:
+    lowered = user_text.lower()
+    wants_stop = any(word in lowered for word in STOP_WORDS)
+    wants_delete = any(word in lowered for word in DELETE_WORDS)
+    if not wants_stop and not wants_delete:
+        return None
+
+    if wants_stop:
+        port = _extract_port(lowered)
+        if port is not None:
+            tools_called = ["stop_preview_by_port"]
+            try:
+                result = stop_preview_by_port(port)
+                save_last_action(
+                    chat_id,
+                    {
+                        "intent": "stop_preview_by_port",
+                        "project_name": f"port:{port}",
+                        "success": bool(result.get("success")),
+                        "path": result.get("cwd", ""),
+                        "error": result.get("error", ""),
+                        "tools_called": tools_called,
+                        "verification": result.get("checks"),
+                    },
+                )
+                return (
+                    _format_stop_result("stop_preview_by_port result:", result),
+                    {
+                        "detected": {"intent": "stop_preview_by_port", "port": port},
+                        "tools_called": tools_called,
+                        "errors": [] if result.get("success") else [result.get("error", "")],
+                    },
+                )
+            except Exception as e:
+                save_last_error(chat_id=chat_id or "", user_id="", handler="stop_delete_answer", error=e, user_text=user_text)
+                return (
+                    f"Не смог остановить preview на порту {port}: {e}",
+                    {"detected": {"intent": "stop_preview_by_port", "port": port}, "tools_called": tools_called, "errors": [str(e)]},
+                )
+
+        if any(phrase in lowered for phrase in STOP_ALL_PHRASES):
+            rows = _stop_all_previews()
+            save_last_action(
+                chat_id,
+                {
+                    "intent": "preview_stop_all",
+                    "project_name": ", ".join(row["project"] for row in rows) or "-",
+                    "success": all(row["stopped"] for row in rows) if rows else True,
+                    "tools_called": ["stop_preview"] * len(rows),
+                    "verification": rows,
+                },
+            )
+            return (
+                _format_stop_all_table(rows),
+                {"detected": {"intent": "preview_stop_all"}, "tools_called": ["stop_preview"] * len(rows), "errors": []},
+            )
+
+        if any(word in lowered for word in ("сервер", "preview", "превью")):
+            project = _workspace_project_from_context(user_text, chat_id)
+            if not project:
+                return (
+                    "Не понял, какой проект остановить. Укажи имя: /preview_stop <project> или назови порт.",
+                    {"detected": {"intent": "stop_preview"}, "tools_called": [], "errors": ["project not resolved"]},
+                )
+            tools_called = ["stop_preview"]
+            try:
+                result = stop_preview(project)
+                save_last_action(
+                    chat_id,
+                    {
+                        "intent": "stop_preview",
+                        "project_name": project,
+                        "success": bool(result.get("success")),
+                        "path": result.get("path", ""),
+                        "error": result.get("error", ""),
+                        "tools_called": tools_called,
+                        "verification": result.get("checks"),
+                    },
+                )
+                return (
+                    _format_stop_result("stop_preview result:", result),
+                    {
+                        "detected": {"intent": "stop_preview", "project": project},
+                        "tools_called": tools_called,
+                        "errors": [] if result.get("success") else [result.get("error", "")],
+                    },
+                )
+            except Exception as e:
+                save_last_error(chat_id=chat_id or "", user_id="", handler="stop_delete_answer", error=e, user_text=user_text)
+                return (
+                    f"Не смог остановить preview: {e}",
+                    {"detected": {"intent": "stop_preview", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
+                )
+
+    if wants_delete and any(word in lowered for word in ("папк", "сайт", "проект", "workspace")):
+        explicit_name = _workspace_name_from_text(user_text)
+        is_vague = any(phrase in lowered for phrase in DELETE_VAGUE_PHRASES)
+        project = explicit_name if explicit_name and _workspace_project_exists(explicit_name) else None
+        if not project and not is_vague:
+            project = _workspace_project_from_context(user_text, chat_id)
+            if project and not _workspace_project_exists(project):
+                project = None
+        if not project:
+            try:
+                projects = [item["name"] for item in list_workspace()["projects"]]
+            except Exception:
+                projects = []
+            listing = ", ".join(projects) or "-"
+            return (
+                "Нужно явно указать проект для удаления (опасное действие).\n"
+                f"Доступные workspace-проекты: {listing}\n"
+                "Используй: /workspace_delete <project>",
+                {"detected": {"intent": "delete_workspace_dir"}, "tools_called": [], "errors": ["project not specified"]},
+            )
+        tools_called = ["delete_workspace_dir"]
+        try:
+            result = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+            save_last_action(
+                chat_id,
+                {
+                    "intent": "delete_workspace_dir",
+                    "project_name": result.get("project_name", project),
+                    "success": bool(result.get("success")),
+                    "path": result.get("path", ""),
+                    "error": result.get("error", ""),
+                    "tools_called": tools_called,
+                    "verification": result.get("verification"),
+                },
+            )
+            return (
+                _format_delete_result(result),
+                {
+                    "detected": {"intent": "delete_workspace_dir", "project": project},
+                    "tools_called": tools_called,
+                    "errors": [] if result.get("success") else [result.get("error", "")],
+                },
+            )
+        except Exception as e:
+            save_last_error(chat_id=chat_id or "", user_id="", handler="stop_delete_answer", error=e, user_text=user_text)
+            return (
+                f"Не смог удалить проект {project}: {e}",
+                {"detected": {"intent": "delete_workspace_dir", "project": project}, "tools_called": tools_called, "errors": [str(e)]},
+            )
+
+    return None
+
+
 def summarize_project_with_ollama(data: dict) -> str:
     summary = ask_ollama_messages(project_summary_prompt(data))
     memory.save_project_note(
@@ -815,6 +1103,8 @@ def pending_task_for_text(user_text: str) -> str | None:
         return "create_workspace_project"
     if any(phrase in lowered for phrase in EDIT_PROJECT_PHRASES):
         return "edit_workspace_project"
+    if any(word in lowered for word in STOP_WORDS) or any(word in lowered for word in DELETE_WORDS):
+        return "stop_or_delete_workspace"
     if any(phrase in lowered for phrase in ("проверь код", "есть ли ошибка", "ошибки в проекте", "проверь проект", "check project")):
         return "safe_code_check"
     if any(phrase in lowered for phrase in ("посмотри проект", "изучи проект", "изучи код", "на чем остановились", "на чём остановились")):
@@ -842,6 +1132,9 @@ def answer_user_text(
     status_answer = workspace_status_answer(user_text, chat_id=chat_id)
     if status_answer:
         return status_answer
+    stop_delete = stop_delete_answer(user_text, chat_id=chat_id)
+    if stop_delete:
+        return stop_delete
     write_answer = write_mode_answer(user_text, chat_id=chat_id)
     if write_answer:
         return write_answer
@@ -1548,23 +1841,125 @@ async def preview_stop_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not context.args:
         await update.message.reply_text("Использование: /preview_stop <project>")
         return
+    chat_id, user_id = chat_user_ids(update)
+    project = context.args[0]
     try:
-        result = stop_preview(context.args[0])
-        await reply_long(
-            update.message,
-            "\n".join(
-                [
-                    "Остановил preview.",
-                    "tools_called: stop_preview",
-                    f"project: {result.get('project')}",
-                    f"stopped: {result.get('stopped')}",
-                ]
-            ),
+        result = stop_preview(project)
+        save_last_action(
+            chat_id,
+            {
+                "intent": "stop_preview",
+                "project_name": project,
+                "success": bool(result.get("success")),
+                "path": result.get("path", ""),
+                "error": result.get("error", ""),
+                "tools_called": ["stop_preview"],
+                "verification": result.get("checks"),
+            },
         )
+        await reply_long(update.message, _format_stop_result("stop_preview result:", result))
     except Exception as e:
-        chat_id, user_id = chat_user_ids(update)
         save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_stop_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /preview_stop: {e}")
+
+
+async def preview_stop_port_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /preview_stop_port <port>")
+        return
+    chat_id, user_id = chat_user_ids(update)
+    try:
+        port = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Порт должен быть числом")
+        return
+    try:
+        result = stop_preview_by_port(port)
+        save_last_action(
+            chat_id,
+            {
+                "intent": "stop_preview_by_port",
+                "project_name": f"port:{port}",
+                "success": bool(result.get("success")),
+                "path": result.get("cwd", ""),
+                "error": result.get("error", ""),
+                "tools_called": ["stop_preview_by_port"],
+                "verification": result.get("checks"),
+            },
+        )
+        await reply_long(update.message, _format_stop_result("stop_preview_by_port result:", result))
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_stop_port_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /preview_stop_port: {e}")
+
+
+async def preview_stop_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, user_id = chat_user_ids(update)
+    try:
+        rows = _stop_all_previews()
+        save_last_action(
+            chat_id,
+            {
+                "intent": "preview_stop_all",
+                "project_name": ", ".join(row["project"] for row in rows) or "-",
+                "success": all(row["stopped"] for row in rows) if rows else True,
+                "tools_called": ["stop_preview"] * len(rows),
+                "verification": rows,
+            },
+        )
+        await reply_long(update.message, _format_stop_all_table(rows))
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_stop_all_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /preview_stop_all: {e}")
+
+
+async def workspace_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /workspace_delete <project>")
+        return
+    chat_id, user_id = chat_user_ids(update)
+    project = context.args[0]
+    try:
+        result = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        save_last_action(
+            chat_id,
+            {
+                "intent": "delete_workspace_dir",
+                "project_name": result.get("project_name", project),
+                "success": bool(result.get("success")),
+                "path": result.get("path", ""),
+                "error": result.get("error", ""),
+                "tools_called": ["delete_workspace_dir"],
+                "verification": result.get("verification"),
+            },
+        )
+        await reply_long(update.message, _format_delete_result(result))
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="workspace_delete_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /workspace_delete: {e}")
+
+
+async def workspace_clean_stopped_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    try:
+        result = cleanup_stale_previews()
+        lines = [
+            "workspace_clean_stopped result:",
+            f"removed: {', '.join(result['removed']) or '-'}",
+            f"remaining: {', '.join(result['remaining']) or '-'}",
+        ]
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="workspace_clean_stopped_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /workspace_clean_stopped: {e}")
 
 
 async def preview_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1726,6 +2121,90 @@ async def selftest_workspace_command(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text(f"Ошибка /selftest_workspace: {e}. Детали сохранены в /last_error")
 
 
+def selftest_stop_delete_result() -> dict:
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        return {
+            "success": False,
+            "error": "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env",
+            "write_root": str(config.get_write_root()),
+        }
+    project = "__jarvis_stop_delete_test__"
+    checks: dict[str, Any] = {}
+    try:
+        if Path(config.get_write_root() / project).exists():
+            try:
+                delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+            except ToolError:
+                pass
+
+        create_result = create_static_site(project, title="Jarvis Stop Delete Selftest")
+        if not create_result.get("success"):
+            raise RuntimeError("create_static_site не вернул success=True")
+        checks["created"] = True
+
+        preview = start_preview(project)
+        if not preview.get("success"):
+            raise RuntimeError("start_preview не вернул success=True")
+        status_after_start = preview_status(project)
+        checks["preview_running_after_start"] = bool(status_after_start.get("running"))
+        response = requests.get(f"http://127.0.0.1:{preview['port']}/", timeout=5)
+        checks["curl_200_after_start"] = response.status_code == 200
+
+        stop_result = stop_preview(project)
+        checks["stop_success"] = bool(stop_result.get("success"))
+        checks["stop_checks"] = stop_result.get("checks")
+        port_still_listening = port_is_listening(int(preview["port"]))
+        checks["port_listening_after_stop"] = port_still_listening
+        try:
+            requests.get(f"http://127.0.0.1:{preview['port']}/", timeout=2)
+            checks["curl_fails_after_stop"] = False
+        except requests.exceptions.RequestException:
+            checks["curl_fails_after_stop"] = True
+
+        delete_result = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        checks["delete_success"] = bool(delete_result.get("success"))
+        checks["folder_gone"] = not Path(config.get_write_root() / project).exists()
+
+        overall = (
+            checks.get("preview_running_after_start")
+            and checks.get("curl_200_after_start")
+            and checks.get("stop_success")
+            and not checks.get("port_listening_after_stop")
+            and checks.get("curl_fails_after_stop")
+            and checks.get("delete_success")
+            and checks.get("folder_gone")
+        )
+        return {"success": bool(overall), "project": project, "checks": checks}
+    except Exception as e:
+        try:
+            stop_preview(project)
+        except Exception:
+            pass
+        try:
+            delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        except Exception:
+            pass
+        return {"success": False, "project": project, "checks": checks, "error": str(e)}
+
+
+async def selftest_stop_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    await progress(update.message, "Принял: запускаю selftest_stop_delete (временный проект, реальные sitebota/test-site не трогаю)")
+    try:
+        result = selftest_stop_delete_result()
+        lines = [f"success: {result.get('success')}", f"project: {result.get('project')}"]
+        for key, value in (result.get("checks") or {}).items():
+            lines.append(f"- {key}: {value}")
+        if result.get("error"):
+            lines.append(f"error: {result['error']}")
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="selftest_stop_delete_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /selftest_stop_delete: {e}. Детали сохранены в /last_error")
+
+
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -1798,7 +2277,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/write_file <project>/<file> <content> - записать текстовый файл",
                 "/delete_file <project>/<file> - удалить файл из WRITE_ROOT",
                 "/preview_start <project> - запустить preview",
-                "/preview_stop <project> - остановить preview",
+                "/preview_stop <project> - остановить preview с проверкой (pid/port/curl)",
+                "/preview_stop_port <port> - остановить preview процесс по порту",
+                "/preview_stop_all - остановить все зарегистрированные preview с таблицей результатов",
+                "/workspace_delete <project> - удалить проект из WRITE_ROOT с проверкой",
+                "/workspace_clean_stopped - убрать из реестра записи о мертвых preview",
+                "/selftest_stop_delete - selftest на временном проекте, не трогает реальные сайты",
                 "/preview_list - список preview",
                 "/preview_status <project> - статус preview",
                 "/selftest_workspace - проверить write/preview workspace",
@@ -2288,6 +2772,11 @@ def main():
     app.add_handler(CommandHandler("delete_file", delete_file_command))
     app.add_handler(CommandHandler("preview_start", preview_start_command))
     app.add_handler(CommandHandler("preview_stop", preview_stop_command))
+    app.add_handler(CommandHandler("preview_stop_port", preview_stop_port_command))
+    app.add_handler(CommandHandler("preview_stop_all", preview_stop_all_command))
+    app.add_handler(CommandHandler("workspace_delete", workspace_delete_command))
+    app.add_handler(CommandHandler("workspace_clean_stopped", workspace_clean_stopped_command))
+    app.add_handler(CommandHandler("selftest_stop_delete", selftest_stop_delete_command))
     app.add_handler(CommandHandler("preview_list", preview_list_command))
     app.add_handler(CommandHandler("preview_status", preview_status_command))
     app.add_handler(CommandHandler("selftest_workspace", selftest_workspace_command))

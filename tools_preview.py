@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -86,6 +87,69 @@ def _port_free(port: int) -> bool:
             return False
 
 
+def _port_listening(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        try:
+            sock.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _find_listening_pid(port: int) -> int | None:
+    try:
+        result = subprocess.run(
+            ["ss", "-H", "-ltnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    match = re.search(r"pid=(\d+)", result.stdout)
+    return int(match.group(1)) if match else None
+
+
+def _path_in_write_root(path: Path) -> bool:
+    root = config.get_write_root().resolve()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _reap(pid: int) -> None:
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+
+def _stop_pid(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    for _ in range(20):
+        _reap(pid)
+        if not _is_pid_alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    for _ in range(10):
+        _reap(pid)
+        if not _is_pid_alive(pid):
+            return
+        time.sleep(0.1)
+    _reap(pid)
+
+
 def _select_port() -> int:
     start = config.env_int("PREVIEW_PORT_MIN", config.PREVIEW_PORT_MIN)
     end = config.env_int("PREVIEW_PORT_MAX", config.PREVIEW_PORT_MAX)
@@ -99,6 +163,10 @@ def _select_port() -> int:
 
 def find_free_port() -> int:
     return _select_port()
+
+
+def port_is_listening(port: int) -> bool:
+    return _port_listening(int(port))
 
 
 def _project_path(project_name: str) -> Path:
@@ -200,41 +268,119 @@ def stop_preview(project_name: str) -> dict[str, Any]:
     record = registry.get(name)
     if not record:
         raise ToolError(f"Preview не найден: {name}")
-    if not _is_own_preview_process(record):
+
+    path = Path(str(record.get("path") or ""))
+    if not _path_in_write_root(path):
+        raise ToolError(f"Preview path вне WRITE_ROOT, отказ останова: {path}")
+
+    pid = int(record.get("pid") or 0)
+    port = int(record.get("port") or 0)
+
+    if pid and _is_pid_alive(pid) and _is_own_preview_process(record):
+        _stop_pid(pid)
+    _PROCESS_HANDLES.pop(name, None)
+
+    process_alive = bool(pid) and _is_pid_alive(pid)
+    port_listening = bool(port) and _port_listening(port)
+    curl_check = _curl_localhost(port) if port else {"success": False}
+    curl_responds = bool(curl_check.get("success"))
+
+    checks = {
+        "process_alive": process_alive,
+        "port_listening": port_listening,
+        "curl_responds": curl_responds,
+    }
+    stopped = not process_alive and not port_listening and not curl_responds
+
+    if stopped:
         registry.pop(name, None)
         _save_registry(registry)
-        return {"success": False, "project": name, "stopped": False, "reason": "process not running or not owned preview"}
 
-    pid = int(record["pid"])
-    os.killpg(pid, signal.SIGTERM)
-    handle = _PROCESS_HANDLES.pop(name, None)
-    for _ in range(20):
-        if handle is not None and handle.poll() is not None:
-            break
-        try:
-            waited, _ = os.waitpid(pid, os.WNOHANG)
-            if waited == pid:
-                break
-        except ChildProcessError:
-            pass
-        if not _is_pid_alive(pid):
-            break
-        time.sleep(0.1)
-    if _is_pid_alive(pid):
-        os.killpg(pid, signal.SIGKILL)
-    if handle is not None:
-        try:
-            handle.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-    else:
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-    registry.pop(name, None)
-    _save_registry(registry)
-    return {"success": True, "project": name, "pid": pid, "stopped": True}
+    result = {
+        "success": stopped,
+        "stopped": stopped,
+        "project": name,
+        "pid": pid,
+        "port": port,
+        "path": str(path),
+        "checks": checks,
+    }
+    if not stopped:
+        result["error"] = (
+            f"Preview не подтвержден как остановленный: process_alive={process_alive} "
+            f"port_listening={port_listening} curl_responds={curl_responds}"
+        )
+    return result
+
+
+def stop_preview_by_port(port: int) -> dict[str, Any]:
+    port = int(port)
+    min_port = config.env_int("PREVIEW_PORT_MIN", config.PREVIEW_PORT_MIN)
+    max_port = config.env_int("PREVIEW_PORT_MAX", config.PREVIEW_PORT_MAX)
+    registry = _load_registry()
+    extra_allowed_ports = {int(record["port"]) for record in registry.values() if record.get("port")}
+    if not (min_port <= port <= max_port) and port not in extra_allowed_ports:
+        raise ToolError(
+            f"Порт {port} вне разрешенного диапазона preview {min_port}-{max_port} "
+            "и не зарегистрирован как preview"
+        )
+
+    if not _port_listening(port):
+        return {
+            "success": True,
+            "stopped": False,
+            "port": port,
+            "reason": "port not listening",
+            "checks": {"process_alive": False, "port_listening": False, "curl_responds": False},
+        }
+
+    pid = _find_listening_pid(port)
+    if not pid:
+        raise ToolError(f"Не удалось определить процесс, слушающий порт {port}")
+
+    cwd = _proc_cwd(pid)
+    cmdline = _proc_cmdline(pid)
+    if "http.server" not in cmdline:
+        raise ToolError(f"Процесс на порту {port} не похож на preview (нет http.server в cmdline): {cmdline.strip()}")
+    if not cwd or not _path_in_write_root(cwd):
+        raise ToolError(f"Процесс на порту {port} вне WRITE_ROOT, отказ останова: {cwd}")
+
+    _stop_pid(pid)
+
+    process_alive = _is_pid_alive(pid)
+    port_listening = _port_listening(port)
+    curl_check = _curl_localhost(port)
+    curl_responds = bool(curl_check.get("success"))
+    checks = {"process_alive": process_alive, "port_listening": port_listening, "curl_responds": curl_responds}
+    stopped = not process_alive and not port_listening and not curl_responds
+
+    if stopped:
+        changed = False
+        for proj_name, rec in list(registry.items()):
+            if int(rec.get("port") or -1) == port:
+                registry.pop(proj_name, None)
+                changed = True
+        if changed:
+            _save_registry(registry)
+
+    result = {
+        "success": stopped,
+        "stopped": stopped,
+        "port": port,
+        "pid": pid,
+        "cwd": str(cwd) if cwd else "",
+        "checks": checks,
+    }
+    if not stopped:
+        result["error"] = f"Порт {port} все еще активен после попытки остановки"
+    return result
+
+
+def cleanup_stale_previews() -> dict[str, Any]:
+    registry = _load_registry()
+    removed = [name for name, record in registry.items() if not _is_own_preview_process(record)]
+    clean = _cleanup_stale(registry)
+    return {"removed": removed, "remaining": list(clean.keys())}
 
 
 def list_previews() -> dict[str, Any]:
@@ -247,5 +393,9 @@ def preview_status(project_name: str) -> dict[str, Any]:
     name = Path(project_name).name
     record = registry.get(name)
     if not record:
-        return {"project": name, "running": False}
-    return {**record, "running": _is_own_preview_process(record)}
+        return {"project": name, "running": False, "registered": False}
+    running = _is_own_preview_process(record)
+    result = {**record, "running": running, "registered": True}
+    if running:
+        result["curl_check"] = _curl_localhost(int(record["port"]))
+    return result

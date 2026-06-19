@@ -212,18 +212,49 @@ def delete_workspace_file(path: str) -> dict[str, Any]:
 
 def delete_workspace_dir(path: str, confirm_token: str | None = None) -> dict[str, Any]:
     ensure_write_root()
-    directory = resolve_write_path(path)
+    cleaned = (path or "").strip()
+    if not cleaned or cleaned in {".", "/", ".."} or "/" in cleaned or "\\" in cleaned:
+        raise ToolError(f"Недопустимое имя проекта для удаления: {path!r}")
+    project_name = _validate_project_name(cleaned)
+
     root = _write_root().resolve()
-    if directory == root:
-        raise ToolError("Удалять WRITE_ROOT запрещено")
-    if not directory.is_dir() or directory.is_symlink():
-        raise ToolError(f"Директория не найдена или является symlink: {directory}")
-    expected = f"DELETE:{directory.name}"
+    candidate = root / project_name
+    if candidate.is_symlink():
+        raise ToolError(f"Удаление symlink запрещено: {candidate}")
+    directory = candidate.resolve()
+    if directory == root or root not in directory.parents:
+        raise ToolError(f"Удаление вне WRITE_ROOT запрещено: {directory}")
+    if not directory.is_dir():
+        raise ToolError(f"Директория не найдена: {directory}")
+    expected = f"DELETE:{project_name}"
     if confirm_token != expected:
         raise ToolError(f"Для удаления директории нужен confirm_token={expected}")
+
+    stop_result = None
+    try:
+        import tools_preview
+
+        stop_result = tools_preview.stop_preview(project_name)
+    except ToolError:
+        stop_result = None
+
     shutil.rmtree(directory)
-    _log_write("delete_workspace_dir", directory)
-    return {"path": str(directory), "deleted": True}
+    exists_after = directory.exists()
+    deleted = not exists_after
+    _log_write("delete_workspace_dir", directory, {"success": deleted})
+
+    result = {
+        "path": str(directory),
+        "project_name": project_name,
+        "deleted": deleted,
+        "success": deleted,
+        "verification": {"exists_after": exists_after},
+    }
+    if stop_result is not None:
+        result["preview_stop"] = stop_result
+    if not deleted:
+        result["error"] = f"Директория все еще существует после удаления: {directory}"
+    return result
 
 
 def init_git(path: str) -> dict[str, Any]:

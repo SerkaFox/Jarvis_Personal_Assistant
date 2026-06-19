@@ -10,8 +10,9 @@ from tools_fs import (
     search_text,
     tree_summary,
 )
+from tools_check import safe_code_check
 from tools_git import find_git_repos, git_diff, git_status
-from tools_project import inspect_project
+from tools_project import inspect_project, project_structure
 from tools_system import read_journal, service_status
 
 
@@ -23,6 +24,8 @@ TOOL_REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
     "git_status": git_status,
     "git_diff": git_diff,
     "inspect_project": inspect_project,
+    "project_structure": project_structure,
+    "safe_code_check": safe_code_check,
     "tree_summary": tree_summary,
     "service_status": service_status,
     "read_journal": read_journal,
@@ -44,15 +47,20 @@ PLANNER_SYSTEM_PROMPT = """
 - git_status(repo_path)
 - git_diff(repo_path, max_chars)
 - inspect_project(repo_name_or_path)
+- project_structure(repo_name_or_path)
+- safe_code_check(repo_name_or_path)
 - tree_summary(path, depth)
 - service_status(name)
 - read_journal(name, lines)
 - final_answer(answer)
 Правила: только чтение, не планируй записи, sudo, restart, deploy, rm/mv/cp, git pull/push/commit.
+Не планируй произвольные shell-команды. Не говори "выполнил команду", если backend не запускал такую команду.
 Примеры:
 Вопрос "Какие проекты у меня есть на сервере и какие из них git-репозитории?" -> {"use_tools": true, "tools": [{"name": "find_git_repos", "args": {}}]}.
 Вопрос "где используется booking_calendar_day" -> {"use_tools": true, "tools": [{"name": "search_text", "args": {"root": "/home/seradmin", "query": "booking_calendar_day"}}]}.
 Вопрос "посмотри проект anna, на чем остановились" -> {"use_tools": true, "tools": [{"name": "inspect_project", "args": {"repo_name_or_path": "anna"}}]}.
+Вопрос "сколько там файлов и структура" при current_project=anna -> {"use_tools": true, "tools": [{"name": "project_structure", "args": {"repo_name_or_path": "anna"}}]}.
+Вопрос "проверь код проекта, есть ли там ошибка?" при current_project=anna -> {"use_tools": true, "tools": [{"name": "safe_code_check", "args": {"repo_name_or_path": "anna"}}]}.
 """.strip()
 
 FINAL_SYSTEM_PROMPT = """
@@ -60,6 +68,9 @@ FINAL_SYSTEM_PROMPT = """
 Отвечай по-русски, кратко и по делу.
 Используй только результаты инструментов как факты о сервере.
 Если инструмент вернул ошибку или данных недостаточно, скажи это прямо.
+Не говори "выполнил команду", если в результатах нет реально запущенной shell-команды.
+Для tree_summary/project_structure/safe_code_check говори: "Проверил через встроенный tool" или "По данным read-only анализа".
+Не выдумывай команды вроде ls -la, если использовался tree_summary или project_structure.
 Не предлагай опасные команды без явного запроса пользователя.
 """.strip()
 
@@ -87,6 +98,10 @@ def build_planner_messages(user_text: str, memory_context: str = "") -> list[dic
 
 def heuristic_plan(user_text: str) -> dict[str, Any] | None:
     text = user_text.lower()
+    if any(phrase in text for phrase in ("проверь код", "есть ли ошибка", "ошибки в проекте", "проверь проект", "check project")):
+        return None
+    if any(phrase in text for phrase in ("посмотри структуру", "сколько там файлов", "сколько файлов", "structure")):
+        return None
     project_inspect_phrases = (
         "посмотри проект",
         "на чем остановились",

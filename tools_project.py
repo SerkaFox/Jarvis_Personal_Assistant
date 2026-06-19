@@ -4,6 +4,19 @@ from typing import Any
 from tools_fs import read_file, search_text, tree_summary
 from tools_git import git_branch, git_diff, git_remote, git_status, resolve_repo, _run_git
 
+PROJECT_EXCLUDED_DIRS = {
+    ".codex",
+    ".config",
+    ".git",
+    ".venv",
+    "__pycache__",
+    "media",
+    "node_modules",
+    "staticfiles",
+    "uploads",
+    "venv",
+}
+
 
 def _safe_read(path: Path, max_chars: int = 3000) -> dict[str, Any] | None:
     try:
@@ -14,9 +27,8 @@ def _safe_read(path: Path, max_chars: int = 3000) -> dict[str, Any] | None:
 
 def _find_files(root: Path, names: tuple[str, ...], max_items: int = 20) -> list[str]:
     matches = []
-    excluded = {".git", "venv", ".venv", "__pycache__", "node_modules", "media", "uploads", "staticfiles"}
     for path in root.rglob("*"):
-        if any(part in excluded for part in path.parts):
+        if any(part in PROJECT_EXCLUDED_DIRS for part in path.parts):
             continue
         if path.is_file() and any(path.name.lower().startswith(name.lower()) for name in names):
             matches.append(str(path))
@@ -36,7 +48,7 @@ def _find_django(root: Path) -> dict[str, Any]:
         "templates": [],
     }
     for path in root.rglob("*.py"):
-        if any(part in {".git", "venv", ".venv", "__pycache__"} for part in path.parts):
+        if any(part in PROJECT_EXCLUDED_DIRS for part in path.parts):
             continue
         if path.name == "settings.py":
             data["settings"].append(str(path))
@@ -52,6 +64,47 @@ def _find_django(root: Path) -> dict[str, Any]:
     if templates.exists():
         data["templates"].append(str(templates))
     return data
+
+
+def project_structure(repo_name_or_path: str, depth: int = 2) -> dict[str, Any]:
+    repo = resolve_repo(repo_name_or_path)
+    counts = {
+        "total_files": 0,
+        "total_dirs": 0,
+        "python_files": 0,
+        "template_files": 0,
+        "js_files": 0,
+        "css_files": 0,
+    }
+
+    for path in repo.rglob("*"):
+        if any(part in PROJECT_EXCLUDED_DIRS for part in path.relative_to(repo).parts):
+            continue
+        if path.is_dir():
+            counts["total_dirs"] += 1
+            continue
+        if not path.is_file():
+            continue
+
+        counts["total_files"] += 1
+        suffix = path.suffix.lower()
+        if suffix == ".py":
+            counts["python_files"] += 1
+        elif suffix in {".html", ".htm", ".jinja", ".j2"}:
+            counts["template_files"] += 1
+        elif suffix in {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"}:
+            counts["js_files"] += 1
+        elif suffix == ".css":
+            counts["css_files"] += 1
+
+    tree = tree_summary(str(repo), depth=depth)
+    return {
+        "project_name": repo.name,
+        "path": str(repo),
+        "counts": counts,
+        "tree_summary": tree["tree"],
+        "depth": tree["depth"],
+    }
 
 
 def inspect_project(repo_name_or_path: str) -> dict[str, Any]:

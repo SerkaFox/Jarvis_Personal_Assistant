@@ -20,11 +20,12 @@ from dotenv import load_dotenv
 
 import config
 from agent import answer_with_tools
-from intent_router import detect_intent, handle_detected_intent
+from intent_router import detect_intent, extract_mentioned_project, handle_detected_intent
 import memory
 from tools_fs import allowed_roots_info, search_text, tree_summary
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
-from tools_project import inspect_project
+from tools_project import inspect_project, project_structure
+from tools_check import safe_code_check
 from tools_system import get_allowed_services, read_journal
 
 load_dotenv()
@@ -78,6 +79,9 @@ def get_system_prompt() -> str:
         "Для серверных/проектных вопросов backend должен вызывать tools. Если ты видишь tool results — отвечай по ним. "
         "Если пользователь говорит 'это', 'он', 'там', 'проект' — используй последние сообщения для контекста. "
         "Не придумывай результаты команд. Если нужны логи или вывод команды — попроси пользователя выполнить команду или скажи, какую команду выполнить. "
+        "Не говори 'выполнил команду', если backend не запускал такую команду. "
+        "Если использовался встроенный tool, говори 'Проверил через встроенный tool' или 'По данным read-only анализа'. "
+        "Не выдумывай команды вроде ls -la, если реально использовался tree_summary/project_structure/safe_code_check. "
         "Для опасных действий, таких как удаление файлов, миграции, рестарт сервисов, deploy, git push или изменения nginx/systemd, требуй явное подтверждение. "
         "Не говори, что ты облачный сервис. Ты локальный Jarvis, подключенный к Ollama."
     )
@@ -158,17 +162,27 @@ def answer_user_text(
         detected = {"intent": "memory_status"}
         return memory_status, {"detected": detected, "tools_called": [], "errors": []}
 
-    detected = detect_intent(user_text, recent_messages or [])
+    current_project = memory.get_current_project(chat_id) if chat_id else None
+    mentioned_project = extract_mentioned_project(user_text)
+    if mentioned_project and chat_id:
+        memory.set_current_project(chat_id, mentioned_project)
+        current_project = mentioned_project
+
+    detected = detect_intent(user_text, recent_messages or [], current_project=current_project)
+    if detected.get("project") and chat_id:
+        memory.set_current_project(chat_id, detected["project"])
+        current_project = detected["project"]
+
     if detected.get("intent") != "normal_chat":
         routed = handle_detected_intent(detected, summarize_project=summarize_project_with_ollama)
-        return routed["answer"], {"detected": detected, **routed}
+        return routed["answer"], {"detected": detected, "current_project": current_project, **routed}
 
     memory_context = memory.build_memory_context(chat_id, user_text) if chat_id else ""
     if use_agent:
         agent_answer = answer_with_tools(user_text, ask_ollama_messages, memory_context=memory_context)
         if agent_answer:
-            return agent_answer, {"detected": detected, "tools_called": ["agent"], "errors": []}
-    return ask_ollama(user_text, chat_id=chat_id), {"detected": detected, "tools_called": [], "errors": []}
+            return agent_answer, {"detected": detected, "current_project": current_project, "tools_called": ["agent"], "errors": []}
+    return ask_ollama(user_text, chat_id=chat_id), {"detected": detected, "current_project": current_project, "tools_called": [], "errors": []}
 
 
 def transcribe_audio_file(path: str) -> dict:
@@ -376,6 +390,91 @@ def _format_git_status(repo: dict) -> str:
     )
 
 
+def _format_structure_result(data: dict) -> str:
+    counts = data.get("counts", {})
+    return "\n".join(
+        [
+            f"Проект: {data.get('project_name')}",
+            f"Путь: {data.get('path')}",
+            "Файлы:",
+            f"- всего файлов: {counts.get('total_files', 0)}",
+            f"- всего директорий: {counts.get('total_dirs', 0)}",
+            f"- Python: {counts.get('python_files', 0)}",
+            f"- templates: {counts.get('template_files', 0)}",
+            f"- JS/TS: {counts.get('js_files', 0)}",
+            f"- CSS: {counts.get('css_files', 0)}",
+            "",
+            "Структура:",
+            data.get("tree_summary") or "-",
+        ]
+    )
+
+
+def _format_check_result(data: dict) -> str:
+    checks = data.get("checks", {})
+    project_type = checks.get("project_type", {}).get("project_type", "unknown")
+    lines = [
+        f"Проверил через встроенный read-only tool: {data.get('project_name')}",
+        f"Путь: {data.get('path')}",
+        f"Тип проекта: {project_type}",
+        f"Git status: {checks.get('git_status', {}).get('status_short') or 'clean'}",
+    ]
+
+    py_compile = checks.get("py_compile")
+    if py_compile:
+        lines.append(
+            f"Python syntax: {'ok' if py_compile.get('ok') else 'errors'} "
+            f"({py_compile.get('checked_files', 0)} файлов)"
+        )
+        for error in py_compile.get("errors", [])[:5]:
+            lines.append(f"- {error.get('path')}: {error.get('error')}")
+
+    django_check = checks.get("django_check")
+    if django_check:
+        if django_check.get("skipped"):
+            lines.append(f"Django check: skipped ({django_check.get('reason')})")
+        else:
+            lines.append(f"Django check returncode: {django_check.get('returncode')}")
+            if django_check.get("stdout"):
+                lines.append(f"stdout:\n{django_check.get('stdout')}")
+            if django_check.get("stderr"):
+                lines.append(f"stderr:\n{django_check.get('stderr')}")
+
+    node = checks.get("node")
+    if node:
+        scripts = node.get("scripts") or {}
+        lines.append("Node scripts: " + (", ".join(scripts.keys()) if scripts else "-"))
+
+    todos = checks.get("todos", {})
+    todo_count = todos.get("count", 0) if isinstance(todos, dict) else 0
+    lines.append(f"TODO/FIXME/BUG/HACK: {todo_count}")
+    lines.append(f"Git status unchanged: {data.get('git_status_unchanged')}")
+    return "\n".join(lines)
+
+
+def _format_project_report(structure: dict, inspection: dict, check: dict) -> str:
+    git = inspection.get("git", {})
+    status = git.get("status", {})
+    todos = inspection.get("todos", {})
+    return "\n\n".join(
+        [
+            _format_structure_result(structure),
+            "\n".join(
+                [
+                    "Git:",
+                    f"branch: {status.get('branch') or '-'}",
+                    f"remote: {status.get('remote') or '-'}",
+                    f"status: {status.get('status_short') or 'clean'}",
+                    f"last commits:\n{git.get('log_oneline') or '-'}",
+                    f"diff stat:\n{git.get('diff_stat') or 'empty'}",
+                    f"TODO/FIXME/HACK/BUG: {todos.get('count', 0) if isinstance(todos, dict) else 0}",
+                ]
+            ),
+            _format_check_result(check),
+        ]
+    )
+
+
 async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -435,10 +534,49 @@ async def tree_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     path = " ".join(context.args).strip() if context.args else str(config.get_allowed_roots()[0])
     try:
+        if context.args:
+            try:
+                result = project_structure(path)
+                chat_id, _ = chat_user_ids(update)
+                memory.set_current_project(chat_id, result["project_name"])
+                await reply_long(update.message, _format_structure_result(result))
+                return
+            except Exception:
+                pass
         result = tree_summary(path)
         await reply_long(update.message, result["tree"])
     except Exception as e:
         await update.message.reply_text(f"Ошибка /tree: {e}")
+
+
+async def structure_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /structure <repo>")
+        return
+    try:
+        data = project_structure(" ".join(context.args))
+        chat_id, _ = chat_user_ids(update)
+        memory.set_current_project(chat_id, data["project_name"])
+        await reply_long(update.message, _format_structure_result(data))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /structure: {e}")
+
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /check <repo>")
+        return
+    try:
+        data = safe_code_check(" ".join(context.args))
+        chat_id, _ = chat_user_ids(update)
+        memory.set_current_project(chat_id, data["project_name"])
+        await reply_long(update.message, _format_check_result(data))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /check: {e}")
 
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,13 +609,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/diff <repo> - git diff",
                 "/find <query> - поиск по ALLOWED_ROOTS",
                 "/tree <path> - краткое дерево",
+                "/structure <repo> - структура и счетчики проекта",
+                "/check <repo> - безопасная read-only проверка кода",
                 "/logs <service> - последние 80 строк journal",
                 "/memory - сохраненная память",
                 "/remember <text> - сохранить факт",
                 "/forget <key> - удалить memory",
                 "/history - последние 10 сообщений",
                 "/clear_history - очистить историю чата",
-                "/project <repo> - inspection проекта",
+                "/project <repo> - structure + git + TODO/FIXME + safe check",
                 "/status - Ollama/STT/TTS/agent status",
                 "/agent_on, /agent_off - read-only agent mode",
                 "/agent_debug_on, /agent_debug_off - debug intent routing",
@@ -567,8 +707,13 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /project <repo>")
         return
     try:
-        data = inspect_project(" ".join(context.args))
-        summary = ask_ollama_messages(project_summary_prompt(data))
+        repo = " ".join(context.args)
+        structure = project_structure(repo)
+        data = inspect_project(repo)
+        check = safe_code_check(repo)
+        summary = _format_project_report(structure, data, check)
+        chat_id, _ = chat_user_ids(update)
+        memory.set_current_project(chat_id, data["project_name"])
         memory.save_project_note(
             data["project_name"],
             data["path"],
@@ -617,9 +762,10 @@ async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, d
     detected = debug_info.get("detected", {})
     lines = [
         "intent debug:",
-        f"detected intent: {detected.get('intent')}",
-        f"selected project: {debug_info.get('project') or detected.get('project') or '-'}",
-        f"tools called: {', '.join(debug_info.get('tools_called') or []) or '-'}",
+        f"detected_intent: {detected.get('intent')}",
+        f"current_project: {debug_info.get('current_project') or debug_info.get('project') or detected.get('project') or '-'}",
+        f"resolved_path: {debug_info.get('resolved_path') or debug_info.get('project_data', {}).get('path') or '-'}",
+        f"tools_called: {', '.join(debug_info.get('tools_called') or []) or '-'}",
         f"errors: {'; '.join(debug_info.get('errors') or []) or '-'}",
     ]
     await message.reply_text("\n".join(lines))
@@ -858,6 +1004,8 @@ def main():
     app.add_handler(CommandHandler("diff", diff_command))
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("tree", tree_command))
+    app.add_handler(CommandHandler("structure", structure_command))
+    app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))

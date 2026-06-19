@@ -7,7 +7,9 @@ from tools_fs import get_allowed_roots, is_excluded_dir, log_tool_call, resolve_
 
 EXCLUDED_GIT_SEARCH_NAMES = {
     ".codex",
+    ".config",
     ".git",
+    ".ssh",
     "__pycache__",
     "backups",
     "media",

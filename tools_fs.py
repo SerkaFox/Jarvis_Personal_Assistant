@@ -8,12 +8,15 @@ import config
 
 EXCLUDED_DIR_NAMES = {
     ".cache",
+    ".codex",
+    ".config",
     ".git",
     ".local",
     ".mypy_cache",
     ".npm",
     ".pytest_cache",
     ".ruff_cache",
+    ".ssh",
     "__pycache__",
     "media",
     "node_modules",
@@ -28,6 +31,7 @@ FORBIDDEN_FILE_NAMES = {
     ".env.local",
     ".env.production",
     ".env.prod",
+    ".git-credentials",
     "id_rsa",
     "id_ed25519",
 }

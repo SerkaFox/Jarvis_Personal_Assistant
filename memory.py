@@ -91,6 +91,11 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
             last_seen_commit text,
             updated_at text
         );
+        create table if not exists sessions (
+            chat_id text primary key,
+            current_project text,
+            updated_at text
+        );
         """
     )
     conn.commit()
@@ -322,10 +327,44 @@ def save_project_note(project_name: str, path: str, summary: str, last_seen_comm
         conn.commit()
 
 
+def set_current_project(chat_id: str, project_name: str) -> None:
+    if not config.MEMORY_ENABLED or not chat_id or not project_name:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            """
+            insert into sessions (chat_id, current_project, updated_at)
+            values (?, ?, ?)
+            on conflict(chat_id) do update set
+              current_project=excluded.current_project,
+              updated_at=excluded.updated_at
+            """,
+            (chat_id, project_name, now_iso()),
+        )
+        conn.commit()
+
+
+def get_current_project(chat_id: str) -> str | None:
+    if not config.MEMORY_ENABLED or not chat_id:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "select current_project from sessions where chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    if not row:
+        return None
+    value = str(row["current_project"] or "").strip()
+    return value or None
+
+
 def build_memory_context(chat_id: str, user_text: str) -> str:
     if not config.MEMORY_ENABLED:
         return ""
     parts = []
+    current_project = get_current_project(chat_id)
+    if current_project:
+        parts.append(f"Current project: {current_project}")
     history = recent_messages(chat_id, config.HISTORY_LIMIT)
     if history:
         parts.append("Последние сообщения:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history))

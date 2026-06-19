@@ -2,9 +2,10 @@ import re
 from typing import Any, Callable
 
 import config
+from tools_check import safe_code_check
 from tools_fs import tree_summary
 from tools_git import find_git_repos
-from tools_project import inspect_project
+from tools_project import inspect_project, project_structure
 
 
 LIST_PROJECT_PHRASES = (
@@ -33,6 +34,34 @@ CONTINUATION_PHRASES = (
     "на чём остановились",
 )
 
+STRUCTURE_PHRASES = (
+    "посмотри структуру",
+    "структуру",
+    "сколько там файлов",
+    "сколько файлов",
+    "tree",
+    "structure",
+)
+
+CHECK_PHRASES = (
+    "проверь код",
+    "есть ли ошибка",
+    "ошибки в проекте",
+    "проверь проект",
+    "check project",
+)
+
+PROJECT_ALIASES = {
+    "anna": (
+        "anna",
+        "анна",
+        "анны",
+        "анне",
+        "салон анны",
+        "салон anna",
+    ),
+}
+
 
 def _repo_names() -> set[str]:
     try:
@@ -46,6 +75,21 @@ def _extract_project(text: str) -> str | None:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip(" .,;:!?")
+    mentioned = extract_mentioned_project(text)
+    if mentioned:
+        return mentioned
+    return None
+
+
+def extract_mentioned_project(text: str) -> str | None:
+    lowered = text.lower()
+    names = _repo_names()
+    for canonical, aliases in PROJECT_ALIASES.items():
+        if canonical in names and any(alias in lowered for alias in aliases):
+            return canonical
+    for name in names:
+        if re.search(rf"\b{re.escape(name)}\b", lowered):
+            return name
     return None
 
 
@@ -53,21 +97,46 @@ def _last_project_from_history(recent_messages: list[dict[str, Any]]) -> str | N
     names = _repo_names()
     for message in reversed(recent_messages or []):
         content = str(message.get("content", "")).lower()
+        mentioned = extract_mentioned_project(content)
+        if mentioned:
+            return mentioned
         for name in names:
             if re.search(rf"\b{re.escape(name)}\b", content):
                 return name
     return None
 
 
-def detect_intent(text: str, recent_messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _project_from_context(
+    text: str,
+    recent_messages: list[dict[str, Any]] | None = None,
+    current_project: str | None = None,
+) -> str | None:
+    return extract_mentioned_project(text) or current_project or _last_project_from_history(recent_messages or [])
+
+
+def detect_intent(
+    text: str,
+    recent_messages: list[dict[str, Any]] | None = None,
+    current_project: str | None = None,
+) -> dict[str, Any]:
     lowered = text.lower()
 
+    if any(phrase in lowered for phrase in CHECK_PHRASES):
+        project = _project_from_context(text, recent_messages, current_project)
+        if project:
+            return {"intent": "safe_code_check", "project": project}
+
+    if any(phrase in lowered for phrase in STRUCTURE_PHRASES):
+        project = _project_from_context(text, recent_messages, current_project)
+        if project:
+            return {"intent": "project_structure", "project": project}
+
     project = _extract_project(text)
-    if project:
+    if project and any(word in lowered for word in ("проект", "код", "изучи", "посмотри", "проверь")):
         return {"intent": "inspect_project", "project": project}
 
     if any(phrase in lowered for phrase in CONTINUATION_PHRASES):
-        project = _last_project_from_history(recent_messages or [])
+        project = _project_from_context(text, recent_messages, current_project)
         if project:
             return {"intent": "inspect_project", "project": project}
 
@@ -81,15 +150,7 @@ def detect_intent(text: str, recent_messages: list[dict[str, Any]] | None = None
 
 def _format_projects() -> tuple[str, list[str]]:
     result = find_git_repos()
-    lines = ["Проекты и git-репозитории по разрешенным roots:"]
-    for root in config.get_allowed_roots():
-        try:
-            tree = tree_summary(str(root), depth=1)["tree"]
-            lines.append(f"\n{root}:\n{tree}")
-        except Exception as e:
-            lines.append(f"\n{root}: ошибка дерева: {e}")
-
-    lines.append(f"\nGit-репозитории: {result['count']}")
+    lines = ["Git-репозитории по разрешенным roots:", f"Найдено: {result['count']}"]
     for repo in result["repositories"]:
         status = repo.get("status_short") or "clean"
         lines.append(
@@ -101,7 +162,63 @@ def _format_projects() -> tuple[str, list[str]]:
                 ]
             )
         )
-    return "\n".join(lines), ["find_git_repos", "tree_summary"]
+    return "\n".join(lines), ["find_git_repos"]
+
+
+def _format_structure(data: dict[str, Any]) -> str:
+    counts = data.get("counts", {})
+    return "\n".join(
+        [
+            f"Проект: {data.get('project_name')}",
+            f"Путь: {data.get('path')}",
+            "Файлы:",
+            f"- всего файлов: {counts.get('total_files', 0)}",
+            f"- всего директорий: {counts.get('total_dirs', 0)}",
+            f"- Python: {counts.get('python_files', 0)}",
+            f"- templates: {counts.get('template_files', 0)}",
+            f"- JS/TS: {counts.get('js_files', 0)}",
+            f"- CSS: {counts.get('css_files', 0)}",
+            "",
+            "Структура:",
+            data.get("tree_summary") or "-",
+        ]
+    )
+
+
+def _format_check(data: dict[str, Any]) -> str:
+    checks = data.get("checks", {})
+    project_type = checks.get("project_type", {}).get("project_type", "unknown")
+    py_compile = checks.get("py_compile")
+    django_check = checks.get("django_check")
+    todos = checks.get("todos", {})
+    lines = [
+        f"Проверил через встроенный read-only tool: {data.get('project_name')}",
+        f"Путь: {data.get('path')}",
+        f"Тип проекта: {project_type}",
+        f"Git status: {checks.get('git_status', {}).get('status_short') or 'clean'}",
+    ]
+    if py_compile:
+        lines.append(
+            f"Python syntax: {'ok' if py_compile.get('ok') else 'errors'} "
+            f"({py_compile.get('checked_files', 0)} файлов)"
+        )
+        for error in py_compile.get("errors", [])[:5]:
+            lines.append(f"- {error.get('path')}: {error.get('error')}")
+    if django_check:
+        if django_check.get("skipped"):
+            lines.append(f"Django check: skipped ({django_check.get('reason')})")
+        else:
+            lines.append(f"Django check returncode: {django_check.get('returncode')}")
+            if django_check.get("stdout"):
+                lines.append(f"stdout:\n{django_check.get('stdout')}")
+            if django_check.get("stderr"):
+                lines.append(f"stderr:\n{django_check.get('stderr')}")
+    if "node" in checks:
+        scripts = checks["node"].get("scripts") or {}
+        lines.append("Node scripts: " + (", ".join(scripts.keys()) if scripts else "-"))
+    lines.append(f"TODO/FIXME/BUG/HACK: {todos.get('count', 0) if isinstance(todos, dict) else 0}")
+    lines.append(f"Git status unchanged: {data.get('git_status_unchanged')}")
+    return "\n".join(lines)
 
 
 def _compact_project_data(data: dict[str, Any]) -> str:
@@ -146,6 +263,32 @@ def handle_detected_intent(
                 "tools_called": tools_called,
                 "errors": errors,
                 "project": data.get("project_name"),
+                "project_data": data,
+            }
+
+        if intent == "project_structure":
+            project = detected.get("project")
+            data = project_structure(project)
+            tools_called = ["project_structure"]
+            return {
+                "answer": _format_structure(data),
+                "tools_called": tools_called,
+                "errors": errors,
+                "project": data.get("project_name"),
+                "resolved_path": data.get("path"),
+                "project_data": data,
+            }
+
+        if intent == "safe_code_check":
+            project = detected.get("project")
+            data = safe_code_check(project)
+            tools_called = ["safe_code_check"]
+            return {
+                "answer": _format_check(data),
+                "tools_called": tools_called,
+                "errors": errors,
+                "project": data.get("project_name"),
+                "resolved_path": data.get("path"),
                 "project_data": data,
             }
     except Exception as e:

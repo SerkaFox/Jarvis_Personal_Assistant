@@ -1,4 +1,5 @@
 import os
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,16 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
+from agent import answer_with_tools
+from tools_fs import allowed_roots_info
+from tools_git import find_git_repos
+from tools_shell import get_allowed_services
+
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))
@@ -69,10 +79,8 @@ def is_allowed(update: Update) -> bool:
 
 
 def ask_ollama(user_text: str) -> str:
-    payload = {
-        "model": MODEL,
-        "stream": False,
-        "messages": [
+    return ask_ollama_messages(
+        [
             {
                 "role": "system",
                 "content": get_system_prompt(),
@@ -81,12 +89,28 @@ def ask_ollama(user_text: str) -> str:
                 "role": "user",
                 "content": user_text,
             },
-        ],
+        ]
+    )
+
+
+def ask_ollama_messages(messages: list[dict[str, str]]) -> str:
+    payload = {
+        "model": MODEL,
+        "stream": False,
+        "messages": messages,
     }
 
     r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=180)
     r.raise_for_status()
     return r.json()["message"]["content"]
+
+
+def answer_user_text(user_text: str, use_agent: bool) -> str:
+    if use_agent:
+        agent_answer = answer_with_tools(user_text, ask_ollama_messages)
+        if agent_answer:
+            return agent_answer
+    return ask_ollama(user_text)
 
 
 def transcribe_audio_file(path: str) -> dict:
@@ -219,6 +243,136 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def reply_long(message, text: str, limit: int = 4000):
+    if not text:
+        await message.reply_text("Пустой ответ.")
+        return
+
+    for start in range(0, len(text), limit):
+        await message.reply_text(text[start : start + limit])
+
+
+async def roots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    try:
+        info = allowed_roots_info()
+        text = (
+            "Разрешенные корни:\n"
+            + "\n".join(f"- {root}" for root in info["allowed_roots"])
+            + f"\n\nMAX_FILE_CHARS={info['max_file_chars']}"
+            + f"\nMAX_SEARCH_RESULTS={info['max_search_results']}"
+        )
+    except Exception as e:
+        text = f"Ошибка /roots: {e}"
+
+    await update.message.reply_text(text)
+
+
+async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    try:
+        result = find_git_repos()
+        lines = [f"Найдено репозиториев: {result['count']}"]
+        for repo in result["repositories"]:
+            status = repo.get("status_short") or "clean"
+            lines.append(
+                "\n".join(
+                    [
+                        f"- {repo.get('path')}",
+                        f"  branch: {repo.get('branch') or '-'}",
+                        f"  origin: {repo.get('remote_origin') or '-'}",
+                        f"  status: {status[:500]}",
+                    ]
+                )
+            )
+        text = "\n".join(lines)
+    except Exception as e:
+        text = f"Ошибка /repos: {e}"
+
+    await reply_long(update.message, text)
+
+
+def _check_ollama() -> str:
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/version", timeout=5)
+        response.raise_for_status()
+        version = response.json().get("version", "unknown")
+        return f"ok ({version})"
+    except Exception as e:
+        return f"error ({e})"
+
+
+def _check_stt() -> str:
+    try:
+        response = requests.get(STT_URL, timeout=5)
+        return f"reachable (HTTP {response.status_code})"
+    except Exception as e:
+        return f"error ({e})"
+
+
+def _check_tts() -> str:
+    if not TTS_ENABLED:
+        return "disabled"
+
+    checks = []
+    checks.append("piper ok" if Path(PIPER_BIN).is_file() else f"piper missing: {PIPER_BIN}")
+    checks.append("model ok" if Path(PIPER_MODEL).is_file() else f"model missing: {PIPER_MODEL}")
+    checks.append(
+        "config ok" if Path(PIPER_CONFIG).is_file() else f"config missing: {PIPER_CONFIG}"
+    )
+    checks.append("ffmpeg ok" if shutil.which("ffmpeg") else "ffmpeg missing")
+    return "; ".join(checks)
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    try:
+        roots_info = allowed_roots_info()
+        text = "\n".join(
+            [
+                "Jarvis status:",
+                f"Ollama: {_check_ollama()}",
+                f"Ollama URL: {OLLAMA_URL}",
+                f"Ollama model: {MODEL}",
+                f"STT: {_check_stt()}",
+                f"STT URL: {STT_URL}",
+                f"TTS: {_check_tts()}",
+                f"TTS enabled: {TTS_ENABLED}",
+                f"TTS engine: {TTS_ENGINE}",
+                f"Piper model: {PIPER_MODEL}",
+                f"Allowed services: {', '.join(get_allowed_services())}",
+                "Allowed roots:",
+                *[f"- {root}" for root in roots_info["allowed_roots"]],
+            ]
+        )
+    except Exception as e:
+        text = f"Ошибка /status: {e}"
+
+    await reply_long(update.message, text)
+
+
+async def agent_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    context.user_data["agent_enabled"] = True
+    await update.message.reply_text("Read-only agent mode: on")
+
+
+async def agent_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    context.user_data["agent_enabled"] = False
+    await update.message.reply_text("Read-only agent mode: off")
+
+
 async def tts_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -243,9 +397,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text
+    use_agent = bool(context.user_data.get("agent_enabled"))
 
     try:
-        answer = ask_ollama(user_text)
+        answer = answer_user_text(user_text, use_agent)
     except requests.exceptions.ConnectionError:
         answer = (
             "Не могу подключиться к Ollama на AI-ПК.\n\n"
@@ -259,7 +414,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         answer = f"Ошибка обращения к Ollama: {e}"
 
-    await update.message.reply_text(answer[:4000])
+    await reply_long(update.message, answer)
 
 
 async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -304,7 +459,8 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
 
         await message.reply_text(f"🎙 Распознал:\n{recognized_text[:1000]}")
 
-        answer = ask_ollama(recognized_text)
+        use_agent = bool(context.user_data.get("agent_enabled"))
+        answer = answer_user_text(recognized_text, use_agent)
         await message.reply_text(answer[:4000])
 
         voice_path = None
@@ -335,6 +491,11 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("roots", roots))
+    app.add_handler(CommandHandler("repos", repos))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("agent_on", agent_on))
+    app.add_handler(CommandHandler("agent_off", agent_off))
     app.add_handler(CommandHandler("tts_test", tts_test))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_or_audio))

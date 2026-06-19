@@ -59,3 +59,81 @@ Jarvis online. Голосовой ответ работает.
 ```
 
 If TTS is unavailable, the bot returns a text error for the missing component: disabled TTS, missing Piper, missing model/config, or missing ffmpeg.
+
+## Read-Only Server/Code Agent
+
+Jarvis can optionally inspect local projects, git status, and selected service logs through a read-only tool layer. The tool layer does not expose arbitrary shell commands and does not write files.
+
+Default configuration:
+
+```env
+ALLOWED_ROOTS=/home/seradmin,/home/seradmin/jelec,/var/www
+ALLOWED_SERVICES=jarvis-bot,j-listoya-stt
+MAX_FILE_CHARS=12000
+MAX_SEARCH_RESULTS=50
+```
+
+`ALLOWED_ROOTS` is a comma-separated allowlist. File and directory tools only work inside these roots after resolving symlinks. Paths with `..` are rejected. Secret-like files such as `.env`, keys, PEM files, sqlite/db files, and `media`/`uploads` content are not readable.
+
+Allowed read-only tools:
+
+```text
+list_dir(path)
+read_file(path, max_chars=12000)
+search_text(root, query, glob=None)
+find_git_repos(root)
+git_status(repo_path)
+tree_summary(path, depth=2)
+service_status(name)
+read_journal(service_name, lines=100)
+```
+
+Shell access is limited to:
+
+```text
+systemctl status <allowed-service>.service --no-pager
+journalctl -u <allowed-service>.service -n <lines> --no-pager
+```
+
+No `sudo`, `restart`, `deploy`, `rm`, `mv`, `cp`, `git pull`, `git push`, or arbitrary `shell=True` commands are available to the agent.
+
+### Commands
+
+```text
+/roots
+```
+
+Shows configured roots and output limits.
+
+```text
+/repos
+```
+
+Finds git repositories under `ALLOWED_ROOTS` and shows path, branch, origin, and `git status --short`.
+
+```text
+/status
+```
+
+Shows Ollama, STT, TTS, selected models, allowed services, and allowed roots.
+
+```text
+/agent_on
+/agent_off
+```
+
+Enables or disables read-only tool use for normal text messages. If the model returns an invalid JSON plan, Jarvis falls back to the normal Ollama answer without tools.
+
+### Example Requests
+
+```text
+какие проекты есть на сервере?
+```
+
+```text
+найди где используется booking_calendar_day
+```
+
+```text
+покажи git status всех репозиториев
+```

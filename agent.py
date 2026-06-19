@@ -11,6 +11,7 @@ from tools_fs import (
     tree_summary,
 )
 from tools_git import find_git_repos, git_diff, git_status
+from tools_project import inspect_project
 from tools_system import read_journal, service_status
 
 
@@ -21,6 +22,7 @@ TOOL_REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
     "find_git_repos": find_git_repos,
     "git_status": git_status,
     "git_diff": git_diff,
+    "inspect_project": inspect_project,
     "tree_summary": tree_summary,
     "service_status": service_status,
     "read_journal": read_journal,
@@ -41,6 +43,7 @@ PLANNER_SYSTEM_PROMPT = """
 - find_git_repos(root)
 - git_status(repo_path)
 - git_diff(repo_path, max_chars)
+- inspect_project(repo_name_or_path)
 - tree_summary(path, depth)
 - service_status(name)
 - read_journal(name, lines)
@@ -49,6 +52,7 @@ PLANNER_SYSTEM_PROMPT = """
 Примеры:
 Вопрос "Какие проекты у меня есть на сервере и какие из них git-репозитории?" -> {"use_tools": true, "tools": [{"name": "find_git_repos", "args": {}}]}.
 Вопрос "где используется booking_calendar_day" -> {"use_tools": true, "tools": [{"name": "search_text", "args": {"root": "/home/seradmin", "query": "booking_calendar_day"}}]}.
+Вопрос "посмотри проект anna, на чем остановились" -> {"use_tools": true, "tools": [{"name": "inspect_project", "args": {"repo_name_or_path": "anna"}}]}.
 """.strip()
 
 FINAL_SYSTEM_PROMPT = """
@@ -71,15 +75,34 @@ def _extract_json(text: str) -> dict[str, Any]:
     return parsed
 
 
-def build_planner_messages(user_text: str) -> list[dict[str, str]]:
+def build_planner_messages(user_text: str, memory_context: str = "") -> list[dict[str, str]]:
+    content = user_text
+    if memory_context:
+        content = f"Контекст памяти и истории:\n{memory_context}\n\nЗапрос пользователя:\n{user_text}"
     return [
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": content},
     ]
 
 
 def heuristic_plan(user_text: str) -> dict[str, Any] | None:
     text = user_text.lower()
+    project_inspect_phrases = (
+        "посмотри проект",
+        "на чем остановились",
+        "на чём остановились",
+        "изучи код",
+        "что дальше делать по",
+    )
+    if any(phrase in text for phrase in project_inspect_phrases):
+        words = user_text.replace(",", " ").split()
+        for word in reversed(words):
+            cleaned = word.strip(" .:;!?").strip()
+            if cleaned and cleaned.lower() not in {"проект", "код", "по", "в", "на", "чем", "чём", "остановились"}:
+                return {
+                    "use_tools": True,
+                    "tools": [{"name": "inspect_project", "args": {"repo_name_or_path": cleaned}}],
+                }
     project_words = ("проект", "проекты", "projects", "репозитор", "git", "repository", "repositories")
     server_words = ("сервер", "server", "папк", "директор")
     if any(word in text for word in project_words) and any(word in text for word in server_words + project_words):
@@ -147,13 +170,16 @@ def build_final_messages(
     user_text: str,
     plan: dict[str, Any],
     tool_results: list[dict[str, Any]],
+    memory_context: str = "",
 ) -> list[dict[str, str]]:
+    context_block = f"Контекст памяти и истории:\n{memory_context}\n\n" if memory_context else ""
     return [
         {"role": "system", "content": FINAL_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                "Запрос пользователя:\n"
+                context_block
+                + "Запрос пользователя:\n"
                 f"{user_text}\n\n"
                 "JSON-план:\n"
                 f"{json.dumps(plan, ensure_ascii=False)}\n\n"
@@ -164,13 +190,17 @@ def build_final_messages(
     ]
 
 
-def answer_with_tools(user_text: str, ask_model: Callable[[list[dict[str, str]]], str]) -> str | None:
+def answer_with_tools(
+    user_text: str,
+    ask_model: Callable[[list[dict[str, str]]], str],
+    memory_context: str = "",
+) -> str | None:
     if not config.AGENT_TOOLS_ENABLED:
         return None
 
     plan = heuristic_plan(user_text)
     if plan is None:
-        planner_response = ask_model(build_planner_messages(user_text))
+        planner_response = ask_model(build_planner_messages(user_text, memory_context))
         try:
             plan = _extract_json(planner_response)
         except (json.JSONDecodeError, ValueError):
@@ -189,4 +219,4 @@ def answer_with_tools(user_text: str, ask_model: Callable[[list[dict[str, str]]]
         logging.warning("agent_plan_error %s", e)
         return None
 
-    return ask_model(build_final_messages(user_text, plan, tool_results))
+    return ask_model(build_final_messages(user_text, plan, tool_results, memory_context))

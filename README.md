@@ -72,6 +72,9 @@ ALLOWED_SERVICES=jarvis-bot,j-listoya-stt
 MAX_FILE_CHARS=12000
 MAX_SEARCH_RESULTS=50
 AGENT_TOOLS_ENABLED=true
+JARVIS_DB_PATH=/home/seradmin/jarvis_bot/data/jarvis.db
+MEMORY_ENABLED=true
+HISTORY_LIMIT=12
 ```
 
 `ALLOWED_ROOTS` is a comma-separated allowlist. File and directory tools only work inside these roots after resolving symlinks. Paths with `..` are rejected. Secret-like files such as `.env`, keys, PEM files, sqlite/db files, and `media`/`uploads` content are not readable.
@@ -143,6 +146,24 @@ Shows a short directory tree, excluding virtualenvs, caches, git internals, medi
 Shows the last 80 journal lines for a service from `ALLOWED_SERVICES`.
 
 ```text
+/memory
+/remember <text>
+/forget <key>
+/history
+/clear_history
+```
+
+Persistent SQLite memory. Jarvis stores user and assistant messages in `messages`, long-lived facts in `memories`, and project summaries in `project_notes`. The database path is configured with `JARVIS_DB_PATH` and defaults to `/home/seradmin/jarvis_bot/data/jarvis.db`. The DB is local and ignored by git.
+
+Jarvis automatically stores simple memory candidates when messages contain phrases such as `запомни`, `remember`, `мой день рождения`, `я родился`, `меня зовут`, `мне нравится`, or `предпочитаю`. Birth dates are normalized to ISO format and stored as `birth_date`.
+
+```text
+/project <repo>
+```
+
+Runs read-only project inspection: git status, branch, remote, diff stat, recent git log, README/TODO/CHANGELOG/docs, TODO/FIXME/HACK/BUG search, Django layout signals, and a short directory tree. Jarvis then asks Ollama for a human summary and saves it to `project_notes`.
+
+```text
 /status
 ```
 
@@ -176,4 +197,16 @@ These commands are intentionally disabled at the current read-only stage. They d
 
 ```text
 покажи git status всех репозиториев
+```
+
+```text
+посмотри проект anna, на чем остановились
+```
+
+```text
+запомни, мой день рождения 13 октября 1982
+```
+
+```text
+сколько мне лет?
 ```

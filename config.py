@@ -10,6 +10,8 @@ DEFAULT_ALLOWED_ROOTS = "/home/seradmin,/home/seradmin/jelec,/var/www"
 DEFAULT_ALLOWED_SERVICES = "jarvis-bot,j-listoya-stt"
 DEFAULT_MAX_FILE_CHARS = 12000
 DEFAULT_MAX_SEARCH_RESULTS = 50
+DEFAULT_JARVIS_DB_PATH = "/home/seradmin/jarvis_bot/data/jarvis.db"
+DEFAULT_HISTORY_LIMIT = 12
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -50,3 +52,6 @@ def get_allowed_services() -> list[str]:
 MAX_FILE_CHARS = env_int("MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS)
 MAX_SEARCH_RESULTS = env_int("MAX_SEARCH_RESULTS", DEFAULT_MAX_SEARCH_RESULTS)
 AGENT_TOOLS_ENABLED = env_bool("AGENT_TOOLS_ENABLED", True)
+JARVIS_DB_PATH = os.getenv("JARVIS_DB_PATH", DEFAULT_JARVIS_DB_PATH)
+MEMORY_ENABLED = env_bool("MEMORY_ENABLED", True)
+HISTORY_LIMIT = env_int("HISTORY_LIMIT", DEFAULT_HISTORY_LIMIT)

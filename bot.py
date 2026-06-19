@@ -20,8 +20,10 @@ from dotenv import load_dotenv
 
 import config
 from agent import answer_with_tools
+import memory
 from tools_fs import allowed_roots_info, search_text, tree_summary
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
+from tools_project import inspect_project
 from tools_system import get_allowed_services, read_journal
 
 load_dotenv()
@@ -69,6 +71,9 @@ def get_system_prompt() -> str:
         f"Текущая дата и время в Испании: {current_time}. "
         "Если пользователь спрашивает дату, день недели или время — используй эту дату, а не свои старые знания. "
         "Помогай с Linux, Django, Python, сервером, Telegram-ботами, Ollama, Codex и администрированием. "
+        "У тебя есть локальная память SQLite: используй историю диалога, memories и project_notes, когда они добавлены в контекст. "
+        "Не говори, что у тебя нет доступа, если доступны read-only tools. "
+        "Если пользователь говорит 'это', 'он', 'там', 'проект' — используй последние сообщения для контекста. "
         "Не придумывай результаты команд. Если нужны логи или вывод команды — попроси пользователя выполнить команду или скажи, какую команду выполнить. "
         "Для опасных действий, таких как удаление файлов, миграции, рестарт сервисов, deploy, git push или изменения nginx/systemd, требуй явное подтверждение. "
         "Не говори, что ты облачный сервис. Ты локальный Jarvis, подключенный к Ollama."
@@ -79,7 +84,11 @@ def is_allowed(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ALLOWED_USER_ID
 
 
-def ask_ollama(user_text: str) -> str:
+def ask_ollama(user_text: str, chat_id: str | None = None) -> str:
+    memory_context = memory.build_memory_context(chat_id, user_text) if chat_id else ""
+    content = user_text
+    if memory_context:
+        content = f"Контекст памяти и истории:\n{memory_context}\n\nЗапрос пользователя:\n{user_text}"
     return ask_ollama_messages(
         [
             {
@@ -88,7 +97,7 @@ def ask_ollama(user_text: str) -> str:
             },
             {
                 "role": "user",
-                "content": user_text,
+                "content": content,
             },
         ]
     )
@@ -106,12 +115,16 @@ def ask_ollama_messages(messages: list[dict[str, str]]) -> str:
     return r.json()["message"]["content"]
 
 
-def answer_user_text(user_text: str, use_agent: bool) -> str:
+def answer_user_text(user_text: str, use_agent: bool, chat_id: str | None = None) -> str:
+    age = memory.age_answer(user_text)
+    if age:
+        return age
+    memory_context = memory.build_memory_context(chat_id, user_text) if chat_id else ""
     if use_agent:
-        agent_answer = answer_with_tools(user_text, ask_ollama_messages)
+        agent_answer = answer_with_tools(user_text, ask_ollama_messages, memory_context=memory_context)
         if agent_answer:
             return agent_answer
-    return ask_ollama(user_text)
+    return ask_ollama(user_text, chat_id=chat_id)
 
 
 def transcribe_audio_file(path: str) -> dict:
@@ -245,6 +258,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reply_long(message, text: str, limit: int = 4000):
+    text = memory.mask_secrets(text)
     if not text:
         await message.reply_text("Пустой ответ.")
         return
@@ -295,6 +309,12 @@ async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"Ошибка /repos: {e}"
 
     await reply_long(update.message, text)
+
+
+def chat_user_ids(update: Update) -> tuple[str, str]:
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+    user_id = str(update.effective_user.id) if update.effective_user else ""
+    return chat_id, user_id
 
 
 def _format_git_status(repo: dict) -> str:
@@ -403,6 +423,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/find <query> - поиск по ALLOWED_ROOTS",
                 "/tree <path> - краткое дерево",
                 "/logs <service> - последние 80 строк journal",
+                "/memory - сохраненная память",
+                "/remember <text> - сохранить факт",
+                "/forget <key> - удалить memory",
+                "/history - последние 10 сообщений",
+                "/clear_history - очистить историю чата",
+                "/project <repo> - inspection проекта",
                 "/status - Ollama/STT/TTS/agent status",
                 "/agent_on, /agent_off - read-only agent mode",
                 "/tts_test - проверить TTS",
@@ -410,6 +436,97 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
     )
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    rows = memory.list_memories(20)
+    if not rows:
+        await update.message.reply_text("Память пуста.")
+        return
+    await reply_long(
+        update.message,
+        "\n".join(f"{row['key']}: {row['value']} ({row['kind']}, {row['confidence']})" for row in rows),
+    )
+
+
+async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Использование: /remember <text>")
+        return
+    candidates = memory.extract_memory_candidates("запомни " + text)
+    if not candidates:
+        candidates = [{"kind": "note", "key": "_".join(text.lower().split()[:5])[:80], "value": text, "confidence": 0.8}]
+    for candidate in candidates:
+        memory.upsert_memory(**candidate)
+    await update.message.reply_text("Запомнил: " + ", ".join(candidate["key"] for candidate in candidates))
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /forget <key>")
+        return
+    deleted = memory.delete_memory(context.args[0])
+    await update.message.reply_text(f"Удалено записей: {deleted}")
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    rows = memory.recent_messages(chat_id, 10)
+    if not rows:
+        await update.message.reply_text("История пуста.")
+        return
+    await reply_long(update.message, "\n".join(f"{row['role']}: {row['content']}" for row in rows))
+
+
+async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    deleted = memory.clear_history(chat_id)
+    await update.message.reply_text(f"История очищена. Удалено сообщений: {deleted}")
+
+
+def project_summary_prompt(data: dict) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": "Ты Jarvis. Составь короткое человеческое резюме проекта по read-only inspection data."},
+        {
+            "role": "user",
+            "content": (
+                "Составь резюме: что это за проект, на чем остановились, "
+                "что не закоммичено, что делать дальше.\n\n"
+                f"{data}"
+            ),
+        },
+    ]
+
+
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /project <repo>")
+        return
+    try:
+        data = inspect_project(" ".join(context.args))
+        summary = ask_ollama_messages(project_summary_prompt(data))
+        memory.save_project_note(
+            data["project_name"],
+            data["path"],
+            summary,
+            data["git"].get("last_commit", ""),
+        )
+        await reply_long(update.message, summary)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /project: {e}")
 
 
 async def disabled_write_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -474,6 +591,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"TTS engine: {TTS_ENGINE}",
                 f"Piper model: {PIPER_MODEL}",
                 f"Agent tools enabled: {config.AGENT_TOOLS_ENABLED}",
+                f"Memory enabled: {config.MEMORY_ENABLED}",
+                f"DB path: {config.JARVIS_DB_PATH}",
                 f"Allowed services: {', '.join(get_allowed_services())}",
                 "Allowed roots:",
                 *[f"- {root}" for root in roots_info["allowed_roots"]],
@@ -525,10 +644,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text
+    chat_id, user_id = chat_user_ids(update)
+    message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
     use_agent = bool(context.user_data.get("agent_enabled"))
 
     try:
-        answer = answer_user_text(user_text, use_agent)
+        answer = answer_user_text(user_text, use_agent, chat_id=chat_id)
     except requests.exceptions.ConnectionError:
         answer = (
             "Не могу подключиться к Ollama на AI-ПК.\n\n"
@@ -542,6 +663,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         answer = f"Ошибка обращения к Ollama: {e}"
 
+    memory.save_message(chat_id, user_id, "assistant", answer, "text")
+    memory.save_memory_candidates(user_text, answer, message_id)
     await reply_long(update.message, answer)
 
 
@@ -585,11 +708,15 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text("🎙 Не смог распознать голосовое сообщение.")
             return
 
-        await message.reply_text(f"🎙 Распознал:\n{recognized_text[:1000]}")
+        chat_id, user_id = chat_user_ids(update)
+        message_id = memory.save_message(chat_id, user_id, "user", recognized_text, "voice")
+        await message.reply_text(f"🎙 Распознал:\n{memory.mask_secrets(recognized_text)[:1000]}")
 
         use_agent = bool(context.user_data.get("agent_enabled"))
-        answer = answer_user_text(recognized_text, use_agent)
-        await message.reply_text(answer[:4000])
+        answer = answer_user_text(recognized_text, use_agent, chat_id=chat_id)
+        memory.save_message(chat_id, user_id, "assistant", answer, "voice")
+        memory.save_memory_candidates(recognized_text, answer, message_id)
+        await reply_long(message, answer)
 
         voice_path = None
         try:
@@ -616,6 +743,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def main():
+    memory.init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -627,6 +755,12 @@ def main():
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("tree", tree_command))
     app.add_handler(CommandHandler("logs", logs_command))
+    app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("remember", remember_command))
+    app.add_handler(CommandHandler("forget", forget_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("clear_history", clear_history_command))
+    app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("agent_on", agent_on))
     app.add_handler(CommandHandler("agent_off", agent_off))

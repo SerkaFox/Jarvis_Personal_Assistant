@@ -8,6 +8,8 @@ __pycache__/
 .ruff_cache/
 
 models/
+data/*.db
+data/*.db-*
 *.wav
 *.ogg
 *.mp3

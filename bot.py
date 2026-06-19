@@ -28,6 +28,12 @@ from tools_git import find_git_repos, git_diff, git_status, resolve_repo
 from tools_project import inspect_project, project_structure
 from tools_check import safe_code_check
 from tools_system import get_allowed_services, read_journal
+from tools_write import (
+    list_write_projects,
+    write_flask_project,
+    write_static_site,
+    workspace_tree,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -150,6 +156,61 @@ def memory_status_answer(user_text: str) -> str | None:
         return f"Memory недоступна: {e}"
 
 
+CREATE_PROJECT_PHRASES = (
+    "создай тестовый сайт",
+    "создай проект",
+    "с нуля создай сайт",
+    "сделай лендинг",
+)
+
+
+def _slug_from_text(text: str, fallback: str = "test-site") -> str:
+    words = re.findall(r"[A-Za-z0-9_-]+", text.lower())
+    stop = {"create", "project", "site", "landing", "new", "test"}
+    candidates = [word for word in words if word not in stop]
+    return candidates[-1] if candidates else fallback
+
+
+def write_mode_answer(user_text: str) -> tuple[str, dict] | None:
+    lowered = user_text.lower()
+    if not any(phrase in lowered for phrase in CREATE_PROJECT_PHRASES):
+        return None
+    detected = {"intent": "create_workspace_project"}
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        return (
+            "Write mode выключен: WRITE_MODE_ENABLED=false. "
+            "Чтобы создавать тестовые проекты, включи WRITE_MODE_ENABLED=true и задай WRITE_ROOT.",
+            {"detected": detected, "tools_called": [], "errors": [], "resolved_path": str(config.get_write_root())},
+        )
+    try:
+        name = _slug_from_text(user_text)
+        data = write_static_site(name)
+        answer = "\n".join(
+            [
+                "Создал тестовый статический сайт в WRITE_ROOT.",
+                f"Проект: {data['project_name']}",
+                f"Путь: {data['path']}",
+                "Файлы:",
+                *[f"- {path}" for path in data["created_files"]],
+            ]
+        )
+        return (
+            answer,
+            {
+                "detected": detected,
+                "tools_called": ["write_static_site"],
+                "errors": [],
+                "resolved_path": data["path"],
+                "project": data["project_name"],
+            },
+        )
+    except Exception as e:
+        return (
+            f"Не смог создать проект в WRITE_ROOT: {e}",
+            {"detected": detected, "tools_called": ["write_static_site"], "errors": [str(e)]},
+        )
+
+
 def summarize_project_with_ollama(data: dict) -> str:
     summary = ask_ollama_messages(project_summary_prompt(data))
     memory.save_project_note(
@@ -176,6 +237,9 @@ def answer_user_text(
     if memory_status:
         detected = {"intent": "memory_status"}
         return memory_status, {"detected": detected, "tools_called": [], "errors": []}
+    write_answer = write_mode_answer(user_text)
+    if write_answer:
+        return write_answer
 
     current_project = memory.get_current_project(chat_id) if chat_id else None
     mentioned_project = extract_mentioned_project(user_text)
@@ -594,6 +658,128 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка /check: {e}")
 
 
+def _write_mode_status_text() -> str:
+    return "\n".join(
+        [
+            f"WRITE_MODE_ENABLED={config.env_bool('WRITE_MODE_ENABLED', config.WRITE_MODE_ENABLED)}",
+            f"WRITE_ROOT={config.get_write_root()}",
+            "Это sandbox для новых тестовых проектов, не deploy.",
+        ]
+    )
+
+
+async def write_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    await update.message.reply_text(_write_mode_status_text())
+
+
+async def workspace_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        await update.message.reply_text(_write_mode_status_text())
+        return
+    try:
+        data = list_write_projects()
+        lines = [
+            f"WRITE_ROOT: {data['write_root']}",
+            f"WRITE_MODE_ENABLED: {data['enabled']}",
+            f"Проектов: {data['count']}",
+        ]
+        lines.extend(f"- {item['name']} ({item['path']})" for item in data["projects"])
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /workspace: {e}")
+
+
+async def new_static_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /new_static <name>")
+        return
+    try:
+        data = write_static_site(context.args[0])
+        await reply_long(
+            update.message,
+            "\n".join(
+                [
+                    "Создал статический сайт в WRITE_ROOT.",
+                    f"Проект: {data['project_name']}",
+                    f"Путь: {data['path']}",
+                    "Файлы:",
+                    *[f"- {path}" for path in data["created_files"]],
+                ]
+            ),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /new_static: {e}")
+
+
+async def new_flask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /new_flask <name>")
+        return
+    try:
+        data = write_flask_project(context.args[0])
+        await reply_long(
+            update.message,
+            "\n".join(
+                [
+                    "Создал Flask-проект в WRITE_ROOT.",
+                    f"Проект: {data['project_name']}",
+                    f"Путь: {data['path']}",
+                    "Файлы:",
+                    *[f"- {path}" for path in data["created_files"]],
+                ]
+            ),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /new_flask: {e}")
+
+
+async def preview_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /preview_info <name>")
+        return
+    try:
+        data = workspace_tree(context.args[0], depth=2)
+        project_path = data["path"]
+        lines = [
+            f"Проект: {project_path}",
+            "Static preview:",
+            f"cd {project_path}",
+            "python3 -m http.server 8000",
+            "",
+            "Flask preview:",
+            f"cd {project_path}",
+            "python3 -m venv venv",
+            "venv/bin/pip install -r requirements.txt",
+            "venv/bin/python app.py",
+        ]
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /preview_info: {e}")
+
+
+async def workspace_tree_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /workspace_tree <name>")
+        return
+    try:
+        data = workspace_tree(context.args[0])
+        await reply_long(update.message, f"{data['path']}\n\n{data['tree']}")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /workspace_tree: {e}")
+
+
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -626,6 +812,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/tree <path> - краткое дерево",
                 "/structure <repo> - структура и счетчики проекта",
                 "/check <repo> - безопасная read-only проверка кода",
+                "/workspace - WRITE_ROOT и тестовые проекты",
+                "/write_mode - состояние write sandbox",
+                "/new_static <name> - создать статический сайт в WRITE_ROOT",
+                "/new_flask <name> - создать Flask-проект в WRITE_ROOT",
+                "/preview_info <name> - как открыть/запустить проект",
+                "/workspace_tree <name> - дерево проекта в WRITE_ROOT",
                 "/logs <service> - последние 80 строк journal",
                 "/memory - сохраненная память",
                 "/remember <text> - сохранить факт",
@@ -840,6 +1032,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Agent tools enabled: {config.AGENT_TOOLS_ENABLED}",
                 f"Memory enabled: {config.MEMORY_ENABLED}",
                 f"DB path: {config.JARVIS_DB_PATH}",
+                f"Write mode enabled: {config.env_bool('WRITE_MODE_ENABLED', config.WRITE_MODE_ENABLED)}",
+                f"Write root: {config.get_write_root()}",
                 f"Allowed services: {', '.join(get_allowed_services())}",
                 "Allowed roots:",
                 *[f"- {root}" for root in roots_info["allowed_roots"]],
@@ -1021,6 +1215,12 @@ def main():
     app.add_handler(CommandHandler("tree", tree_command))
     app.add_handler(CommandHandler("structure", structure_command))
     app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("workspace", workspace_command))
+    app.add_handler(CommandHandler("write_mode", write_mode_command))
+    app.add_handler(CommandHandler("new_static", new_static_command))
+    app.add_handler(CommandHandler("new_flask", new_flask_command))
+    app.add_handler(CommandHandler("preview_info", preview_info_command))
+    app.add_handler(CommandHandler("workspace_tree", workspace_tree_command))
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))

@@ -101,6 +101,33 @@ journalctl -u <allowed-service>.service -n <lines> --no-pager
 
 No `sudo`, `restart`, `deploy`, `rm`, `mv`, `cp`, `git pull`, `git push`, or arbitrary `shell=True` commands are available to the agent.
 
+## Safe Write Workspace
+
+Jarvis can create brand-new test projects only inside a dedicated workspace. This is not deploy mode and does not allow writes to real projects.
+
+Default configuration:
+
+```env
+WRITE_MODE_ENABLED=false
+WRITE_ROOT=/home/seradmin/jarvis_workspace
+```
+
+`WRITE_MODE_ENABLED` is disabled by default. Set it to `true` only when you want Jarvis to create files in the sandbox. `WRITE_ROOT` is the only directory where write tools can create directories, write text files, and run `git init`. Paths with `..` are rejected, and secret-like files such as `.env`, keys, PEM files, sqlite/db files, and token/password filenames are blocked.
+
+Allowed write workspace operations:
+
+```text
+create_project_dir(name)
+write_text_file(path, content, overwrite=false)
+append_text_file(path, content)
+list_write_projects()
+init_git(path)
+write_static_site(project_name, title, description, theme)
+run_safe_project_check(path)
+```
+
+The write tools do not deploy, do not use sudo, do not install dependencies, and do not write outside `WRITE_ROOT`.
+
 ### Commands
 
 ```text
@@ -144,6 +171,42 @@ Searches text across all `ALLOWED_ROOTS` with ripgrep.
 ```
 
 Shows a short directory tree, excluding virtualenvs, caches, git internals, media, uploads, and staticfiles.
+
+```text
+/workspace
+```
+
+Shows `WRITE_ROOT` and projects inside the safe workspace.
+
+```text
+/write_mode
+```
+
+Shows whether safe write mode is enabled.
+
+```text
+/new_static <name>
+```
+
+Creates a static test site inside `WRITE_ROOT` with `index.html`, `assets/css/style.css`, `assets/js/main.js`, and `README.md`.
+
+```text
+/new_flask <name>
+```
+
+Creates a minimal Flask project inside `WRITE_ROOT` with `app.py`, `requirements.txt`, templates, static assets, and `README.md`. The generated app uses `FLASK_DEBUG=1` only when explicitly set in the environment.
+
+```text
+/preview_info <name>
+```
+
+Shows local preview commands for a workspace project.
+
+```text
+/workspace_tree <name>
+```
+
+Shows the tree for a project inside `WRITE_ROOT`.
 
 ```text
 /logs <service>
@@ -216,6 +279,12 @@ These commands are intentionally disabled at the current read-only stage. They d
 ```text
 посмотри проект anna, на чем остановились
 ```
+
+```text
+создай тестовый сайт demo-site
+```
+
+Creates a static site in `WRITE_ROOT` when `WRITE_MODE_ENABLED=true`; otherwise Jarvis explains that write mode is disabled.
 
 ```text
 запомни, мой день рождения 13 октября 1982

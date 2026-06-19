@@ -14,7 +14,7 @@ from tools_fs import ToolError
 
 MAX_WRITE_CHARS = 180_000
 MAX_READ_CHARS = 80_000
-SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$")
 FORBIDDEN_WRITE_NAMES = {
     ".env",
     ".env.local",
@@ -145,17 +145,33 @@ def create_project_dir(name: str) -> dict[str, Any]:
     return {"project_name": project_name, "path": str(path), "created": True}
 
 
-def write_text_file(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+def write_text_file(path: str, relative_or_content: str, content: str | None = None, overwrite: bool = False) -> dict[str, Any]:
     ensure_write_root()
-    _ensure_text_content(content)
-    file_path = resolve_write_path(path)
+    if content is None:
+        file_path = resolve_write_path(path)
+        text_content = relative_or_content
+    else:
+        project = _validate_project_name(path)
+        _reject_path_traversal(relative_or_content)
+        relative = Path(relative_or_content)
+        if relative.is_absolute():
+            raise ToolError(f"Файл проекта должен быть относительным: {relative_or_content}")
+        if any(part.startswith(".") for part in relative.parts):
+            raise ToolError(f"Скрытые файлы в workspace-проекте запрещены: {relative_or_content}")
+        file_path = resolve_write_path(str(Path(project) / relative))
+        text_content = content
+    _ensure_text_content(text_content)
     _ensure_text_file(file_path)
     if file_path.exists() and not overwrite:
         raise ToolError(f"Файл уже существует: {file_path}")
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
-    _log_write("write_text_file", file_path, {"chars": len(content), "overwrite": overwrite})
-    return {"path": str(file_path), "chars": len(content), "overwrite": overwrite}
+    file_path.write_text(text_content, encoding="utf-8")
+    _log_write("write_text_file", file_path, {"chars": len(text_content), "overwrite": overwrite})
+    return {"path": str(file_path), "chars": len(text_content), "overwrite": overwrite}
+
+
+def write_project_text_file(project_name: str, relative_path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+    return write_text_file(project_name, relative_path, content, overwrite=overwrite)
 
 
 def append_text_file(path: str, content: str) -> dict[str, Any]:
@@ -535,15 +551,11 @@ def create_flask_site(
     return {"success": True, "project_name": name, "path": project["path"], "created_files": created, "check": check}
 
 
-def verify_static_site(project_name: str) -> dict[str, Any]:
+def verify_static_site(project_name: str, required_files: list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:
     project = _validate_project_name(project_name)
     root = resolve_write_path(project)
-    required = [
-        root / "index.html",
-        root / "assets" / "css" / "style.css",
-        root / "assets" / "js" / "main.js",
-        root / "README.md",
-    ]
+    required_relative = required_files or ["index.html", "assets/css/style.css", "assets/js/main.js", "README.md"]
+    required = [root / relative for relative in required_relative]
     missing = [str(path) for path in required if not path.is_file()]
     return {
         "success": not missing,
@@ -554,8 +566,8 @@ def verify_static_site(project_name: str) -> dict[str, Any]:
     }
 
 
-def verify_project_files(project_name: str) -> dict[str, Any]:
-    return verify_static_site(project_name)
+def verify_project_files(project_name: str, required_files: list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:
+    return verify_static_site(project_name, required_files=required_files)
 
 
 def write_flask_project(project_name: str) -> dict[str, Any]:

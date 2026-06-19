@@ -112,7 +112,7 @@ class ErrorSmokeTests(unittest.IsolatedAsyncioTestCase):
             update = FakeUpdate("создай сайт в папке Demo")
             await bot.handle_text(update, FakeContext())
             self.assertIn("Принял задачу: create_workspace_project", update.message.replies[0])
-            self.assertTrue(any("Шаг 1/4" in reply for reply in update.message.replies))
+            self.assertTrue(any("Шаг 1/5" in reply for reply in update.message.replies))
             self.assertEqual(update.message.replies[-1], "done")
         finally:
             bot.answer_user_text = original

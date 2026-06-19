@@ -4,6 +4,7 @@ import signal
 import socket
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,10 @@ def _select_port() -> int:
     raise ToolError(f"Нет свободных preview ports в диапазоне {start}..{end}")
 
 
+def find_free_port() -> int:
+    return _select_port()
+
+
 def _project_path(project_name: str) -> Path:
     ensure_write_root()
     path = resolve_write_path(project_name)
@@ -109,6 +114,17 @@ def _preview_url(port: int) -> str:
     if not host.startswith(("http://", "https://")):
         host = f"http://{host}"
     return f"{host}:{port}"
+
+
+def _curl_localhost(port: int) -> dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            body = response.read(4096).decode("utf-8", errors="replace")
+            ok = 200 <= int(response.status) < 400 and "<html" in body.lower()
+            return {"success": ok, "url": url, "status": int(response.status), "contains_html": "<html" in body.lower()}
+    except Exception as exc:
+        return {"success": False, "url": url, "error": str(exc)}
 
 
 def _cleanup_stale(registry: dict[str, Any]) -> dict[str, Any]:
@@ -127,7 +143,8 @@ def start_preview(project_name: str) -> dict[str, Any]:
     registry = _cleanup_stale(_load_registry())
     existing = registry.get(name)
     if existing and _is_own_preview_process(existing):
-        return {**existing, "success": True, "already_running": True}
+        curl_check = _curl_localhost(int(existing["port"]))
+        return {**existing, "success": bool(curl_check.get("success")), "already_running": True, "curl_check": curl_check}
 
     port = _select_port()
     env = {**os.environ, "PORT": str(port)}
@@ -152,6 +169,13 @@ def start_preview(project_name: str) -> dict[str, Any]:
     time.sleep(0.25)
     if process.poll() is not None:
         raise ToolError(f"Preview процесс завершился сразу: {process.returncode}")
+    curl_check = _curl_localhost(port)
+    if not curl_check.get("success"):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except Exception:
+            pass
+        raise ToolError(f"Preview HTTP-check failed: {curl_check}")
 
     record = {
         "success": True,
@@ -162,6 +186,7 @@ def start_preview(project_name: str) -> dict[str, Any]:
         "url": _preview_url(port),
         "command": " ".join(command),
         "started_at": int(time.time()),
+        "curl_check": curl_check,
     }
     _PROCESS_HANDLES[name] = process
     registry[name] = record

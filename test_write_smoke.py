@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from tools_fs import ToolError
 import config
@@ -145,11 +146,13 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertTrue(result["cleanup"])
 
     def test_natural_language_sitebota_create_and_preview(self):
-        from bot import write_mode_answer
+        from bot import fixture_site_spec, write_mode_answer
         from tools_preview import stop_preview
 
-        answer, debug = write_mode_answer("создай сайт sitebota в рабочей папке и запусти временный сервер", chat_id="test")
-        self.assertIn("create_static_site", debug["tools_called"])
+        with patch("bot.ask_ollama_for_site_spec", side_effect=fixture_site_spec):
+            answer, debug = write_mode_answer("создай сайт sitebota в рабочей папке и запусти временный сервер", chat_id="test")
+        self.assertIn("ask_ollama_for_site_spec", debug["tools_called"])
+        self.assertIn("write_text_file", debug["tools_called"])
         self.assertIn("start_preview", debug["tools_called"])
         self.assertIn("preview_url:", answer)
         self.assertTrue((Path(self.tmp.name) / "sitebota" / "index.html").exists())
@@ -164,10 +167,17 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertEqual(debug["detected"]["intent"], "where_project")
 
     def test_create_site_workflow_creates_real_files_and_last_action(self):
-        from bot import create_site_workflow, get_last_action
+        from bot import create_site_workflow, fixture_site_spec, get_last_action
 
-        answer, debug = create_site_workflow("sitebota_test", chat_id="test", with_preview=False)
-        self.assertIn("create_static_site", debug["tools_called"])
+        answer, debug = create_site_workflow(
+            "создай сайт sitebota_test",
+            project_name="sitebota_test",
+            chat_id="test",
+            start_preview_requested=False,
+            site_spec_provider=fixture_site_spec,
+        )
+        self.assertIn("ask_ollama_for_site_spec", debug["tools_called"])
+        self.assertIn("write_text_file", debug["tools_called"])
         self.assertIn("verify_project_files", debug["tools_called"])
         self.assertIn("Создал проект", answer)
         self.assertTrue((Path(self.tmp.name) / "sitebota_test" / "index.html").is_file())
@@ -177,10 +187,16 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertTrue(action["path"].endswith("sitebota_test"))
 
     def test_create_and_preview_workflow_starts_preview_and_last_action(self):
-        from bot import create_site_workflow, get_last_action
+        from bot import create_site_workflow, fixture_site_spec, get_last_action
         from tools_preview import stop_preview
 
-        answer, debug = create_site_workflow("sitebota_preview_test", chat_id="test", with_preview=True)
+        answer, debug = create_site_workflow(
+            "создай сайт sitebota_preview_test",
+            project_name="sitebota_preview_test",
+            chat_id="test",
+            start_preview_requested=True,
+            site_spec_provider=fixture_site_spec,
+        )
         self.assertIn("start_preview", debug["tools_called"])
         self.assertIn("curl_localhost", debug["tools_called"])
         self.assertIn("preview_url:", answer)
@@ -190,10 +206,16 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         stop_preview("sitebota_preview_test")
 
     def test_workspace_where_reports_preview_url_after_create_and_preview(self):
-        from bot import create_site_workflow, workspace_where_answer
+        from bot import create_site_workflow, fixture_site_spec, workspace_where_answer
         from tools_preview import stop_preview
 
-        create_site_workflow("sitebota_where_test", chat_id="test", with_preview=True)
+        create_site_workflow(
+            "создай сайт sitebota_where_test",
+            project_name="sitebota_where_test",
+            chat_id="test",
+            start_preview_requested=True,
+            site_spec_provider=fixture_site_spec,
+        )
         answer, debug = workspace_where_answer("sitebota_where_test", chat_id="test")
         self.assertIn("exists: true", answer)
         self.assertIn("preview running: True", answer)
@@ -208,6 +230,26 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         answer, _debug = workspace_where_answer(None, chat_id="test")
         self.assertIn("Я не вижу подтверждения", answer)
         self.assertNotIn("Создал проект", answer)
+
+    def test_ollama_fake_bash_response_is_rejected(self):
+        from bot import ask_ollama_for_site_spec
+
+        with patch("bot.ask_ollama_messages", return_value="mkdir sitebota && python3 -m http.server 8700"):
+            with self.assertRaises(RuntimeError):
+                ask_ollama_for_site_spec("создай сайт sitebota", "sitebota")
+
+    def test_action_schema_rejects_absolute_path(self):
+        from action_schemas import validate_create_static_site_action
+
+        with self.assertRaises(ToolError):
+            validate_create_static_site_action(
+                {
+                    "action": "create_static_site",
+                    "project_name": "bad",
+                    "files": [{"path": "/tmp/index.html", "content": "x"}],
+                },
+                expected_project_name="bad",
+            )
 
 
 if __name__ == "__main__":

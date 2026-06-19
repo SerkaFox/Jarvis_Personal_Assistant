@@ -22,6 +22,7 @@ from telegram.ext import (
 from dotenv import load_dotenv
 
 import config
+from action_schemas import extract_json_object, validate_create_static_site_action
 from agent import answer_with_tools
 from intent_router import detect_intent, extract_mentioned_project, handle_detected_intent
 import memory
@@ -34,6 +35,7 @@ from tools_preview import list_previews, preview_status, start_preview, stop_pre
 from tools_errors import error_summary, latest_error, mask_error_text, save_last_error
 from tools_write import (
     create_flask_site,
+    create_project_dir,
     create_static_site,
     delete_workspace_dir,
     delete_workspace_file,
@@ -42,6 +44,7 @@ from tools_write import (
     update_static_site_file,
     verify_project_files,
     verify_static_site,
+    write_project_text_file,
     write_text_file,
     workspace_tree,
 )
@@ -336,6 +339,69 @@ def _wants_start_preview(text: str) -> bool:
     return "запусти" in lowered and any(word in lowered for word in ("сервер", "preview", "превью"))
 
 
+def looks_like_fake_action_response(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "mkdir ",
+            "cat >",
+            "cat <<",
+            "python3 -m http.server",
+            "python -m http.server",
+            "создаю файл",
+            "запускаю сервер",
+            "файл создан",
+        )
+    )
+
+
+def ask_ollama_for_site_spec(user_text: str, project_name: str) -> dict:
+    prompt = f"""
+Верни только JSON. Не пиши markdown. Не пиши bash-команды. Не используй mkdir/cat/python/http.server.
+Твоя задача: сгенерировать спецификацию статического сайта, который backend запишет через tools.
+
+Строгий формат:
+{{
+  "action": "create_static_site",
+  "project_name": "{project_name}",
+  "title": "Site title",
+  "description": "Short description",
+  "files": [
+    {{"path": "index.html", "content": "..."}},
+    {{"path": "assets/css/style.css", "content": "..."}},
+    {{"path": "assets/js/main.js", "content": "..."}},
+    {{"path": "README.md", "content": "..."}}
+  ],
+  "start_preview": true
+}}
+
+Требования:
+- project_name строго "{project_name}";
+- все path только относительные внутри проекта;
+- минимум файлы index.html, assets/css/style.css, assets/js/main.js, README.md;
+- без внешних CDN, удаленных шрифтов и внешних скриптов;
+- современный responsive landing page;
+- hero, features, workflow/use-cases, contact CTA;
+- CSS animations и prefers-reduced-motion;
+- JS только локальный и безопасный;
+- HTML должен ссылаться на assets/css/style.css и assets/js/main.js.
+
+Запрос пользователя:
+{user_text}
+""".strip()
+    raw = ask_ollama_messages(
+        [
+            {"role": "system", "content": "Ты генератор JSON action specs для Jarvis backend. Возвращай только валидный JSON."},
+            {"role": "user", "content": prompt},
+        ]
+    )
+    if looks_like_fake_action_response(raw):
+        raise RuntimeError("Ollama попыталась заменить JSON action текстовыми shell-командами")
+    data = extract_json_object(raw)
+    return validate_create_static_site_action(data, expected_project_name=project_name)
+
+
 def _format_write_success(
     action: str,
     tools_called: list[str],
@@ -424,8 +490,20 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
     )
 
 
-def create_site_workflow(project_name: str, chat_id: str | None = None, with_preview: bool = False) -> tuple[str, dict]:
-    detected = {"intent": "create_and_preview" if with_preview else "create_site", "project": project_name}
+def create_site_workflow(
+    user_text: str,
+    project_name: str | None = None,
+    chat_id: str | None = None,
+    start_preview_requested: bool = True,
+    site_spec_provider=None,
+    with_preview: bool | None = None,
+) -> tuple[str, dict]:
+    if project_name is None:
+        project_name = user_text
+        user_text = f"создай сайт {project_name}"
+    if with_preview is not None:
+        start_preview_requested = with_preview
+    detected = {"intent": "create_and_preview" if start_preview_requested else "create_site", "project": project_name}
     tools_called: list[str] = []
     action = {
         "intent": detected["intent"],
@@ -445,20 +523,26 @@ def create_site_workflow(project_name: str, chat_id: str | None = None, with_pre
             {"detected": detected, "tools_called": tools_called, "errors": [saved["error"]], "resolved_path": str(config.get_write_root())},
         )
     try:
-        created = create_static_site(
-            project_name,
-            title=project_name,
-            description="Landing page про Telegram/AI bot, созданный Jarvis в безопасной workspace-песочнице.",
-        )
-        tools_called.append("create_static_site")
-        if not created.get("success"):
-            raise RuntimeError("create_static_site не вернул success=True")
+        provider = site_spec_provider or ask_ollama_for_site_spec
+        spec = provider(user_text, project_name)
+        tools_called.append("ask_ollama_for_site_spec")
+        spec = validate_create_static_site_action(spec, expected_project_name=project_name)
+        tools_called.append("validate_create_static_site_action")
+        project = create_project_dir(project_name)
+        tools_called.append("create_project_dir")
+        created_files = []
+        for file_spec in spec["files"]:
+            result = write_project_text_file(project_name, file_spec["path"], file_spec["content"], overwrite=False)
+            created_files.append(result["path"])
+        tools_called.append("write_text_file")
         verify = verify_project_files(project_name)
         tools_called.append("verify_project_files")
         if not verify.get("success"):
             raise RuntimeError("Файлы проекта не созданы: " + ", ".join(verify.get("missing") or []))
         preview = None
-        if with_preview:
+        curl_check = None
+        should_start_preview = bool(start_preview_requested)
+        if should_start_preview:
             preview = start_preview(project_name)
             tools_called.append("start_preview")
             status = preview_status(project_name)
@@ -467,48 +551,91 @@ def create_site_workflow(project_name: str, chat_id: str | None = None, with_pre
                 raise RuntimeError("Preview tool не подтвердил запущенный процесс")
             response = requests.get(f"http://127.0.0.1:{preview['port']}/", timeout=5)
             response.raise_for_status()
-            if project_name not in response.text:
+            if "<html" not in response.text.lower():
                 raise RuntimeError("Preview HTTP-check не увидел HTML проекта")
+            curl_check = {"success": True, "url": f"http://127.0.0.1:{preview['port']}/", "status_code": response.status_code}
             tools_called.append("curl_localhost")
         if chat_id:
-            memory.set_current_project(chat_id, created["project_name"])
+            memory.set_current_project(chat_id, project["project_name"])
         action.update(
             {
-                "project_name": created["project_name"],
+                "project_name": project["project_name"],
                 "success": True,
-                "path": created["path"],
-                "created_files": created["created_files"],
+                "path": project["path"],
+                "created_files": created_files,
                 "preview_url": preview["url"] if preview else "",
                 "tools_called": tools_called,
             }
         )
         save_last_action(chat_id, action)
         answer = _format_write_success(
-            "Создал проект в WRITE_ROOT." if not with_preview else "Создал проект в WRITE_ROOT и запустил preview.",
+            "Создал проект в WRITE_ROOT." if not preview else "Создал проект в WRITE_ROOT и запустил preview.",
             tools_called,
-            created["path"],
-            created=created["created_files"],
+            project["path"],
+            created=created_files,
             preview_url=preview["url"] if preview else None,
         )
+        if curl_check:
+            answer += f"\ncurl_check: success={curl_check['success']} status={curl_check['status_code']} url={curl_check['url']}"
         return (
             answer,
             {
                 "detected": detected,
                 "tools_called": tools_called,
                 "errors": [],
-                "resolved_path": created["path"],
-                "project": created["project_name"],
+                "resolved_path": project["path"],
+                "project": project["project_name"],
                 "preview_url": preview["url"] if preview else "",
+                "curl_check": curl_check or {},
             },
         )
     except Exception as e:
         action["error"] = str(e)
         save_last_action(chat_id, action)
-        save_last_error(chat_id=chat_id or "", user_id="", handler="create_site_workflow", error=e, user_text=project_name)
+        save_last_error(chat_id=chat_id or "", user_id="", handler="create_site_workflow", error=e, user_text=user_text)
+        if "json" in str(e).lower() or "ollama" in str(e).lower():
+            message = f"Генерация JSON не удалась: {e}. Файлы не создавались."
+        else:
+            message = f"Генерация/создание сайта не выполнены: {e}"
         return (
-            f"Не смог создать проект в WRITE_ROOT: {e}",
+            message,
             {"detected": detected, "tools_called": tools_called, "errors": [str(e)], "project": project_name},
         )
+
+
+def fixture_site_spec(user_text: str, project_name: str) -> dict:
+    return {
+        "action": "create_static_site",
+        "project_name": project_name,
+        "title": "Jarvis Selftest",
+        "description": "Temporary workspace selftest site",
+        "files": [
+            {
+                "path": "index.html",
+                "content": (
+                    "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+                    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                    "<title>Jarvis Selftest</title><link rel=\"stylesheet\" href=\"assets/css/style.css\">"
+                    "</head><body><main class=\"hero\"><h1>Jarvis Selftest</h1>"
+                    "<p>Workspace write and preview fixture.</p></main>"
+                    "<script src=\"assets/js/main.js\"></script></body></html>"
+                ),
+            },
+            {
+                "path": "assets/css/style.css",
+                "content": (
+                    "body{margin:0;font-family:Arial,sans-serif;background:#f8fafc;color:#111827}"
+                    ".hero{min-height:100vh;display:grid;place-items:center;text-align:center;padding:32px}"
+                    "h1{font-size:clamp(32px,8vw,72px)}"
+                    "@media (prefers-reduced-motion:no-preference){.hero{animation:fade .4s ease-out}}"
+                    "@keyframes fade{from{opacity:.2;transform:translateY(8px)}to{opacity:1;transform:none}}"
+                ),
+            },
+            {"path": "assets/js/main.js", "content": "document.documentElement.dataset.jarvisSelftest='ok';\n"},
+            {"path": "README.md", "content": "# Jarvis Selftest\n\nTemporary selftest project.\n"},
+        ],
+        "start_preview": True,
+    }
 
 
 def workspace_status_answer(user_text: str, chat_id: str | None = None) -> tuple[str, dict] | None:
@@ -665,7 +792,7 @@ def write_mode_answer(user_text: str, chat_id: str | None = None) -> tuple[str, 
             save_last_action(chat_id, {"intent": "create_flask_site", "project_name": name, "success": False, "error": str(e), "tools_called": ["create_flask_site"]})
             save_last_error(chat_id=chat_id or "", user_id="", handler="write_mode_answer", error=e, user_text=user_text)
             return (f"Не смог создать Flask-проект в WRITE_ROOT: {e}", {"detected": detected, "tools_called": ["create_flask_site"], "errors": [str(e)]})
-    return create_site_workflow(name, chat_id=chat_id, with_preview=_wants_preview(user_text))
+    return create_site_workflow(user_text, project_name=name, chat_id=chat_id, start_preview_requested=True)
 
 
 def summarize_project_with_ollama(data: dict) -> str:
@@ -738,8 +865,25 @@ def answer_user_text(
     if use_agent:
         agent_answer = answer_with_tools(user_text, ask_ollama_messages, memory_context=memory_context)
         if agent_answer:
+            if looks_like_fake_action_response(agent_answer):
+                name = _slug_from_text(user_text)
+                return create_site_workflow(
+                    "Модель попыталась заменить действие текстом. Запускаю tool workflow.\n" + user_text,
+                    project_name=name,
+                    chat_id=chat_id,
+                    start_preview_requested=True,
+                )
             return agent_answer, {"detected": detected, "current_project": current_project, "tools_called": ["agent"], "errors": []}
-    return ask_ollama(user_text, chat_id=chat_id), {"detected": detected, "current_project": current_project, "tools_called": [], "errors": []}
+    ollama_answer = ask_ollama(user_text, chat_id=chat_id)
+    if looks_like_fake_action_response(ollama_answer):
+        name = _slug_from_text(user_text)
+        return create_site_workflow(
+            "Модель попыталась заменить действие текстом. Запускаю tool workflow.\n" + user_text,
+            project_name=name,
+            chat_id=chat_id,
+            start_preview_requested=True,
+        )
+    return ollama_answer, {"detected": detected, "current_project": current_project, "tools_called": [], "errors": []}
 
 
 def transcribe_audio_file(path: str) -> dict:
@@ -1471,12 +1615,13 @@ async def create_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Использование: /create_site <project>")
         return
     chat_id, _ = chat_user_ids(update)
-    await progress(update.message, f"Принял: создаю {context.args[0]}")
-    await progress(update.message, "Шаг 1/3: проверяю WRITE_ROOT")
-    await progress(update.message, "Шаг 2/3: создаю файлы")
+    await progress(update.message, f"Принял: создаю проект {context.args[0]} через Ollama + tools.")
+    await progress(update.message, "Шаг 1/5: прошу Ollama сгенерировать структуру сайта...")
+    await progress(update.message, "Шаг 2/5: проверяю JSON...")
+    await progress(update.message, "Шаг 3/5: записываю файлы...")
     try:
-        answer, debug = create_site_workflow(context.args[0], chat_id=chat_id, with_preview=False)
-        await progress(update.message, "Шаг 3/3: проверяю файлы")
+        answer, debug = create_site_workflow(update.message.text or "", project_name=context.args[0], chat_id=chat_id, start_preview_requested=False)
+        await progress(update.message, "Шаг 5/5: проверяю результат...")
         await reply_long(update.message, answer)
         await maybe_send_intent_debug(update.message, context, debug)
     except Exception as e:
@@ -1493,13 +1638,14 @@ async def create_and_preview_command(update: Update, context: ContextTypes.DEFAU
         return
     chat_id, _ = chat_user_ids(update)
     project = context.args[0]
-    await progress(update.message, f"Принял: создаю {project}")
-    await progress(update.message, "Шаг 1/4: проверяю WRITE_ROOT")
-    await progress(update.message, "Шаг 2/4: создаю файлы")
-    await progress(update.message, "Шаг 3/4: проверяю файлы")
-    await progress(update.message, "Шаг 4/4: запускаю preview")
+    await progress(update.message, f"Принял: создаю проект {project} через Ollama + tools.")
+    await progress(update.message, "Шаг 1/5: прошу Ollama сгенерировать структуру сайта...")
+    await progress(update.message, "Шаг 2/5: проверяю JSON...")
+    await progress(update.message, "Шаг 3/5: записываю файлы...")
+    await progress(update.message, "Шаг 4/5: запускаю preview...")
+    await progress(update.message, "Шаг 5/5: проверяю curl...")
     try:
-        answer, debug = create_site_workflow(project, chat_id=chat_id, with_preview=True)
+        answer, debug = create_site_workflow(update.message.text or "", project_name=project, chat_id=chat_id, start_preview_requested=True)
         await reply_long(update.message, answer)
         await maybe_send_intent_debug(update.message, context, debug)
     except Exception as e:
@@ -1522,16 +1668,24 @@ def selftest_workspace_result() -> dict:
             "error": "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env",
             "write_root": str(config.get_write_root()),
         }
-    project = f"jarvis_selftest_{int(datetime.now().timestamp())}"
-    preview = None
+    project = "__jarvis_selftest_static__"
     cleanup = None
     try:
-        created = create_static_site(project, title="Jarvis Selftest", description="Workspace selftest project")
-        verify = verify_static_site(project)
-        if not created.get("success") or not verify.get("success"):
-            raise RuntimeError("selftest files verification failed")
-        preview = start_preview(project)
-        response = requests.get(f"http://127.0.0.1:{preview['port']}/", timeout=5)
+        if Path(config.get_write_root() / project).exists():
+            delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        answer, debug = create_site_workflow(
+            "selftest workspace static site",
+            project_name=project,
+            chat_id="selftest",
+            start_preview_requested=True,
+            site_spec_provider=fixture_site_spec,
+        )
+        if debug.get("errors"):
+            raise RuntimeError("; ".join(debug["errors"]))
+        status = preview_status(project)
+        if not status.get("running"):
+            raise RuntimeError("selftest preview not running")
+        response = requests.get(f"http://127.0.0.1:{status['port']}/", timeout=5)
         response.raise_for_status()
         if "Jarvis Selftest" not in response.text:
             raise RuntimeError("preview response does not contain expected HTML")
@@ -1541,17 +1695,17 @@ def selftest_workspace_result() -> dict:
             "success": True,
             "write_root": str(config.get_write_root()),
             "project": project,
-            "created_files": created["created_files"],
-            "preview_url": preview["url"],
+            "created_files": get_last_action("selftest").get("created_files", []),
+            "preview_url": status["url"],
             "stopped": stopped.get("stopped"),
             "cleanup": cleanup.get("deleted"),
+            "tools_called": debug.get("tools_called", []),
         }
     except Exception:
-        if preview:
-            try:
-                stop_preview(project)
-            except Exception:
-                pass
+        try:
+            stop_preview(project)
+        except Exception:
+            pass
         try:
             cleanup = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
         except Exception:
@@ -1959,12 +2113,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await progress(update.message, f"Принял задачу: {pending_task}")
             if pending_task == "create_workspace_project":
                 project_name = _slug_from_text(user_text)
-                await progress(update.message, f"Принял: создаю {project_name} в workspace")
-                await progress(update.message, "Шаг 1/4: проверяю WRITE_ROOT")
-                await progress(update.message, "Шаг 2/4: создаю файлы")
-                await progress(update.message, "Шаг 3/4: проверяю файлы")
+                await progress(update.message, f"Принял: создаю проект {project_name} через Ollama + tools.")
+                await progress(update.message, "Шаг 1/5: прошу Ollama сгенерировать структуру сайта...")
+                await progress(update.message, "Шаг 2/5: проверяю JSON...")
+                await progress(update.message, "Шаг 3/5: записываю файлы...")
                 if _wants_preview(user_text):
-                    await progress(update.message, "Шаг 4/4: запускаю preview")
+                    await progress(update.message, "Шаг 4/5: запускаю preview...")
+                    await progress(update.message, "Шаг 5/5: проверяю curl...")
             else:
                 await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
                 await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")

@@ -41,9 +41,8 @@ BOT_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
 
 class SecretMaskingLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = BOT_TOKEN_RE.sub("bot[MASKED]", str(record.msg))
-        if record.args:
-            record.args = tuple(BOT_TOKEN_RE.sub("bot[MASKED]", str(arg)) for arg in record.args)
+        record.msg = BOT_TOKEN_RE.sub("bot[MASKED]", record.getMessage())
+        record.args = ()
         return True
 
 

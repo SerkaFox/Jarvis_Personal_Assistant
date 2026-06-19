@@ -434,8 +434,9 @@ def _check_ollama() -> str:
 
 def _check_stt() -> str:
     try:
-        response = requests.get(STT_URL, timeout=5)
-        return f"reachable (HTTP {response.status_code})"
+        response = requests.get(f"{STT_URL.rstrip('/')}/docs", timeout=5)
+        response.raise_for_status()
+        return "ok (/docs)"
     except Exception as e:
         return f"error ({e})"
 

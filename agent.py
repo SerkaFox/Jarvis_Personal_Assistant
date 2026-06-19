@@ -29,6 +29,8 @@ TOOL_REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
 PLANNER_SYSTEM_PROMPT = """
 Ты планировщик read-only инструментов Jarvis.
 Верни только валидный JSON, без Markdown.
+Ты работаешь на реальном сервере пользователя, а не в абстрактном /home/user.
+Для вопросов о проектах, папках, сервере, git-репозиториях, статусе, diff, логах или поиске по коду ОБЯЗАТЕЛЬНО выбирай tools.
 Если инструменты не нужны, верни {"use_tools": false, "reason": "...", "tools": []}.
 Если нужны, верни {"use_tools": true, "reason": "...", "tools": [{"name": "...", "args": {...}}]}.
 Также можно вернуть один action: {"action": "search_text", "args": {...}}.
@@ -44,6 +46,9 @@ PLANNER_SYSTEM_PROMPT = """
 - read_journal(name, lines)
 - final_answer(answer)
 Правила: только чтение, не планируй записи, sudo, restart, deploy, rm/mv/cp, git pull/push/commit.
+Примеры:
+Вопрос "Какие проекты у меня есть на сервере и какие из них git-репозитории?" -> {"use_tools": true, "tools": [{"name": "find_git_repos", "args": {}}]}.
+Вопрос "где используется booking_calendar_day" -> {"use_tools": true, "tools": [{"name": "search_text", "args": {"root": "/home/seradmin", "query": "booking_calendar_day"}}]}.
 """.strip()
 
 FINAL_SYSTEM_PROMPT = """
@@ -71,6 +76,15 @@ def build_planner_messages(user_text: str) -> list[dict[str, str]]:
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
         {"role": "user", "content": user_text},
     ]
+
+
+def heuristic_plan(user_text: str) -> dict[str, Any] | None:
+    text = user_text.lower()
+    project_words = ("проект", "проекты", "projects", "репозитор", "git", "repository", "repositories")
+    server_words = ("сервер", "server", "папк", "директор")
+    if any(word in text for word in project_words) and any(word in text for word in server_words + project_words):
+        return {"use_tools": True, "tools": [{"name": "find_git_repos", "args": {}}]}
+    return None
 
 
 def execute_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -154,11 +168,13 @@ def answer_with_tools(user_text: str, ask_model: Callable[[list[dict[str, str]]]
     if not config.AGENT_TOOLS_ENABLED:
         return None
 
-    planner_response = ask_model(build_planner_messages(user_text))
-    try:
-        plan = _extract_json(planner_response)
-    except (json.JSONDecodeError, ValueError):
-        return None
+    plan = heuristic_plan(user_text)
+    if plan is None:
+        planner_response = ask_model(build_planner_messages(user_text))
+        try:
+            plan = _extract_json(planner_response)
+        except (json.JSONDecodeError, ValueError):
+            return None
 
     if plan.get("action") == "final_answer":
         answer = plan.get("answer")

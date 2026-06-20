@@ -3,6 +3,7 @@ import mimetypes
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,14 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
 IMG_SUBDIR = Path("assets") / "img"
 CSS_PATH = Path("assets") / "css" / "style.css"
+
+IMAGE_LISTING_CANDIDATE_SUBDIRS = (
+    Path("assets") / "img",
+    Path("assets") / "images",
+    Path("static") / "img",
+    Path("public") / "img",
+)
+IMAGE_LISTING_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
 def pillow_available() -> bool:
@@ -137,6 +146,49 @@ def list_project_images(project_name: str) -> dict[str, Any]:
         if path.is_file() and path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS | {".webp"}:
             images.append({"name": path.name, "path": str(path), "bytes": path.stat().st_size})
     return {"project_name": _validate_project_name(project_name), "images": images, "count": len(images)}
+
+
+def list_workspace_project_images(project_name: str) -> dict[str, Any]:
+    """Read-only: searches the common image directories
+    (assets/img, assets/images, static/img, public/img) inside
+    WRITE_ROOT/<project> and returns the real .jpg/.jpeg/.png/.webp/.gif
+    files found, with relative path, size, and last-modified time. Never
+    invents files -- if none of the candidate directories contain images,
+    returns an empty list (the caller should say so honestly, not guess)."""
+    ensure_write_root()
+    project = _validate_project_name(project_name)
+    root = resolve_write_path(project).resolve()
+    if not root.is_dir():
+        raise ToolError(f"Проект не найден в WRITE_ROOT: {root}")
+
+    images: list[dict[str, Any]] = []
+    searched_dirs: list[str] = []
+    for subdir in IMAGE_LISTING_CANDIDATE_SUBDIRS:
+        candidate = (root / subdir).resolve()
+        if candidate != root and root not in candidate.parents:
+            continue
+        if not candidate.is_dir():
+            continue
+        searched_dirs.append(str(subdir))
+        for path in sorted(candidate.glob("*")):
+            if path.is_file() and path.suffix.lower() in IMAGE_LISTING_EXTENSIONS:
+                stat = path.stat()
+                images.append(
+                    {
+                        "path": str(path.relative_to(root)),
+                        "bytes": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                        .isoformat(timespec="seconds")
+                        .replace("+00:00", "Z"),
+                    }
+                )
+    images.sort(key=lambda f: f["path"])
+    return {
+        "project_name": project,
+        "searched_dirs": searched_dirs,
+        "images": images,
+        "count": len(images),
+    }
 
 
 def _resolve_project_image_path(project_name: str, image_relative_path: str) -> dict[str, Any]:

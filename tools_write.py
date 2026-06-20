@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -728,3 +729,63 @@ def workspace_tree(path: str | None = None, depth: int = 3) -> dict[str, Any]:
 
     walk(target, 0, "")
     return {"path": str(target), "tree": "\n".join(lines)}
+
+
+def tree_workspace_project(project_name: str, depth: int = 3) -> dict[str, Any]:
+    """Read-only ASCII tree of WRITE_ROOT/<project>, same exclusions as
+    workspace_tree (.git/venv/__pycache__/hidden dirs)."""
+    project = _validate_project_name(project_name)
+    root = resolve_write_path(project).resolve()
+    if not root.is_dir():
+        raise ToolError(f"Проект не найден в WRITE_ROOT: {root}")
+    result = workspace_tree(project, depth=depth)
+    return {"project_name": project, **result}
+
+
+def list_workspace_project_files(project_name: str, depth: int = 3) -> dict[str, Any]:
+    """Read-only: lists real files inside WRITE_ROOT/<project> up to `depth`
+    levels -- relative path, size in bytes, last-modified UTC timestamp.
+    Excludes .git/venv/__pycache__/hidden dirs and any db/secret/key/token
+    files via the same policy as the write tools. Never invents files --
+    an empty/missing subdirectory just yields an empty list."""
+    ensure_write_root()
+    project = _validate_project_name(project_name)
+    root = resolve_write_path(project).resolve()
+    if not root.is_dir():
+        raise ToolError(f"Проект не найден в WRITE_ROOT: {root}")
+    depth = max(1, min(int(depth or 3), 6))
+
+    files: list[dict[str, Any]] = []
+
+    def walk(directory: Path, current_depth: int) -> None:
+        if current_depth > depth:
+            return
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except OSError:
+            return
+        for child in children:
+            if child.name in TREE_EXCLUDED or child.name.startswith("."):
+                continue
+            if child.is_dir():
+                walk(child, current_depth + 1)
+            elif child.is_file():
+                if _is_forbidden_workspace_file(child):
+                    continue
+                try:
+                    stat = child.stat()
+                except OSError:
+                    continue
+                files.append(
+                    {
+                        "path": str(child.relative_to(root)),
+                        "bytes": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                        .isoformat(timespec="seconds")
+                        .replace("+00:00", "Z"),
+                    }
+                )
+
+    walk(root, 1)
+    files.sort(key=lambda f: f["path"])
+    return {"project_name": project, "root": str(root), "depth": depth, "files": files, "count": len(files)}

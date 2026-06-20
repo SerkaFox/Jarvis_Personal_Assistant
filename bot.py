@@ -59,6 +59,7 @@ from tools_browser import (
 from tools_media import (
     convert_to_webp,
     list_project_images,
+    list_workspace_project_images,
     pillow_available,
     save_telegram_image_to_project,
     set_hero_background,
@@ -85,8 +86,10 @@ from tools_write import (
     delete_workspace_dir,
     delete_workspace_file,
     list_workspace,
+    list_workspace_project_files,
     read_workspace_file,
     resolve_write_path,
+    tree_workspace_project,
     update_static_site_file,
     verify_project_files,
     verify_static_site,
@@ -3144,15 +3147,49 @@ async def images_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     project = context.args[0]
     try:
-        result = list_project_images(project)
+        result = list_workspace_project_images(project)
         if not result["images"]:
-            await update.message.reply_text(f"В {project} пока нет изображений в assets/img.")
+            searched = ", ".join(result["searched_dirs"]) or "assets/img, assets/images, static/img, public/img"
+            await update.message.reply_text(f"В проекте {project} изображений не найдено (искал в: {searched}).")
             return
-        lines = [f"Изображения проекта {project}:"]
-        lines.extend(f"- {img['name']} ({img['bytes']} bytes)" for img in result["images"])
+        lines = [f"В проекте {project} нашёл изображения:"]
+        lines.extend(f"- {img['path']}" for img in result["images"])
         await reply_long(update.message, "\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Ошибка /images: {e}")
+
+
+async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /files <project>")
+        return
+    project = context.args[0]
+    try:
+        result = list_workspace_project_files(project, depth=3)
+        if not result["files"]:
+            await update.message.reply_text(f"В проекте {project} файлов не найдено.")
+            return
+        lines = [f"В проекте {project} нашёл файлы:"]
+        lines.extend(f"- {f['path']}" for f in result["files"])
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /files: {e}")
+
+
+async def tree_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /tree_project <project>")
+        return
+    project = context.args[0]
+    try:
+        result = tree_workspace_project(project, depth=3)
+        await reply_long(update.message, result["tree"])
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /tree_project: {e}")
 
 
 async def set_background_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3308,6 +3345,77 @@ FIXED_ATTACHMENT_WORDS = (
 def _wants_fixed_attachment(text: str) -> bool:
     lowered = (text or "").lower()
     return any(word in lowered for word in FIXED_ATTACHMENT_WORDS)
+
+
+IMAGE_LISTING_PHRASES = (
+    "какие фото", "какие фотки", "какие изображения", "какие картинки",
+    "какие фоны", "какой фон", "фото для фона", "фотографии для фона",
+    "картинки для фона", "изображения для фона", "покажи фото", "покажи изображения",
+    "background files", "background images", "what images", "what photos",
+    "images in project", "photos in project", "show images", "list images",
+    "qué imágenes", "que imagenes", "qué fondos", "que fondos", "imágenes del proyecto",
+    "archivos de imagen",
+)
+
+FILE_LISTING_PHRASES = (
+    "какие файлы", "найди файлы", "что лежит в папке", "что лежит в проекте",
+    "список файлов", "покажи файлы", "покажи список файлов", "файлы проекта",
+    "list files", "find files", "what files", "files in project", "show files",
+    "archivos en el proyecto", "lista de archivos", "qué archivos", "que archivos",
+)
+
+
+def _wants_image_listing(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in IMAGE_LISTING_PHRASES)
+
+
+def _wants_file_listing(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in FILE_LISTING_PHRASES)
+
+
+def _answer_file_listing_question(user_text: str, project: str) -> tuple[str, dict]:
+    """Deterministic, read-only answer for "what files/images do you have"
+    questions -- never lets Ollama improvise file names. Always backed by
+    list_workspace_project_images/list_workspace_project_files, which only
+    ever report files that genuinely exist under WRITE_ROOT/<project>."""
+    wants_images = _wants_image_listing(user_text)
+    try:
+        if wants_images:
+            result = list_workspace_project_images(project)
+            images = result["images"]
+            if not images:
+                searched = ", ".join(result["searched_dirs"]) or "assets/img, assets/images, static/img, public/img"
+                answer = f"В проекте {project} изображений не найдено (искал в: {searched})."
+            else:
+                lines = [f"В проекте {project} нашёл изображения:"]
+                lines.extend(f"- {img['path']}" for img in images)
+                answer = "\n".join(lines)
+            tools_called = ["list_workspace_project_images"]
+        else:
+            result = list_workspace_project_files(project, depth=3)
+            files = result["files"]
+            if not files:
+                answer = f"В проекте {project} файлов не найдено."
+            else:
+                shown = files[:100]
+                lines = [f"В проекте {project} нашёл файлы:"]
+                lines.extend(f"- {f['path']}" for f in shown)
+                if len(files) > len(shown):
+                    lines.append(f"... и ещё {len(files) - len(shown)} файлов")
+                answer = "\n".join(lines)
+            tools_called = ["list_workspace_project_files"]
+        return answer, {
+            "detected": {"intent": "list_workspace_files", "project": project},
+            "tools_called": tools_called,
+            "errors": [],
+        }
+    except ToolError as e:
+        return (
+            f"Не смог получить список файлов проекта {project}: {e}",
+            {"detected": {"intent": "list_workspace_files", "project": project}, "tools_called": [], "errors": [str(e)]},
+        )
 
 
 async def _check_background_live(project_name: str, base_url: str, relative_image: str) -> dict[str, Any]:
@@ -3775,7 +3883,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/current_task - текущая выполняемая задача",
                 "/progress - прогресс текущей задачи или последнее действие",
                 "/browser_check <project> - проверить запущенный preview через Playwright",
-                "/images <project> - список изображений проекта (assets/img)",
+                "/images <project> - список изображений проекта (assets/img, assets/images, static/img, public/img)",
+                "/files <project> - список файлов проекта (alias: /ls)",
+                "/tree_project <project> - дерево файлов проекта",
                 "/set_background <project> <image_name> - поставить изображение фоном hero-секции",
                 "/last_media - статус последнего присланного фото",
                 "/retry_media_background <project> [hero] - повторить применение последнего фото без повторной отправки",
@@ -4464,6 +4574,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if _wants_image_listing(user_text) or _wants_file_listing(user_text):
+            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
+            if project:
+                answer, _debug_info = _answer_file_listing_question(user_text, project)
+                await reply_long(update.message, answer)
+                return
+
         available_media = get_latest_available_media(chat_id)
         if _wants_background_from_latest_photo(user_text, has_pending_media=bool(available_media)):
             if not available_media:
@@ -4694,6 +4811,9 @@ def main():
     app.add_handler(CommandHandler("progress", progress_command))
     app.add_handler(CommandHandler("browser_check", browser_check_command))
     app.add_handler(CommandHandler("images", images_command))
+    app.add_handler(CommandHandler("files", files_command))
+    app.add_handler(CommandHandler("ls", files_command))
+    app.add_handler(CommandHandler("tree_project", tree_project_command))
     app.add_handler(CommandHandler("set_background", set_background_command))
     app.add_handler(CommandHandler("last_media", last_media_command))
     app.add_handler(CommandHandler("retry_media_background", retry_media_background_command))

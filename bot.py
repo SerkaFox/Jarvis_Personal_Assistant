@@ -23,21 +23,24 @@ from telegram.ext import (
 from dotenv import load_dotenv
 
 import config
-from action_schemas import extract_json_object, validate_create_static_site_action
+from action_schemas import extract_json_object, validate_create_static_site_action, validate_edit_workspace_site_action
 from agent import answer_with_tools
 from intent_router import detect_intent, extract_mentioned_project, format_workspace_inventory, handle_detected_intent
 import memory
 import semantic_router
 from tools_fs import ToolError, allowed_roots_info, search_text, tree_summary
+from tools_edit import apply_file_updates, read_workspace_project_files, verify_workspace_project
 from tools_git import find_git_repos, git_diff, git_status, resolve_repo
 from tools_project import inspect_project, project_structure
 from tools_check import safe_code_check
 from tools_system import get_allowed_services, read_journal
 from tools_preview import (
     cleanup_stale_previews,
+    curl_check,
     list_previews,
     port_is_listening,
     preview_status,
+    preview_url_for_port,
     scan_listening_ports,
     start_preview,
     stop_preview,
@@ -202,6 +205,28 @@ EDIT_PROJECT_PHRASES = (
     "добавь анимацию",
 )
 
+EDIT_SITE_PHRASES = (
+    "поменяй стиль",
+    "измени стиль",
+    "поменяй дизайн",
+    "сделай зеленый",
+    "сделай зелёный",
+    "добавь погоду",
+    "добавь блок",
+    "добавь кнопку",
+    "редактируй сайт",
+    "отредактируй сайт",
+    "поменяй цвет",
+    "edit the site",
+    "change the design",
+    "change the style",
+    "update the site",
+    "cambia el estilo",
+    "cambia el diseño",
+    "añade el tiempo",
+    "modifica el sitio",
+)
+
 
 def _slug_from_text(text: str, fallback: str = "test-site") -> str:
     folder_match = re.search(r"(?:в\s+папке|папку|проект(?:е)?\s+)([A-Za-z0-9_.-]+)", text, re.IGNORECASE)
@@ -256,7 +281,9 @@ def save_last_action(chat_id: str | None, action: dict) -> dict:
         "success": bool(action.get("success")),
         "path": action.get("path") or "",
         "created_files": action.get("created_files") or [],
+        "modified_files": action.get("modified_files") or [],
         "preview_url": action.get("preview_url") or "",
+        "curl_check": action.get("curl_check"),
         "error": str(action.get("error") or ""),
         "tools_called": action.get("tools_called") or [],
         "verification": action.get("verification"),
@@ -282,6 +309,7 @@ def _format_last_action(action: dict | None) -> str:
         f"success: {action.get('success')}",
         f"path: {action.get('path') or '-'}",
         f"preview_url: {action.get('preview_url') or '-'}",
+        f"curl_check: {action.get('curl_check') or '-'}",
         f"tools_called: {', '.join(action.get('tools_called') or []) or '-'}",
         f"verification: {action.get('verification') or '-'}",
         f"error: {action.get('error') or '-'}",
@@ -289,7 +317,69 @@ def _format_last_action(action: dict | None) -> str:
     ]
     created = action.get("created_files") or []
     lines.extend(f"- {item}" for item in created) if created else lines.append("-")
+    modified = action.get("modified_files") or []
+    lines.append("modified_files:")
+    lines.extend(f"- {item}" for item in modified) if modified else lines.append("-")
     return "\n".join(lines)
+
+
+def _current_task_path() -> Path:
+    path = Path(os.getenv("JARVIS_DB_PATH", config.JARVIS_DB_PATH)).resolve().parent / "current_task.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_current_tasks() -> dict:
+    path = _current_task_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_current_tasks(data: dict) -> None:
+    _current_task_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_current_task(chat_id: str | None, intent: str, project_name: str | None, step: str) -> dict:
+    key = str(chat_id or "global")
+    now = datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds").replace("+00:00", "Z")
+    payload = {
+        "intent": intent,
+        "project_name": project_name,
+        "step": step,
+        "started_at": now,
+        "updated_at": now,
+    }
+    data = _load_current_tasks()
+    data[key] = payload
+    _save_current_tasks(data)
+    return payload
+
+
+def update_current_task_step(chat_id: str | None, step: str) -> None:
+    key = str(chat_id or "global")
+    data = _load_current_tasks()
+    if key in data:
+        data[key]["step"] = step
+        data[key]["updated_at"] = datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds").replace("+00:00", "Z")
+        _save_current_tasks(data)
+
+
+def get_current_task(chat_id: str | None) -> dict | None:
+    data = _load_current_tasks()
+    return data.get(str(chat_id or "global"))
+
+
+def clear_current_task(chat_id: str | None) -> None:
+    key = str(chat_id or "global")
+    data = _load_current_tasks()
+    if key in data:
+        data.pop(key, None)
+        _save_current_tasks(data)
 
 
 def _workspace_name_from_text(text: str) -> str | None:
@@ -414,6 +504,57 @@ def ask_ollama_for_site_spec(user_text: str, project_name: str) -> dict:
         raise RuntimeError("Ollama попыталась заменить JSON action текстовыми shell-командами")
     data = extract_json_object(raw)
     return validate_create_static_site_action(data, expected_project_name=project_name)
+
+
+def ask_ollama_for_site_edit(user_text: str, project_name: str, current_files: list[dict]) -> dict:
+    files_block = "\n\n".join(f"--- {f['path']} ---\n{f['content']}" for f in current_files)
+    prompt = f"""
+Верни только JSON. Не пиши markdown. Не пиши bash-команды. Не используй mkdir/cat/python/http.server.
+Твоя задача: отредактировать существующий статический сайт workspace-проекта "{project_name}" по запросу пользователя.
+Тебе дано полное текущее содержимое файлов проекта. Верни JSON с ПОЛНЫМ новым содержимым каждого
+изменённого файла (не диффы, не фрагменты, целиком весь файл).
+
+Строгий формат:
+{{
+  "action": "edit_workspace_site",
+  "project_name": "{project_name}",
+  "summary": "Short description of what changed",
+  "files": [
+    {{"path": "index.html", "content": "full new file content"}},
+    {{"path": "assets/css/style.css", "content": "full new file content"}}
+  ],
+  "notes": ["short implementation notes"]
+}}
+
+Требования:
+- project_name строго "{project_name}";
+- меняй только те файлы, которые реально нужно изменить для выполнения запроса;
+- все path только относительные внутри проекта, без "..", без абсолютных путей;
+- без внешних CDN, удаленных шрифтов, внешних скриптов и npm-библиотек;
+- сохраняй responsive design и существующую структуру секций, если явно не просили иное;
+- если просят добавить погоду для Бильбао, используй клиентский JS fetch к Open-Meteo
+  (https://api.open-meteo.com/v1/forecast?latitude=43.2630&longitude=-2.9350&current_weather=true),
+  без API key, с try/catch и текстовым fallback на случай ошибки запроса.
+
+Текущие файлы проекта:
+{files_block}
+
+Запрос пользователя:
+{user_text}
+""".strip()
+    raw = ask_ollama_messages(
+        [
+            {
+                "role": "system",
+                "content": "Ты генератор JSON edit specs для Jarvis backend. Возвращай только валидный JSON с полным содержимым измененных файлов.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+    )
+    if looks_like_fake_action_response(raw):
+        raise RuntimeError("Ollama попыталась заменить JSON edit текстовыми shell-командами")
+    data = extract_json_object(raw)
+    return validate_edit_workspace_site_action(data, expected_project_name=project_name)
 
 
 def _format_write_success(
@@ -591,8 +732,8 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
             lines.append(f"curl status: {curl_check}")
         else:
             lines.append("curl status: -")
-        if status.get("running") and status.get("url"):
-            lines.append(f"url: {status['url']}")
+        if status.get("running") and port:
+            lines.append(f"url: {preview_url_for_port(int(port))}")
         else:
             lines.append("url: -")
         answer = "\n".join(lines)
@@ -718,6 +859,134 @@ def create_site_workflow(
         return (
             message,
             {"detected": detected, "tools_called": tools_called, "errors": [str(e)], "project": project_name},
+        )
+
+
+RESTART_PREVIEW_WORDS = (
+    "запусти", "перезапусти", "проверь", "включи",
+    "start", "restart", "check", "launch",
+    "inicia", "reinicia", "comprueba", "verifica", "arranca",
+)
+
+
+def edit_workspace_site_workflow(
+    user_text: str,
+    project_name: str,
+    chat_id: str | None = None,
+) -> tuple[str, dict]:
+    tools_called: list[str] = []
+    save_current_task(chat_id, "edit_workspace_site", project_name, "starting")
+    action = {
+        "intent": "edit_workspace_site",
+        "project_name": project_name,
+        "success": False,
+        "path": "",
+        "modified_files": [],
+        "preview_url": "",
+        "curl_check": None,
+        "error": "",
+        "tools_called": tools_called,
+    }
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        action["error"] = "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env"
+        save_last_action(chat_id, action)
+        clear_current_task(chat_id)
+        return (
+            action["error"],
+            {"detected": {"intent": "edit_workspace_site", "project": project_name}, "tools_called": tools_called, "errors": [action["error"]]},
+        )
+    try:
+        update_current_task_step(chat_id, "reading_files")
+        read_result = read_workspace_project_files(project_name)
+        tools_called.append("read_workspace_project_files")
+        if not read_result["files"]:
+            raise RuntimeError("Не нашел текстовых файлов проекта для редактирования")
+
+        update_current_task_step(chat_id, "asking_ollama")
+        spec = ask_ollama_for_site_edit(user_text, project_name, read_result["files"])
+        tools_called.append("ask_ollama_for_site_edit")
+        tools_called.append("validate_edit_workspace_site_action")
+
+        update_current_task_step(chat_id, "writing_files")
+        write_result = apply_file_updates(project_name, spec["files"])
+        tools_called.append("apply_file_updates")
+        if not write_result["success"]:
+            raise RuntimeError("Запись файлов не подтверждена: " + ("; ".join(write_result["errors"]) or "неизвестная ошибка"))
+
+        update_current_task_step(chat_id, "verifying_structure")
+        verify = verify_workspace_project(project_name)
+        tools_called.append("verify_workspace_project")
+        if not verify["exists"]:
+            raise RuntimeError("Проект не найден после редактирования")
+
+        update_current_task_step(chat_id, "checking_preview")
+        status = preview_status(project_name)
+        tools_called.append("preview_status")
+        if not status.get("running") and any(word in user_text.lower() for word in RESTART_PREVIEW_WORDS):
+            start_preview(project_name)
+            tools_called.append("start_preview")
+            status = preview_status(project_name)
+            tools_called.append("preview_status")
+
+        preview_url = ""
+        curl_result = None
+        if status.get("running") and status.get("port"):
+            curl_result = curl_check(int(status["port"]))
+            preview_url = preview_url_for_port(int(status["port"]))
+            tools_called.append("curl_check")
+
+        if chat_id:
+            memory.set_current_project(chat_id, project_name)
+
+        action.update(
+            {
+                "success": True,
+                "path": verify["path"],
+                "modified_files": write_result["modified_files"],
+                "preview_url": preview_url,
+                "curl_check": curl_result,
+                "tools_called": tools_called,
+            }
+        )
+        save_last_action(chat_id, action)
+        clear_current_task(chat_id)
+
+        answer_lines = [
+            f"Отредактировал сайт {project_name}.",
+            f"tools_called: {', '.join(tools_called)}",
+            f"summary: {spec.get('summary') or '-'}",
+            "modified files:",
+        ]
+        answer_lines.extend(f"- {path}" for path in write_result["modified_files"])
+        if preview_url:
+            answer_lines.append(f"preview_url: {preview_url}")
+            if curl_result:
+                answer_lines.append(f"curl_check: success={curl_result.get('success')} status={curl_result.get('status')}")
+        else:
+            answer_lines.append("preview: не запущен (не перезапускал и не останавливал)")
+        if spec.get("notes"):
+            answer_lines.append("notes: " + "; ".join(spec["notes"]))
+        return (
+            "\n".join(answer_lines),
+            {
+                "detected": {"intent": "edit_workspace_site", "project": project_name},
+                "tools_called": tools_called,
+                "errors": [],
+                "resolved_path": verify["path"],
+                "project": project_name,
+                "modified_files": write_result["modified_files"],
+                "preview_url": preview_url,
+            },
+        )
+    except Exception as e:
+        action["error"] = str(e)
+        action["tools_called"] = tools_called
+        save_last_action(chat_id, action)
+        save_last_error(chat_id=chat_id or "", user_id="", handler="edit_workspace_site_workflow", error=e, user_text=user_text)
+        clear_current_task(chat_id)
+        return (
+            f"Не смог отредактировать сайт {project_name}: {e}",
+            {"detected": {"intent": "edit_workspace_site", "project": project_name}, "tools_called": tools_called, "errors": [str(e)]},
         )
 
 
@@ -1124,6 +1393,10 @@ def pending_task_for_text(user_text: str) -> str | None:
     )
     if has_create_intent:
         return "create_workspace_project"
+    if any(phrase in lowered for phrase in EDIT_SITE_PHRASES) or any(verb in lowered for verb in semantic_router.ACTION_VERBS) and any(
+        word in lowered for word in ("стиль", "дизайн", "погод", "style", "design", "weather", "estilo", "diseño", "tiempo")
+    ):
+        return "edit_workspace_site"
     if any(phrase in lowered for phrase in EDIT_PROJECT_PHRASES):
         return "edit_workspace_project"
     if any(word in lowered for word in STOP_WORDS) or any(word in lowered for word in DELETE_WORDS):
@@ -1193,6 +1466,18 @@ def semantic_router_answer(
         answer, debug_info = create_site_workflow(
             user_text, project_name=name, chat_id=chat_id, start_preview_requested=start_preview_flag
         )
+        debug_info["router"] = classification
+        return answer, debug_info
+
+    if intent == "edit_workspace_site":
+        proj = project or (last_action or {}).get("project_name") or _workspace_project_from_context(user_text, chat_id)
+        if not proj or not _workspace_project_exists(proj):
+            return (
+                "Не понял, какой проект редактировать. Укажи: /edit_site <project> <task>, "
+                "или сначала упомяни проект.",
+                {"detected": {"intent": "edit_workspace_site"}, "tools_called": [], "errors": ["project not resolved"], "router": classification},
+            )
+        answer, debug_info = edit_workspace_site_workflow(user_text, proj, chat_id)
         debug_info["router"] = classification
         return answer, debug_info
 
@@ -2318,6 +2603,67 @@ async def last_action_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await reply_long(update.message, _format_last_action(get_last_action(chat_id)))
 
 
+async def edit_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /edit_site <project> <задача>")
+        return
+    chat_id, _ = chat_user_ids(update)
+    project = context.args[0]
+    task_text = " ".join(context.args[1:])
+    await progress(update.message, f"Принял: редактирую {project} через Ollama + tools.")
+    await progress(update.message, "Шаг 1/6: читаю текущие файлы проекта...")
+    await progress(update.message, "Шаг 2/6: прошу Ollama сгенерировать изменения...")
+    await progress(update.message, "Шаг 3/6: проверяю JSON...")
+    await progress(update.message, "Шаг 4/6: записываю файлы...")
+    await progress(update.message, "Шаг 5/6: проверяю структуру проекта...")
+    try:
+        answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
+        await progress(update.message, "Шаг 6/6: проверяю preview...")
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="edit_site_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /edit_site: {e}")
+
+
+async def current_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    task = get_current_task(chat_id)
+    if not task:
+        await update.message.reply_text("Сейчас нет активной задачи.")
+        return
+    lines = [
+        f"intent: {task.get('intent')}",
+        f"project: {task.get('project_name')}",
+        f"step: {task.get('step')}",
+        f"started_at: {task.get('started_at')}",
+        f"updated_at: {task.get('updated_at')}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    task = get_current_task(chat_id)
+    if task:
+        lines = [
+            "Выполняется задача:",
+            f"intent: {task.get('intent')}",
+            f"project: {task.get('project_name')}",
+            f"step: {task.get('step')}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+        return
+    await reply_long(update.message, _format_last_action(get_last_action(chat_id)))
+
+
 def selftest_workspace_result() -> dict:
     if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
         return {
@@ -2914,6 +3260,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if _wants_preview(user_text):
                     await progress(update.message, "Шаг 4/5: запускаю preview...")
                     await progress(update.message, "Шаг 5/5: проверяю curl...")
+            elif pending_task == "edit_workspace_site":
+                await progress(update.message, "Шаг 1/6: читаю текущие файлы проекта...")
+                await progress(update.message, "Шаг 2/6: прошу Ollama сгенерировать изменения...")
+                await progress(update.message, "Шаг 3/6: проверяю JSON...")
+                await progress(update.message, "Шаг 4/6: записываю файлы...")
+                await progress(update.message, "Шаг 5/6: проверяю структуру проекта...")
             else:
                 await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
                 await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")
@@ -2944,7 +3296,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
             debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
 
-        if pending_task and pending_task != "create_workspace_project":
+        if pending_task == "edit_workspace_site":
+            await progress(update.message, "Шаг 6/6: проверяю preview...")
+        elif pending_task and pending_task != "create_workspace_project":
             await progress(update.message, "Шаг 4/4: готовлю ответ...")
 
         await maybe_send_intent_debug(update.message, context, debug_info)
@@ -3098,6 +3452,9 @@ def main():
     app.add_handler(CommandHandler("bot_logs", bot_logs_command))
     app.add_handler(CommandHandler("last_error", last_error_command))
     app.add_handler(CommandHandler("last_action", last_action_command))
+    app.add_handler(CommandHandler("edit_site", edit_site_command))
+    app.add_handler(CommandHandler("current_task", current_task_command))
+    app.add_handler(CommandHandler("progress", progress_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("forget", forget_command))

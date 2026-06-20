@@ -86,3 +86,42 @@ def validate_create_static_site_action(data: dict[str, Any], expected_project_na
         "files": normalized_files,
         "start_preview": bool(data.get("start_preview", True)),
     }
+
+
+def validate_edit_workspace_site_action(data: dict[str, Any], expected_project_name: str | None = None) -> dict[str, Any]:
+    if data.get("action") != "edit_workspace_site":
+        raise ToolError("action должен быть edit_workspace_site")
+    project_name = str(data.get("project_name") or expected_project_name or "").strip()
+    if not project_name:
+        raise ToolError("project_name обязателен")
+    if expected_project_name and project_name != expected_project_name:
+        raise ToolError(f"project_name не совпадает: {project_name} != {expected_project_name}")
+    files = data.get("files")
+    if not isinstance(files, list) or not files:
+        raise ToolError("files должен быть непустым массивом")
+    normalized_files = []
+    seen = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise ToolError("Каждый files item должен быть объектом")
+        relative_path = _validate_relative_file_path(item.get("path", ""))
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ToolError(f"content обязателен для {relative_path}")
+        if "\x00" in content:
+            raise ToolError(f"Бинарное содержимое запрещено: {relative_path}")
+        if relative_path in seen:
+            raise ToolError(f"Дубликат файла в edit spec: {relative_path}")
+        seen.add(relative_path)
+        normalized_files.append({"path": relative_path, "content": content})
+    notes = data.get("notes")
+    if not isinstance(notes, list):
+        notes = []
+    notes = [str(item) for item in notes if isinstance(item, (str, int, float))][:20]
+    return {
+        "action": "edit_workspace_site",
+        "project_name": project_name,
+        "summary": str(data.get("summary") or "")[:500],
+        "files": normalized_files,
+        "notes": notes,
+    }

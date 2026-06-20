@@ -8,6 +8,7 @@ ALLOWED_INTENTS = {
     "workspace_inventory",
     "create_static_site",
     "create_and_preview",
+    "edit_workspace_site",
     "where_project",
     "preview_start",
     "preview_stop",
@@ -36,15 +37,20 @@ ACTION_VERBS_RU = (
     "создай", "создать", "сделай", "сделать", "запусти", "запустить",
     "останови", "остановить", "удали", "удалить", "выключи", "выключить",
     "отключи", "отключить", "стопни", "снеси", "снести",
+    "поменяй", "поменять", "измени", "изменить", "отредактируй", "редактируй",
+    "добавь", "добавить", "обнови", "обновить",
 )
 ACTION_VERBS_EN = (
     "create", "make", "build", "start", "launch", "spin up",
     "stop", "delete", "remove", "kill", "shut down", "shutdown", "tear down",
+    "edit", "change", "modify", "update", "add",
 )
 ACTION_VERBS_ES = (
     "crea", "crear", "haz", "hacer", "inicia", "iniciar", "levanta", "levantar",
     "para", "parar", "detén", "detener", "elimina", "eliminar", "borra", "borrar",
     "apaga", "apagar",
+    "cambia", "cambiar", "modifica", "modificar", "edita", "editar",
+    "añade", "añadir", "agrega", "agregar", "actualiza", "actualizar",
 )
 ACTION_VERBS = ACTION_VERBS_RU + ACTION_VERBS_EN + ACTION_VERBS_ES
 
@@ -93,6 +99,18 @@ Allowed intents and their MEANING (not literal phrases):
   started immediately. Examples: "создай сайт sitebota и запусти сервер",
   "create a landing page called sitebota and give me a local URL",
   "crea una web sitebota y levanta un servidor temporal".
+
+- edit_workspace_site: user wants an EXISTING workspace site's content/design changed —
+  style, colors, text, sections, widgets — NOT a brand new site. This includes vague
+  requests that only make sense in context (e.g. right after talking about a specific
+  project). Examples (ru/en/es): "поменяй стиль сайта на зеленый", "измени дизайн",
+  "добавь погоду", "добавь блок", "добавь кнопку", "сделай зеленый стиль",
+  "поменяй стиль сайта на зеленый и добавь погоду в Бильбао", "edit the site",
+  "change the design", "change the style", "update the site", "añade el tiempo",
+  "cambia el estilo", "cambia el diseño", "modifica el sitio". If no project is named in
+  the message, set project_name to null — the backend will use the current/last project
+  from context. This intent must NEVER be confused with preview_stop or
+  workspace_delete: changing a site's look never means stopping or removing it.
 
 - where_project: user asks where a specific existing project lives or how to open it
   (path/URL). Examples: "где ты создал sitebota?", "where can I open sitebota?",
@@ -269,10 +287,13 @@ def classify_intent(
     if ask_model is None:
         return _failure_result("no_model_or_empty_text")
 
-    try:
-        messages = build_router_messages(user_text, recent_messages, current_project, last_action)
-        raw = ask_model(messages)
-        data = _extract_json(raw)
-        return _normalize_classification(data)
-    except Exception as e:
-        return _failure_result(f"router_error: {e}")
+    messages = build_router_messages(user_text, recent_messages, current_project, last_action)
+    last_error: Exception | None = None
+    for _attempt in range(2):
+        try:
+            raw = ask_model(messages)
+            data = _extract_json(raw)
+            return _normalize_classification(data)
+        except Exception as e:
+            last_error = e
+    return _failure_result(f"router_error: {last_error}")

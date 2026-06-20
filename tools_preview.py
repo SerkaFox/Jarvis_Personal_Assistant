@@ -177,6 +177,10 @@ def curl_check(port: int) -> dict[str, Any]:
     return _curl_localhost(int(port))
 
 
+def preview_url_for_port(port: int) -> str:
+    return _preview_url(int(port))
+
+
 def is_own_preview_process(record: dict[str, Any]) -> bool:
     return _is_own_preview_process(record)
 

@@ -214,7 +214,8 @@ class EditWorkflowSmokeTests(unittest.TestCase):
         action = get_last_action("test")
         self.assertEqual(action["intent"], "edit_workspace_site")
         self.assertTrue(action["success"])
-        self.assertIn("Отредактировал сайт sitebota", answer)
+        self.assertIn("изменил сайт sitebota", answer)
+        self.assertNotIn("tools_called", answer)
 
     def test_edit_workflow_uses_lan_url_from_server_host(self):
         from bot import edit_workspace_site_workflow
@@ -246,7 +247,7 @@ class EditWorkflowSmokeTests(unittest.TestCase):
 
         self.assertNotIn("start_preview", debug["tools_called"])
         self.assertFalse(preview_status("sitebota_stopped")["running"])
-        self.assertIn("preview: не запущен", answer)
+        self.assertIn("Preview не запущен", answer)
 
     def test_edit_workflow_missing_project_returns_error_without_crash(self):
         from bot import edit_workspace_site_workflow
@@ -287,8 +288,9 @@ class EditWorkflowSmokeTests(unittest.TestCase):
         create_static_site("sitebota_where")
         start_preview("sitebota_where")
         answer, _debug = workspace_where_answer("sitebota_where", chat_id="test")
-        url_line = next(line for line in answer.splitlines() if line.startswith("url:"))
-        self.assertTrue(url_line.startswith("url: http://192.168.0.50:"))
+        url_line = next(line for line in answer.splitlines() if line.startswith("Открыть сайт:"))
+        self.assertTrue(url_line.startswith("Открыть сайт: http://192.168.0.50:"))
+        self.assertNotIn("tools_called", answer)
 
 
 if __name__ == "__main__":

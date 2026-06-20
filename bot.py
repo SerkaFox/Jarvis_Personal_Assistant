@@ -37,6 +37,7 @@ from tools_system import get_allowed_services, read_journal
 from tools_preview import (
     cleanup_stale_previews,
     curl_check,
+    detect_lan_ip,
     list_previews,
     port_is_listening,
     preview_status,
@@ -45,6 +46,14 @@ from tools_preview import (
     start_preview,
     stop_preview,
     stop_preview_by_port,
+)
+from tools_browser import check_site_with_playwright, playwright_available
+from tools_media import (
+    convert_to_webp,
+    list_project_images,
+    pillow_available,
+    save_telegram_image_to_project,
+    set_hero_background,
 )
 from tools_errors import error_summary, latest_error, mask_error_text, save_last_error
 from tools_write import (
@@ -542,19 +551,89 @@ def ask_ollama_for_site_edit(user_text: str, project_name: str, current_files: l
 Запрос пользователя:
 {user_text}
 """.strip()
-    raw = ask_ollama_messages(
-        [
-            {
-                "role": "system",
-                "content": "Ты генератор JSON edit specs для Jarvis backend. Возвращай только валидный JSON с полным содержимым измененных файлов.",
-            },
-            {"role": "user", "content": prompt},
-        ]
-    )
-    if looks_like_fake_action_response(raw):
-        raise RuntimeError("Ollama попыталась заменить JSON edit текстовыми shell-командами")
-    data = extract_json_object(raw)
-    return validate_edit_workspace_site_action(data, expected_project_name=project_name)
+    messages = [
+        {
+            "role": "system",
+            "content": "Ты генератор JSON edit specs для Jarvis backend. Возвращай только валидный JSON с полным содержимым измененных файлов.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    last_error: Exception | None = None
+    for attempt in range(2):
+        raw = ask_ollama_messages(messages)
+        try:
+            if looks_like_fake_action_response(raw):
+                raise ToolError("Ollama попыталась заменить JSON edit текстовыми shell-командами")
+            data = extract_json_object(raw)
+            return validate_edit_workspace_site_action(data, expected_project_name=project_name)
+        except (ToolError, RuntimeError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Ты вернул невалидный JSON. Исправь и верни только JSON без markdown, без пояснений, без ``` оберток.",
+                }
+            )
+    raise last_error or ToolError("Не удалось получить валидный JSON edit spec от Ollama")
+
+
+def format_user_result(headline: str, info: dict | None = None) -> str:
+    """Human-friendly summary for normal chat mode. No tools_called/WRITE_ROOT/raw JSON."""
+    info = info or {}
+    lines = [headline] if headline else []
+    folder = info.get("resolved_path") or info.get("path") or info.get("actual_path")
+    if folder:
+        lines.append(f"Папка: {folder}")
+    created = info.get("created_files")
+    if created:
+        lines.append("Создал файлы:")
+        lines.extend(f"- {path}" for path in created)
+    modified = info.get("modified_files")
+    if modified:
+        lines.append("Изменил файлы:")
+        lines.extend(f"- {path}" for path in modified)
+    deleted = info.get("deleted_files")
+    if deleted:
+        lines.append("Удалил файлы:")
+        lines.extend(f"- {path}" for path in deleted)
+    open_url = info.get("preview_url")
+    if open_url:
+        lines.append(f"Открыть сайт: {open_url}")
+    elif info.get("preview_note"):
+        lines.append(info["preview_note"])
+    notes = info.get("notes")
+    if notes:
+        notes_text = "; ".join(str(n) for n in notes) if isinstance(notes, (list, tuple)) else str(notes)
+        lines.append(f"Заметки: {notes_text}")
+    if info.get("warning"):
+        lines.append(f"⚠️ {info['warning']}")
+    return "\n".join(lines)
+
+
+def format_debug_result(info: dict | None = None) -> str:
+    """Technical dump shown only when /debug_on (agent_debug) is active."""
+    info = info or {}
+    lines = ["--- debug ---", f"tools_called: {', '.join(info.get('tools_called') or []) or '-'}"]
+    lines.append(f"рабочая папка Jarvis: {config.get_write_root()}")
+    path_value = info.get("resolved_path") or info.get("path") or info.get("actual_path")
+    if path_value:
+        lines.append(f"actual_path: {path_value}")
+    if info.get("created_files"):
+        lines.append(f"created_files: {', '.join(info['created_files'])}")
+    if info.get("modified_files"):
+        lines.append(f"modified_files: {', '.join(info['modified_files'])}")
+    if info.get("deleted_files"):
+        lines.append(f"deleted_files: {', '.join(info['deleted_files'])}")
+    if "preview_url" in info:
+        lines.append(f"preview_url: {info.get('preview_url') or '-'}")
+    if "curl_check" in info:
+        lines.append(f"curl_check: {info.get('curl_check')}")
+    if "browser_check" in info:
+        lines.append(f"browser_check: {info.get('browser_check')}")
+    if info.get("errors"):
+        lines.append(f"errors: {'; '.join(str(e) for e in info['errors'])}")
+    return "\n".join(lines)
 
 
 def _format_write_success(
@@ -565,72 +644,68 @@ def _format_write_success(
     modified: list[str] | None = None,
     deleted: list[str] | None = None,
     preview_url: str | None = None,
+    debug: bool = False,
 ) -> str:
-    lines = [
-        action,
-        f"tools_called: {', '.join(tools_called)}",
-        f"actual_path: {actual_path}",
-    ]
-    if created is not None:
-        lines.append("created files:")
-        lines.extend(f"- {path}" for path in created)
-    if modified is not None:
-        lines.append("modified files:")
-        lines.extend(f"- {path}" for path in modified)
-    if deleted is not None:
-        lines.append("deleted files:")
-        lines.extend(f"- {path}" for path in deleted)
-    if preview_url:
-        lines.append(f"preview_url: {preview_url}")
-    else:
-        lines.append("preview command: /preview_start <project>")
-    return "\n".join(lines)
+    info = {
+        "tools_called": tools_called,
+        "resolved_path": actual_path,
+        "created_files": created,
+        "modified_files": modified,
+        "deleted_files": deleted,
+        "preview_url": preview_url,
+    }
+    if not preview_url:
+        info["preview_note"] = "Preview не запущен. Команда: /preview_start <project>"
+    text = format_user_result(action, info)
+    if debug:
+        text += "\n\n" + format_debug_result(info)
+    return text
 
 
-def _format_stop_result(label: str, result: dict) -> str:
+def _format_stop_result(label: str, result: dict, debug: bool = False) -> str:
     checks = result.get("checks") or {}
-    lines = [label, f"success: {bool(result.get('success'))}"]
-    if "project" in result:
-        lines.append(f"project: {result.get('project')}")
-    if "port" in result:
-        lines.append(f"port: {result.get('port')}")
-    if "pid" in result:
-        lines.append(f"pid: {result.get('pid')}")
-    path_value = result.get("path") or result.get("cwd") or "-"
-    lines.append(f"path: {path_value}")
-    if result.get("success"):
-        if checks:
-            lines.append("verification: процесс завершен, порт закрыт, curl больше не отвечает")
-        else:
-            lines.append(f"verification: {result.get('reason') or 'нечего было останавливать'}")
+    success = bool(result.get("success"))
+    project = result.get("project")
+    path_value = result.get("path") or result.get("cwd") or ""
+    if success:
+        headline = f"Остановил preview {project}." if project else "Остановил preview."
     else:
-        lines.append(
-            "verification: process_alive={} port_listening={} curl_responds={}".format(
-                checks.get("process_alive"), checks.get("port_listening"), checks.get("curl_responds")
-            )
-        )
-        if result.get("error"):
-            lines.append(f"error: {result['error']}")
+        headline = f"Не смог остановить preview {project}." if project else "Не смог остановить preview."
+    info: dict = {"resolved_path": path_value}
+    lines = [format_user_result(headline, info)]
+    if result.get("port"):
+        lines.append(f"Порт: {result.get('port')}")
+    if not success and result.get("error"):
+        lines.append(f"Причина: {result['error']}")
+    if debug:
+        debug_info = {
+            "tools_called": [label.split(" ")[0]],
+            "resolved_path": path_value,
+        }
+        lines.append("")
+        lines.append(format_debug_result(debug_info))
+        lines.append(f"pid: {result.get('pid', '-')} checks: {checks}")
     return "\n".join(lines)
 
 
-def _format_delete_result(result: dict) -> str:
+def _format_delete_result(result: dict, debug: bool = False) -> str:
+    success = bool(result.get("success"))
+    project_name = result.get("project_name")
     verification = result.get("verification") or {}
-    lines = [
-        "delete_workspace_dir result:",
-        f"project_name: {result.get('project_name')}",
-        f"path: {result.get('path')}",
-        f"success: {bool(result.get('success'))}",
-    ]
-    if result.get("success"):
-        lines.append("verification: папка отсутствует")
-    else:
-        lines.append(f"verification: exists_after={verification.get('exists_after')}")
-        if result.get("error"):
-            lines.append(f"error: {result['error']}")
+    headline = f"Удалил проект {project_name}." if success else f"Не смог удалить проект {project_name}."
+    info = {"resolved_path": result.get("path")}
+    lines = [format_user_result(headline, info)]
     preview_stop = result.get("preview_stop")
     if preview_stop is not None:
-        lines.append(f"preview_stop.success: {bool(preview_stop.get('success'))}")
+        lines.append("Preview тоже остановлен." if preview_stop.get("success") else "Preview не подтвержден как остановленный.")
+    if not success and result.get("error"):
+        lines.append(f"Причина: {result['error']}")
+    if debug:
+        lines.append("")
+        lines.append(format_debug_result({"tools_called": ["delete_workspace_dir"], "resolved_path": result.get("path")}))
+        lines.append(f"verification: {verification}")
+        if preview_stop is not None:
+            lines.append(f"preview_stop: {preview_stop}")
     return "\n".join(lines)
 
 
@@ -681,15 +756,16 @@ def _format_stop_all_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def workspace_where_answer(project_name: str | None, chat_id: str | None = None) -> tuple[str, dict]:
+def workspace_where_answer(project_name: str | None, chat_id: str | None = None, debug: bool = False) -> tuple[str, dict]:
     tools_called = ["verify_project_files", "preview_status"]
     if not project_name:
         action = get_last_action(chat_id)
         if not action or not action.get("success"):
+            text = "Не вижу подтвержденного созданного сайта. Укажи имя проекта: /where <project>"
+            if debug:
+                text += "\n\n" + format_debug_result({"tools_called": []})
             return (
-                "Я не вижу подтверждения, что сайт был создан. Проверяю workspace...\n"
-                f"WRITE_ROOT: {config.get_write_root()}\n"
-                "Проект не определен. Укажи имя: /where <project>",
+                text,
                 {"detected": {"intent": "where_project"}, "tools_called": [], "errors": ["project not resolved"]},
             )
         project_name = str(action["project_name"])
@@ -698,45 +774,30 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
     status = preview_status(project_name)
     port = status.get("port")
     port_listening = bool(port) and port_is_listening(int(port))
+    curl_result = status.get("curl_check")
+    running = bool(status.get("running"))
+    preview_url = preview_url_for_port(int(port)) if running and port else ""
+
     if not exists:
-        answer = "\n".join(
-            [
-                "Я не вижу подтверждения, что сайт был создан. Проверяю workspace...",
-                f"project_name: {project_name}",
-                "exists: false",
-                f"path: {verify['path']}",
-                "Проект не найден в WRITE_ROOT",
-                f"preview registered: {status.get('registered', False)}",
-                f"port listening: {port_listening}",
-            ]
-        )
+        headline = f"Не нашел проект {project_name} в рабочей папке Jarvis."
+        answer = format_user_result(headline, {"resolved_path": verify["path"]})
     else:
-        required = {
-            "index": str(Path(verify["path"]) / "index.html"),
-            "css": str(Path(verify["path"]) / "assets" / "css" / "style.css"),
-            "js": str(Path(verify["path"]) / "assets" / "js" / "main.js"),
-            "readme": str(Path(verify["path"]) / "README.md"),
+        headline = f"Сайт {project_name} запущен." if running else f"Проект {project_name} на месте, но preview не запущен."
+        info: dict = {"resolved_path": verify["path"], "preview_url": preview_url}
+        if not running:
+            info["preview_note"] = f"Команда для запуска: /preview_start {project_name}"
+        answer = format_user_result(headline, info)
+
+    if debug:
+        debug_info = {
+            "tools_called": tools_called,
+            "resolved_path": verify.get("path"),
+            "preview_url": preview_url,
+            "curl_check": curl_result,
         }
-        lines = [
-            f"project_name: {project_name}",
-            "exists: true",
-            f"path: {verify['path']}",
-            "files exist:",
-        ]
-        lines.extend(f"- {key}: {Path(path).is_file()} ({path})" for key, path in required.items())
-        lines.append(f"preview registered: {status.get('registered', False)}")
-        lines.append(f"preview running: {status.get('running', False)}")
-        lines.append(f"port listening: {port_listening}")
-        curl_check = status.get("curl_check")
-        if curl_check:
-            lines.append(f"curl status: {curl_check}")
-        else:
-            lines.append("curl status: -")
-        if status.get("running") and port:
-            lines.append(f"url: {preview_url_for_port(int(port))}")
-        else:
-            lines.append("url: -")
-        answer = "\n".join(lines)
+        answer += "\n\n" + format_debug_result(debug_info)
+        answer += f"\nport listening: {port_listening}; preview registered: {status.get('registered', False)}"
+
     return (
         answer,
         {
@@ -745,6 +806,8 @@ def workspace_where_answer(project_name: str | None, chat_id: str | None = None)
             "errors": [] if exists else ["project not found"],
             "resolved_path": verify.get("path"),
             "project": project_name,
+            "preview_url": preview_url,
+            "curl_check": curl_result,
         },
     )
 
@@ -827,15 +890,14 @@ def create_site_workflow(
             }
         )
         save_last_action(chat_id, action)
+        headline = f"Готово! Я создал сайт {project['project_name']}." if not preview else f"Готово! Я создал сайт {project['project_name']} и запустил предпросмотр."
         answer = _format_write_success(
-            "Создал проект в WRITE_ROOT." if not preview else "Создал проект в WRITE_ROOT и запустил preview.",
+            headline,
             tools_called,
             project["path"],
             created=created_files,
             preview_url=preview["url"] if preview else None,
         )
-        if curl_check:
-            answer += f"\ncurl_check: success={curl_check['success']} status={curl_check['status_code']} url={curl_check['url']}"
         return (
             answer,
             {
@@ -867,6 +929,112 @@ RESTART_PREVIEW_WORDS = (
     "start", "restart", "check", "launch",
     "inicia", "reinicia", "comprueba", "verifica", "arranca",
 )
+
+LANGUAGE_TASK_WORDS = (
+    "язык", "language", "idioma", "переключ", "switch lang", "ru/en/es", "en/es/ru", "мультиязыч",
+)
+ANIMATION_TASK_WORDS = (
+    "360", "rotate", "вращ", "анимац", "animation", "крутит", "переворач", "spin",
+)
+
+
+def _mentions_languages(text: str) -> bool:
+    lowered = text.lower()
+    if any(word in lowered for word in LANGUAGE_TASK_WORDS):
+        return True
+    hits = sum(1 for code in ("ru", "en", "es", "русск", "англ", "испан", "español", "ingl") if code in lowered)
+    return hits >= 2
+
+
+def _mentions_animation(text: str) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in ANIMATION_TASK_WORDS)
+
+
+def _check_language_support(haystack: str) -> tuple[bool, str]:
+    lowered = haystack.lower()
+
+    def has_lang(code: str) -> bool:
+        patterns = (f'"{code}"', f"'{code}'", f'data-lang="{code}"', f"lang-{code}", f">{code}<", f'id="{code}"')
+        return any(p in lowered for p in patterns)
+
+    missing = [code.upper() for code in ("ru", "es", "en") if not has_lang(code)]
+    if missing:
+        return False, f"не найдены языковые маркеры: {', '.join(missing)}"
+
+    has_click_handler = ("addeventlistener" in lowered or "onclick" in lowered) and "lang" in lowered
+    if not has_click_handler:
+        return False, "не найден обработчик клика для переключения языка"
+
+    main_idx = lowered.find("<main")
+    if main_idx == -1:
+        main_idx = lowered.find("<section")
+    lang_marker_positions = [
+        idx for idx in (lowered.find("data-lang"), lowered.find("lang-switch"), lowered.find("lang-btn")) if idx != -1
+    ]
+    if lang_marker_positions and main_idx != -1 and min(lang_marker_positions) > main_idx:
+        return False, "языковые кнопки не похожи на расположенные в header/верхнем углу"
+    return True, "ok"
+
+
+def _check_animation(haystack: str) -> tuple[bool, str]:
+    lowered = haystack.lower().replace(" ", "")
+    has_rotate = "rotatey(360deg)" in lowered or "rotatex(360deg)" in lowered or "rotate(360deg)" in lowered
+    if not has_rotate:
+        return False, "не найден rotateY(360deg)/rotate(360deg) в CSS/JS"
+    has_anim_marker = "@keyframes" in lowered or "animation:" in lowered or "animation-name" in lowered or "classlist" in lowered
+    if not has_anim_marker:
+        return False, "не найден класс/animation для карточек или букв"
+    return True, "ok"
+
+
+def _check_sections_preserved(before_haystack: str, after_haystack: str) -> tuple[bool, str]:
+    before_sections = before_haystack.lower().count("<section")
+    after_sections = after_haystack.lower().count("<section")
+    before_cards = before_haystack.lower().count("card")
+    after_cards = after_haystack.lower().count("card")
+    if before_sections and after_sections < before_sections:
+        return False, f"количество <section> уменьшилось: {before_sections} -> {after_sections}"
+    if before_cards and after_cards < max(1, before_cards // 2):
+        return False, f"похоже пропали карточки (card): {before_cards} -> {after_cards}"
+    return True, "ok"
+
+
+def run_acceptance_checks(
+    user_text: str,
+    before_files: list[dict],
+    after_files: list[dict],
+    browser_result: dict | None = None,
+) -> dict:
+    before_haystack = "\n".join(f["content"] for f in before_files)
+    after_haystack = "\n".join(f["content"] for f in after_files)
+    failed: list[str] = []
+    checks: dict = {}
+
+    if _mentions_languages(user_text):
+        ok, detail = _check_language_support(after_haystack)
+        checks["languages"] = {"ok": ok, "detail": detail}
+        if not ok:
+            failed.append(f"языки: {detail}")
+
+    if _mentions_animation(user_text):
+        ok, detail = _check_animation(after_haystack)
+        checks["animation"] = {"ok": ok, "detail": detail}
+        if not ok:
+            failed.append(f"анимация 360°: {detail}")
+
+    if after_files:
+        ok, detail = _check_sections_preserved(before_haystack, after_haystack)
+        checks["sections_preserved"] = {"ok": ok, "detail": detail}
+        if not ok:
+            failed.append(f"секции/карточки: {detail}")
+
+    if browser_result and not browser_result.get("skipped") and browser_result.get("success") is False:
+        reason = "; ".join(browser_result.get("errors") or browser_result.get("console_errors") or ["сайт не загрузился корректно"])
+        checks["browser"] = browser_result
+        failed.append(f"браузерная проверка: {reason}")
+
+    return {"success": not failed, "failed": failed, "checks": checks}
 
 
 def edit_workspace_site_workflow(
@@ -901,9 +1069,28 @@ def edit_workspace_site_workflow(
         tools_called.append("read_workspace_project_files")
         if not read_result["files"]:
             raise RuntimeError("Не нашел текстовых файлов проекта для редактирования")
+        before_files = read_result["files"]
 
         update_current_task_step(chat_id, "asking_ollama")
-        spec = ask_ollama_for_site_edit(user_text, project_name, read_result["files"])
+        try:
+            spec = ask_ollama_for_site_edit(user_text, project_name, before_files)
+        except Exception as e:
+            action["error"] = str(e)
+            action["tools_called"] = tools_called
+            save_last_action(chat_id, action)
+            save_last_error(
+                chat_id=chat_id or "", user_id="", handler="edit_workspace_site_workflow.ask_ollama", error=e, user_text=user_text
+            )
+            clear_current_task(chat_id)
+            friendly = "Не смог получить корректный план изменений от модели. Я не стал трогать файлы, чтобы не сломать сайт."
+            return (
+                friendly,
+                {
+                    "detected": {"intent": "edit_workspace_site", "project": project_name},
+                    "tools_called": tools_called,
+                    "errors": [str(e)],
+                },
+            )
         tools_called.append("ask_ollama_for_site_edit")
         tools_called.append("validate_edit_workspace_site_action")
 
@@ -919,6 +1106,38 @@ def edit_workspace_site_workflow(
         if not verify["exists"]:
             raise RuntimeError("Проект не найден после редактирования")
 
+        update_current_task_step(chat_id, "checking_acceptance")
+        after_read = read_workspace_project_files(project_name)
+        tools_called.append("read_workspace_project_files")
+        acceptance = run_acceptance_checks(user_text, before_files, after_read["files"])
+        tools_called.append("run_acceptance_checks")
+
+        if not acceptance["success"]:
+            repair_text = (
+                user_text
+                + "\n\nИСПРАВЬ предыдущую попытку, она не прошла проверку: "
+                + "; ".join(acceptance["failed"])
+                + ". Сохрани остальной существующий функционал сайта."
+            )
+            try:
+                spec_repair = ask_ollama_for_site_edit(repair_text, project_name, after_read["files"])
+                tools_called.append("ask_ollama_for_site_edit_repair")
+                write_result_repair = apply_file_updates(project_name, spec_repair["files"])
+                tools_called.append("apply_file_updates")
+                if write_result_repair["success"]:
+                    write_result["modified_files"] = list(
+                        dict.fromkeys(write_result["modified_files"] + write_result_repair["modified_files"])
+                    )
+                    spec["summary"] = spec_repair.get("summary") or spec.get("summary")
+                    if spec_repair.get("notes"):
+                        spec["notes"] = spec_repair["notes"]
+                    after_read = read_workspace_project_files(project_name)
+                    tools_called.append("read_workspace_project_files")
+                    acceptance = run_acceptance_checks(user_text, before_files, after_read["files"])
+                    tools_called.append("run_acceptance_checks")
+            except Exception:
+                pass
+
         update_current_task_step(chat_id, "checking_preview")
         status = preview_status(project_name)
         tools_called.append("preview_status")
@@ -930,17 +1149,31 @@ def edit_workspace_site_workflow(
 
         preview_url = ""
         curl_result = None
+        browser_result = None
         if status.get("running") and status.get("port"):
             curl_result = curl_check(int(status["port"]))
             preview_url = preview_url_for_port(int(status["port"]))
             tools_called.append("curl_check")
+            try:
+                if playwright_available():
+                    update_current_task_step(chat_id, "browser_check")
+                    browser_result = check_site_with_playwright(project_name, f"http://127.0.0.1:{status['port']}/")
+                    tools_called.append("check_site_with_playwright")
+                    if browser_result.get("success") is False:
+                        reason = "; ".join(
+                            browser_result.get("errors") or browser_result.get("console_errors") or ["проверка не прошла"]
+                        )
+                        acceptance["failed"].append(f"браузерная проверка: {reason}")
+                        acceptance["success"] = False
+            except Exception as browser_exc:
+                browser_result = {"success": None, "skipped": True, "reason": str(browser_exc)}
 
         if chat_id:
             memory.set_current_project(chat_id, project_name)
 
         action.update(
             {
-                "success": True,
+                "success": bool(acceptance["success"]),
                 "path": verify["path"],
                 "modified_files": write_result["modified_files"],
                 "preview_url": preview_url,
@@ -951,31 +1184,36 @@ def edit_workspace_site_workflow(
         save_last_action(chat_id, action)
         clear_current_task(chat_id)
 
-        answer_lines = [
-            f"Отредактировал сайт {project_name}.",
-            f"tools_called: {', '.join(tools_called)}",
-            f"summary: {spec.get('summary') or '-'}",
-            "modified files:",
-        ]
-        answer_lines.extend(f"- {path}" for path in write_result["modified_files"])
-        if preview_url:
-            answer_lines.append(f"preview_url: {preview_url}")
-            if curl_result:
-                answer_lines.append(f"curl_check: success={curl_result.get('success')} status={curl_result.get('status')}")
+        info = {
+            "resolved_path": verify["path"],
+            "modified_files": write_result["modified_files"],
+            "preview_url": preview_url,
+            "notes": spec.get("notes"),
+        }
+        if not preview_url:
+            info["preview_note"] = "Preview не запущен (я его не запускал и не останавливал)."
+
+        if acceptance["success"]:
+            headline = f"Готово! Я изменил сайт {project_name}: {spec.get('summary') or 'внес изменения по запросу'}."
+            answer = format_user_result(headline, info)
         else:
-            answer_lines.append("preview: не запущен (не перезапускал и не останавливал)")
-        if spec.get("notes"):
-            answer_lines.append("notes: " + "; ".join(spec["notes"]))
+            headline = "Изменения применены частично, проверка не прошла: " + "; ".join(acceptance["failed"])
+            info["warning"] = "Проверь сайт вручную, прежде чем считать задачу завершенной."
+            answer = format_user_result(headline, info)
+
         return (
-            "\n".join(answer_lines),
+            answer,
             {
                 "detected": {"intent": "edit_workspace_site", "project": project_name},
                 "tools_called": tools_called,
-                "errors": [],
+                "errors": [] if acceptance["success"] else acceptance["failed"],
                 "resolved_path": verify["path"],
                 "project": project_name,
                 "modified_files": write_result["modified_files"],
                 "preview_url": preview_url,
+                "curl_check": curl_result,
+                "browser_check": browser_result,
+                "acceptance": acceptance,
             },
         )
     except Exception as e:
@@ -1262,7 +1500,7 @@ def _workspace_edit_answer(user_text: str, chat_id: str | None) -> tuple[str, di
         )
     except Exception as e:
         return (
-            f"Не смог изменить проект в WRITE_ROOT: {e}",
+            f"Не смог изменить проект: {e}",
             {"detected": detected, "tools_called": ["read_workspace_file", "update_static_site_file"], "errors": [str(e)]},
         )
 
@@ -1302,13 +1540,13 @@ def write_mode_answer(user_text: str, chat_id: str | None = None) -> tuple[str, 
                 },
             )
             return (
-                _format_write_success("Создал Flask-проект в WRITE_ROOT.", ["create_flask_site"], data["path"], created=data["created_files"]),
+                _format_write_success("Готово! Создал Flask-проект.", ["create_flask_site"], data["path"], created=data["created_files"]),
                 {"detected": detected, "tools_called": ["create_flask_site"], "errors": [], "resolved_path": data["path"], "project": data["project_name"]},
             )
         except Exception as e:
             save_last_action(chat_id, {"intent": "create_flask_site", "project_name": name, "success": False, "error": str(e), "tools_called": ["create_flask_site"]})
             save_last_error(chat_id=chat_id or "", user_id="", handler="write_mode_answer", error=e, user_text=user_text)
-            return (f"Не смог создать Flask-проект в WRITE_ROOT: {e}", {"detected": detected, "tools_called": ["create_flask_site"], "errors": [str(e)]})
+            return (f"Не смог создать Flask-проект: {e}", {"detected": detected, "tools_called": ["create_flask_site"], "errors": [str(e)]})
     return create_site_workflow(user_text, project_name=name, chat_id=chat_id, start_preview_requested=True)
 
 
@@ -1834,6 +2072,34 @@ async def progress(message, text: str):
         await message.reply_text(safe_text)
 
 
+class ProgressTracker:
+    """Edits a single Telegram message in place across workflow steps when possible,
+    falling back to a new message if editing fails (e.g. message too old)."""
+
+    def __init__(self, message):
+        self._message = message
+        self._sent = None
+
+    async def step(self, text: str) -> None:
+        safe_text = mask_error_text(text)[:900]
+        logging.info("progress %s", safe_text)
+        if not self._message:
+            return
+        if self._sent is None:
+            try:
+                self._sent = await self._message.reply_text(safe_text)
+            except Exception:
+                self._sent = None
+            return
+        try:
+            await self._sent.edit_text(safe_text)
+        except Exception:
+            try:
+                self._sent = await self._message.reply_text(safe_text)
+            except Exception:
+                self._sent = None
+
+
 def _error_context(update: Update | None) -> tuple[str, str, str]:
     if not update:
         return "", "", ""
@@ -2226,10 +2492,11 @@ async def new_static_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await reply_long(
             update.message,
             _format_write_success(
-                "Создал статический сайт в WRITE_ROOT.",
+                "Создал статический сайт в рабочей папке Jarvis.",
                 ["create_static_site", "verify_static_site"],
                 data["path"],
                 created=data["created_files"],
+                debug=bool(context.user_data.get("agent_debug")),
             ),
         )
     except Exception as e:
@@ -2251,10 +2518,11 @@ async def new_flask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_long(
             update.message,
             _format_write_success(
-                "Создал Flask-проект в WRITE_ROOT.",
+                "Создал Flask-проект в рабочей папке Jarvis.",
                 ["create_flask_site"],
                 data["path"],
                 created=data["created_files"],
+                debug=bool(context.user_data.get("agent_debug")),
             ),
         )
     except Exception as e:
@@ -2313,10 +2581,11 @@ async def write_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await reply_long(
             update.message,
             _format_write_success(
-                "Записал файл в WRITE_ROOT.",
+                "Записал файл в рабочей папке Jarvis.",
                 ["write_text_file"],
                 result["path"],
                 modified=[result["path"]],
+                debug=bool(context.user_data.get("agent_debug")),
             ),
         )
     except Exception as e:
@@ -2334,10 +2603,11 @@ async def delete_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_long(
             update.message,
             _format_write_success(
-                "Удалил файл из WRITE_ROOT.",
+                "Удалил файл из рабочей папки Jarvis.",
                 ["delete_workspace_file"],
                 result["path"],
                 deleted=[result["path"]],
+                debug=bool(context.user_data.get("agent_debug")),
             ),
         )
     except Exception as e:
@@ -2370,10 +2640,11 @@ async def preview_start_command(update: Update, context: ContextTypes.DEFAULT_TY
         await reply_long(
             update.message,
             _format_write_success(
-                "Запустил preview для workspace-проекта.",
+                "Запустил preview для проекта.",
                 ["start_preview", "preview_status"],
                 result["path"],
-                preview_url=result["url"],
+                preview_url=preview_url_for_port(int(result["port"])),
+                debug=bool(context.user_data.get("agent_debug")),
             ),
         )
     except Exception as e:
@@ -2404,7 +2675,10 @@ async def preview_stop_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 "verification": result.get("checks"),
             },
         )
-        await reply_long(update.message, _format_stop_result("stop_preview result:", result))
+        await reply_long(
+            update.message,
+            _format_stop_result("stop_preview result:", result, debug=bool(context.user_data.get("agent_debug"))),
+        )
     except Exception as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_stop_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /preview_stop: {e}")
@@ -2436,7 +2710,10 @@ async def preview_stop_port_command(update: Update, context: ContextTypes.DEFAUL
                 "verification": result.get("checks"),
             },
         )
-        await reply_long(update.message, _format_stop_result("stop_preview_by_port result:", result))
+        await reply_long(
+            update.message,
+            _format_stop_result("stop_preview_by_port result:", result, debug=bool(context.user_data.get("agent_debug"))),
+        )
     except Exception as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="preview_stop_port_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /preview_stop_port: {e}")
@@ -2486,7 +2763,10 @@ async def workspace_delete_command(update: Update, context: ContextTypes.DEFAULT
                 "verification": result.get("verification"),
             },
         )
-        await reply_long(update.message, _format_delete_result(result))
+        await reply_long(
+            update.message,
+            _format_delete_result(result, debug=bool(context.user_data.get("agent_debug"))),
+        )
     except Exception as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="workspace_delete_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /workspace_delete: {e}")
@@ -2612,15 +2892,14 @@ async def edit_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, _ = chat_user_ids(update)
     project = context.args[0]
     task_text = " ".join(context.args[1:])
-    await progress(update.message, f"Принял: редактирую {project} через Ollama + tools.")
-    await progress(update.message, "Шаг 1/6: читаю текущие файлы проекта...")
-    await progress(update.message, "Шаг 2/6: прошу Ollama сгенерировать изменения...")
-    await progress(update.message, "Шаг 3/6: проверяю JSON...")
-    await progress(update.message, "Шаг 4/6: записываю файлы...")
-    await progress(update.message, "Шаг 5/6: проверяю структуру проекта...")
+    tracker = ProgressTracker(update.message)
+    await tracker.step("⏳ Принял задачу...")
+    await tracker.step("🧠 Генерирую изменения...")
+    await tracker.step("💾 Записываю файлы...")
+    await tracker.step("🧪 Проверяю сайт...")
     try:
         answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
-        await progress(update.message, "Шаг 6/6: проверяю preview...")
+        await tracker.step("✅ Готово.")
         await reply_long(update.message, answer)
         await maybe_send_intent_debug(update.message, context, debug)
     except Exception as e:
@@ -2662,6 +2941,165 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
         return
     await reply_long(update.message, _format_last_action(get_last_action(chat_id)))
+
+
+async def browser_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /browser_check <project>")
+        return
+    project = context.args[0]
+    try:
+        status = preview_status(project)
+        if not status.get("running") or not status.get("port"):
+            await update.message.reply_text(f"Preview для {project} не запущен. Сначала: /preview_start {project}")
+            return
+        if not playwright_available():
+            await update.message.reply_text("Playwright не установлен, браузерная проверка недоступна.")
+            return
+        result = check_site_with_playwright(project, f"http://127.0.0.1:{status['port']}/")
+        lines = [
+            f"Браузерная проверка {project}:",
+            f"success: {result.get('success')}",
+            f"title: {result.get('title') or '-'}",
+            f"body_present: {result.get('body_present')}",
+            f"language_buttons_found: {', '.join(result.get('language_buttons_found') or []) or '-'}",
+            f"language_switch_ok: {result.get('language_switch_ok')}",
+        ]
+        if result.get("console_errors"):
+            lines.append(f"console_errors: {'; '.join(result['console_errors'][:5])}")
+        if result.get("errors"):
+            lines.append(f"errors: {'; '.join(result['errors'][:5])}")
+        if result.get("screenshot_path"):
+            lines.append(f"screenshot: {result['screenshot_path']}")
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /browser_check: {e}")
+
+
+async def images_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /images <project>")
+        return
+    project = context.args[0]
+    try:
+        result = list_project_images(project)
+        if not result["images"]:
+            await update.message.reply_text(f"В {project} пока нет изображений в assets/img.")
+            return
+        lines = [f"Изображения проекта {project}:"]
+        lines.extend(f"- {img['name']} ({img['bytes']} bytes)" for img in result["images"])
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /images: {e}")
+
+
+async def set_background_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /set_background <project> <image_name>")
+        return
+    project, image_name = context.args[0], context.args[1]
+    chat_id, user_id = chat_user_ids(update)
+    try:
+        info = set_hero_background(project, f"assets/img/{image_name}")
+        task_text = (
+            f"Используй изображение {info['relative_path']} как фон hero-секции "
+            "(background-image, cover, по центру, без потери читаемости текста). Сохрани остальной функционал."
+        )
+        tracker = ProgressTracker(update.message)
+        await tracker.step("🧠 Обновляю CSS/HTML под новое фото...")
+        answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
+        await tracker.step("✅ Готово.")
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="set_background_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /set_background: {e}")
+
+
+IMAGE_CAPTION_PHRASES = (
+    "добавь на фон", "фон сайта", "добавь эту фотку", "добавь это фото", "добавь эту фото",
+    "используй как hero", "hero background", "добавь фото на сайт", "поставь как фон",
+    "добавь картинку", "вставь фото", "поставь фото",
+    "add to background", "use as hero", "as background", "set as background", "add this photo",
+    "fondo del sitio", "usa como fondo", "como hero",
+)
+
+
+def _wants_image_on_site(caption: str) -> bool:
+    if not caption:
+        return False
+    lowered = caption.lower()
+    return any(phrase in lowered for phrase in IMAGE_CAPTION_PHRASES)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    message = update.message
+    caption = message.caption or ""
+    chat_id, user_id = chat_user_ids(update)
+
+    if not _wants_image_on_site(caption):
+        await message.reply_text(
+            "Получил фото. Если хочешь добавить его на сайт, пришли с подписью вроде "
+            '"добавь на фон" или "используй как hero background".'
+        )
+        return
+
+    project = _workspace_project_from_context(caption, chat_id) or memory.get_current_project(chat_id)
+    if not project:
+        await message.reply_text("Не понял, для какого проекта это фото. Укажи имя проекта в подписи.")
+        return
+
+    tracker = ProgressTracker(message)
+    await tracker.step("⏳ Принял фото...")
+    try:
+        if message.photo:
+            tg_photo = message.photo[-1]
+            tg_file = await context.bot.get_file(tg_photo.file_id)
+            original_name = f"{tg_photo.file_unique_id}.jpg"
+            mime_type = "image/jpeg"
+        elif message.document and (message.document.mime_type or "").startswith("image/"):
+            tg_file = await context.bot.get_file(message.document.file_id)
+            original_name = message.document.file_name
+            mime_type = message.document.mime_type
+        else:
+            await message.reply_text("Это не похоже на изображение.")
+            return
+
+        await tracker.step("💾 Скачиваю и сохраняю изображение...")
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+        saved = save_telegram_image_to_project(project, file_bytes, original_name=original_name, mime_type=mime_type)
+
+        relative_name = Path(saved["relative_path"]).name
+        if pillow_available():
+            webp_path = str(Path(saved["path"]).with_suffix(".webp"))
+            try:
+                convert_to_webp(saved["path"], webp_path)
+                relative_name = Path(webp_path).name
+            except ToolError:
+                pass
+
+        await tracker.step("🧠 Обновляю CSS/HTML под новое фото...")
+        task_text = (
+            f"Используй изображение assets/img/{relative_name} как фон hero-секции "
+            "(background-image, cover, по центру, без потери читаемости текста). Сохрани остальной функционал."
+        )
+        answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
+        await tracker.step("✅ Готово.")
+        await reply_long(message, answer)
+        await maybe_send_intent_debug(message, context, debug)
+    except ToolError as e:
+        await message.reply_text(f"Не смог сохранить изображение: {e}")
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_photo", error=e, user_text=caption)
+        await message.reply_text(f"Ошибка обработки фото: {e}")
 
 
 def selftest_workspace_result() -> dict:
@@ -2883,6 +3321,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/create_site <project> - создать статический сайт и проверить файлы",
                 "/create_and_preview <project> - создать сайт, проверить файлы и запустить preview",
                 "/where <project> - показать путь, файлы и preview status проекта",
+                "/edit_site <project> <задача> - отредактировать существующий сайт через Ollama",
+                "/current_task - текущая выполняемая задача",
+                "/progress - прогресс текущей задачи или последнее действие",
+                "/browser_check <project> - проверить запущенный preview через Playwright",
+                "/images <project> - список изображений проекта (assets/img)",
+                "/set_background <project> <image_name> - поставить изображение фоном hero-секции",
                 "/new_flask <name> - создать Flask-проект в WRITE_ROOT",
                 "/write_file <project>/<file> <content> - записать текстовый файл",
                 "/delete_file <project>/<file> - удалить файл из WRITE_ROOT",
@@ -3116,6 +3560,19 @@ async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, d
                 router.get("reason") or "-",
             )
         )
+    if debug_info.get("modified_files"):
+        lines.append(f"modified_files: {', '.join(debug_info['modified_files'])}")
+    if debug_info.get("created_files"):
+        lines.append(f"created_files: {', '.join(debug_info['created_files'])}")
+    if "preview_url" in debug_info:
+        lines.append(f"preview_url: {debug_info.get('preview_url') or '-'}")
+    if "curl_check" in debug_info:
+        lines.append(f"curl_check: {debug_info.get('curl_check')}")
+    if "browser_check" in debug_info:
+        lines.append(f"browser_check: {debug_info.get('browser_check')}")
+    if "acceptance" in debug_info:
+        lines.append(f"acceptance: {debug_info.get('acceptance')}")
+    lines.append(f"рабочая папка Jarvis: {config.get_write_root()}")
     if message:
         await message.reply_text("\n".join(lines))
 
@@ -3163,8 +3620,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             previews = list_previews()
             previews_count = previews["count"]
+            preview_lines = [
+                f"- {item['project']}: {preview_url_for_port(int(item['port']))}"
+                for item in previews["previews"]
+                if item.get("port")
+            ]
         except Exception:
             previews_count = "unknown"
+            preview_lines = []
+        server_host_env = os.getenv("SERVER_HOST", "").strip()
+        lan_ip = detect_lan_ip()
         text = "\n".join(
             [
                 "Jarvis status:",
@@ -3185,7 +3650,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Write root: {config.get_write_root()}",
                 f"Preview ports: {config.PREVIEW_PORT_MIN}..{config.PREVIEW_PORT_MAX}",
                 f"Previews count: {previews_count}",
-                f"Server host: {config.SERVER_HOST}",
+                "Active previews:",
+                *(preview_lines or ["- нет запущенных preview"]),
+                f"SERVER_HOST (env): {server_host_env or '-'}",
+                f"LAN IP (hostname -I): {lan_ip or '-'}",
+                f"Playwright: {'installed' if playwright_available() else 'not installed'}",
+                f"Pillow: {'installed' if pillow_available() else 'not installed'}",
+                f"Debug mode (agent_debug): {'on' if context.user_data.get('agent_debug') else 'off'}",
                 f"Last errors count: {errors['count']}",
                 f"Last error: {errors['last_timestamp'] or '-'} {errors['last_type'] or ''}".strip(),
                 f"Allowed services: {', '.join(get_allowed_services())}",
@@ -3249,26 +3720,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_task = pending_task_for_text(user_text)
         debug_info["pending_task"] = pending_task
 
-        if pending_task:
-            await progress(update.message, f"Принял задачу: {pending_task}")
+        tracker = ProgressTracker(update.message) if pending_task else None
+        if pending_task and tracker:
+            await tracker.step("⏳ Принял задачу...")
             if pending_task == "create_workspace_project":
                 project_name = _slug_from_text(user_text)
-                await progress(update.message, f"Принял: создаю проект {project_name} через Ollama + tools.")
-                await progress(update.message, "Шаг 1/5: прошу Ollama сгенерировать структуру сайта...")
-                await progress(update.message, "Шаг 2/5: проверяю JSON...")
-                await progress(update.message, "Шаг 3/5: записываю файлы...")
+                await tracker.step(f"🧠 Генерирую сайт {project_name}...")
+                await tracker.step("💾 Записываю файлы...")
                 if _wants_preview(user_text):
-                    await progress(update.message, "Шаг 4/5: запускаю preview...")
-                    await progress(update.message, "Шаг 5/5: проверяю curl...")
+                    await tracker.step("🧪 Проверяю сайт...")
             elif pending_task == "edit_workspace_site":
-                await progress(update.message, "Шаг 1/6: читаю текущие файлы проекта...")
-                await progress(update.message, "Шаг 2/6: прошу Ollama сгенерировать изменения...")
-                await progress(update.message, "Шаг 3/6: проверяю JSON...")
-                await progress(update.message, "Шаг 4/6: записываю файлы...")
-                await progress(update.message, "Шаг 5/6: проверяю структуру проекта...")
+                await tracker.step("🧠 Генерирую изменения...")
+                await tracker.step("💾 Записываю файлы...")
+                await tracker.step("🧪 Проверяю сайт...")
             else:
-                await progress(update.message, "Шаг 1/4: определяю проект и контекст...")
-                await progress(update.message, "Шаг 2/4: вызываю безопасные tools...")
+                await tracker.step("🧠 Определяю проект и контекст...")
 
         try:
             answer, debug_info = answer_user_text(
@@ -3296,10 +3762,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
             debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
 
-        if pending_task == "edit_workspace_site":
-            await progress(update.message, "Шаг 6/6: проверяю preview...")
-        elif pending_task and pending_task != "create_workspace_project":
-            await progress(update.message, "Шаг 4/4: готовлю ответ...")
+        if tracker:
+            await tracker.step("✅ Готово.")
 
         await maybe_send_intent_debug(update.message, context, debug_info)
         memory.save_message(chat_id, user_id, "assistant", answer, "text")
@@ -3455,6 +3919,9 @@ def main():
     app.add_handler(CommandHandler("edit_site", edit_site_command))
     app.add_handler(CommandHandler("current_task", current_task_command))
     app.add_handler(CommandHandler("progress", progress_command))
+    app.add_handler(CommandHandler("browser_check", browser_check_command))
+    app.add_handler(CommandHandler("images", images_command))
+    app.add_handler(CommandHandler("set_background", set_background_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("forget", forget_command))
@@ -3477,6 +3944,7 @@ def main():
     app.add_handler(CommandHandler("deploy", disabled_write_command))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_or_audio))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_polling()

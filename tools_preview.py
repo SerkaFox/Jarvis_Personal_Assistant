@@ -233,8 +233,37 @@ def _project_path(project_name: str) -> Path:
     return path
 
 
+_LAN_IP_CACHE: dict[str, str | None] = {}
+
+
+def _is_loopback_host(host: str) -> bool:
+    lowered = host.lower()
+    return "127.0.0.1" in lowered or "localhost" in lowered or "0.0.0.0" in lowered
+
+
+def detect_lan_ip() -> str | None:
+    if "ip" in _LAN_IP_CACHE:
+        return _LAN_IP_CACHE["ip"]
+    ip = None
+    try:
+        result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=3, check=False)
+        candidates = [token for token in result.stdout.split() if token and not token.startswith("127.")]
+        candidates = [token for token in candidates if not token.startswith("172.17.") and not token.startswith("172.18.")]
+        if candidates:
+            ip = candidates[0]
+    except Exception:
+        ip = None
+    _LAN_IP_CACHE["ip"] = ip
+    return ip
+
+
 def _preview_url(port: int) -> str:
-    host = os.getenv("SERVER_HOST", config.SERVER_HOST).rstrip("/")
+    host = os.getenv("SERVER_HOST", "").strip() or config.SERVER_HOST
+    host = (host or "").rstrip("/")
+    if not host or _is_loopback_host(host):
+        lan_ip = detect_lan_ip()
+        if lan_ip:
+            host = f"http://{lan_ip}"
     if not host.startswith(("http://", "https://")):
         host = f"http://{host}"
     return f"{host}:{port}"

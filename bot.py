@@ -47,7 +47,12 @@ from tools_preview import (
     stop_preview,
     stop_preview_by_port,
 )
-from tools_browser import check_site_with_playwright, playwright_available
+from tools_browser import (
+    check_site_with_playwright,
+    check_site_with_playwright_async,
+    playwright_async_smoke_check,
+    playwright_available,
+)
 from tools_media import (
     convert_to_webp,
     list_project_images,
@@ -391,6 +396,46 @@ def clear_current_task(chat_id: str | None) -> None:
         _save_current_tasks(data)
 
 
+def _last_verification_path() -> Path:
+    path = Path(os.getenv("JARVIS_DB_PATH", config.JARVIS_DB_PATH)).resolve().parent / "last_verification.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def save_last_verification(project_name: str, result: dict | None) -> None:
+    if not result:
+        return
+    payload = {
+        "project_name": project_name,
+        "success": result.get("success"),
+        "skipped": result.get("skipped"),
+        "title": result.get("title"),
+        "body_text_length": result.get("body_text_length"),
+        "language_buttons_found": result.get("language_buttons_found"),
+        "language_switch_ok": result.get("language_switch_ok"),
+        "background_image_loaded": result.get("background_image_loaded"),
+        "screenshot_path": result.get("screenshot_path"),
+        "errors": result.get("errors"),
+        "console_errors": result.get("console_errors"),
+        "checked_at": datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    try:
+        _last_verification_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logging.exception("failed_to_save_last_verification")
+
+
+def get_last_verification() -> dict | None:
+    path = _last_verification_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _workspace_name_from_text(text: str) -> str | None:
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", text)
     stop = {
@@ -684,7 +729,7 @@ def _format_stop_result(label: str, result: dict, debug: bool = False) -> str:
         }
         lines.append("")
         lines.append(format_debug_result(debug_info))
-        lines.append(f"pid: {result.get('pid', '-')} checks: {checks}")
+        lines.append(f"success: {success} pid: {result.get('pid', '-')} checks: {checks}")
     return "\n".join(lines)
 
 
@@ -936,6 +981,10 @@ LANGUAGE_TASK_WORDS = (
 ANIMATION_TASK_WORDS = (
     "360", "rotate", "вращ", "анимац", "animation", "крутит", "переворач", "spin",
 )
+BACKGROUND_TASK_WORDS = (
+    "фон", "background", "hero", "обои", "wallpaper", "задний план",
+)
+MAX_REPAIR_ITERATIONS = 2
 
 
 def _mentions_languages(text: str) -> bool:
@@ -949,6 +998,11 @@ def _mentions_languages(text: str) -> bool:
 def _mentions_animation(text: str) -> bool:
     lowered = text.lower()
     return any(word in lowered for word in ANIMATION_TASK_WORDS)
+
+
+def _mentions_background(text: str) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in BACKGROUND_TASK_WORDS)
 
 
 def _check_language_support(haystack: str) -> tuple[bool, str]:
@@ -985,10 +1039,22 @@ def _check_animation(haystack: str) -> tuple[bool, str]:
     has_anim_marker = "@keyframes" in lowered or "animation:" in lowered or "animation-name" in lowered or "classlist" in lowered
     if not has_anim_marker:
         return False, "не найден класс/animation для карточек или букв"
+    has_dom_hook = any(
+        marker in lowered
+        for marker in ('class="card', "class='card", 'class="letter', "class='letter", 'class="anim', "classlist.add")
+    )
+    if not has_dom_hook:
+        return False, "не найден элемент (card/letter), к которому применяется анимация"
     return True, "ok"
 
 
+def _html_only_haystack(files: list[dict]) -> str:
+    return "\n".join(f["content"] for f in files if f["path"].lower().endswith(".html"))
+
+
 def _check_sections_preserved(before_haystack: str, after_haystack: str) -> tuple[bool, str]:
+    """Expects HTML-only content. CSS/JS files routinely mention "card" in class
+    selectors and would otherwise swing the count even when no markup changed."""
     before_sections = before_haystack.lower().count("<section")
     after_sections = after_haystack.lower().count("<section")
     before_cards = before_haystack.lower().count("card")
@@ -1000,22 +1066,41 @@ def _check_sections_preserved(before_haystack: str, after_haystack: str) -> tupl
     return True, "ok"
 
 
+def _check_background_reference(after_haystack: str, image_relative_path: str) -> tuple[bool, str]:
+    image_name = Path(image_relative_path).name.lower()
+    lowered = after_haystack.lower()
+    if image_name not in lowered and image_relative_path.lower() not in lowered:
+        return False, f"CSS/HTML не ссылается на {image_relative_path}"
+    return True, "ok"
+
+
 def run_acceptance_checks(
     user_text: str,
     before_files: list[dict],
     after_files: list[dict],
     browser_result: dict | None = None,
+    expect_background_image: str | None = None,
 ) -> dict:
     before_haystack = "\n".join(f["content"] for f in before_files)
     after_haystack = "\n".join(f["content"] for f in after_files)
     failed: list[str] = []
     checks: dict = {}
+    have_browser = bool(browser_result and not browser_result.get("skipped"))
 
     if _mentions_languages(user_text):
         ok, detail = _check_language_support(after_haystack)
         checks["languages"] = {"ok": ok, "detail": detail}
         if not ok:
             failed.append(f"языки: {detail}")
+        elif have_browser:
+            found = {code.lower() for code in (browser_result.get("language_buttons_found") or [])}
+            missing_buttons = [code.upper() for code in ("ru", "es", "en") if code not in found]
+            if missing_buttons:
+                checks["languages"] = {"ok": False, "detail": f"браузер не нашел кнопки {', '.join(missing_buttons)}"}
+                failed.append(f"языки: браузер не нашел кнопки {', '.join(missing_buttons)}")
+            elif browser_result.get("language_switch_ok") is False:
+                checks["languages"] = {"ok": False, "detail": "клик по кнопкам не меняет видимый текст"}
+                failed.append("языки: переключение кнопок не меняет видимый текст (проверено в браузере)")
 
     if _mentions_animation(user_text):
         ok, detail = _check_animation(after_haystack)
@@ -1023,24 +1108,52 @@ def run_acceptance_checks(
         if not ok:
             failed.append(f"анимация 360°: {detail}")
 
-    if after_files:
-        ok, detail = _check_sections_preserved(before_haystack, after_haystack)
+    if expect_background_image:
+        ok, detail = _check_background_reference(after_haystack, expect_background_image)
+        checks["background_image"] = {"ok": ok, "detail": detail}
+        if not ok:
+            failed.append(f"фон: {detail}")
+        elif have_browser and browser_result.get("background_image_loaded") is False:
+            checks["background_image"] = {"ok": False, "detail": "браузер не подтвердил отображение фона"}
+            failed.append("фон: браузер не подтвердил, что изображение реально отображается как фон")
+
+    before_html = _html_only_haystack(before_files)
+    after_html = _html_only_haystack(after_files)
+    if after_html:
+        ok, detail = _check_sections_preserved(before_html, after_html)
         checks["sections_preserved"] = {"ok": ok, "detail": detail}
         if not ok:
             failed.append(f"секции/карточки: {detail}")
 
-    if browser_result and not browser_result.get("skipped") and browser_result.get("success") is False:
+    if have_browser and browser_result.get("success") is False:
         reason = "; ".join(browser_result.get("errors") or browser_result.get("console_errors") or ["сайт не загрузился корректно"])
-        checks["browser"] = browser_result
+        checks["browser"] = {"ok": False, "detail": reason}
         failed.append(f"браузерная проверка: {reason}")
 
     return {"success": not failed, "failed": failed, "checks": checks}
+
+
+def build_verification_report(failed_checks: list[str], browser_result: dict | None = None) -> str:
+    if not failed_checks:
+        return ""
+    lines = [
+        "Отчет автоматической проверки. Исправь ТОЛЬКО перечисленные ниже проблемы,",
+        "остальной код и функционал сайта не трогай:",
+    ]
+    lines.extend(f"- {item}" for item in failed_checks)
+    if browser_result and not browser_result.get("skipped"):
+        if browser_result.get("console_errors"):
+            lines.append("- JS console errors: " + "; ".join(browser_result["console_errors"][:5]))
+        if browser_result.get("errors"):
+            lines.append("- Page errors: " + "; ".join(browser_result["errors"][:5]))
+    return "\n".join(lines)
 
 
 def edit_workspace_site_workflow(
     user_text: str,
     project_name: str,
     chat_id: str | None = None,
+    expect_background_image: str | None = None,
 ) -> tuple[str, dict]:
     tools_called: list[str] = []
     save_current_task(chat_id, "edit_workspace_site", project_name, "starting")
@@ -1106,21 +1219,62 @@ def edit_workspace_site_workflow(
         if not verify["exists"]:
             raise RuntimeError("Проект не найден после редактирования")
 
-        update_current_task_step(chat_id, "checking_acceptance")
-        after_read = read_workspace_project_files(project_name)
-        tools_called.append("read_workspace_project_files")
-        acceptance = run_acceptance_checks(user_text, before_files, after_read["files"])
-        tools_called.append("run_acceptance_checks")
+        update_current_task_step(chat_id, "checking_preview")
+        status = preview_status(project_name)
+        tools_called.append("preview_status")
+        if not status.get("running") and any(word in user_text.lower() for word in RESTART_PREVIEW_WORDS):
+            start_preview(project_name)
+            tools_called.append("start_preview")
+            status = preview_status(project_name)
+            tools_called.append("preview_status")
 
-        if not acceptance["success"]:
-            repair_text = (
-                user_text
-                + "\n\nИСПРАВЬ предыдущую попытку, она не прошла проверку: "
-                + "; ".join(acceptance["failed"])
-                + ". Сохрани остальной существующий функционал сайта."
+        # Feedback loop: apply -> verify (static + real browser check) -> if it fails,
+        # send a structured report of ONLY the failed checks back to Ollama and retry.
+        # Capped at MAX_REPAIR_ITERATIONS repair attempts so a stubborn failure can't
+        # loop forever or run away with Ollama calls.
+        acceptance = {"success": True, "failed": [], "checks": {}}
+        browser_result: dict | None = None
+        curl_result = None
+        preview_url = ""
+        report_text = ""
+        iteration = 0
+        while True:
+            iteration += 1
+            update_current_task_step(chat_id, f"checking_acceptance_{iteration}")
+            after_read = read_workspace_project_files(project_name)
+            tools_called.append("read_workspace_project_files")
+
+            browser_result = None
+            if status.get("running") and status.get("port"):
+                curl_result = curl_check(int(status["port"]))
+                preview_url = preview_url_for_port(int(status["port"]))
+                tools_called.append("curl_check")
+                if playwright_available():
+                    update_current_task_step(chat_id, "browser_check")
+                    browser_result = check_site_with_playwright(
+                        project_name,
+                        f"http://127.0.0.1:{status['port']}/",
+                        expect_background_image=expect_background_image,
+                    )
+                    tools_called.append("check_site_with_playwright")
+                    save_last_verification(project_name, browser_result)
+
+            acceptance = run_acceptance_checks(
+                user_text,
+                before_files,
+                after_read["files"],
+                browser_result=browser_result,
+                expect_background_image=expect_background_image,
             )
+            tools_called.append("run_acceptance_checks")
+
+            if acceptance["success"] or iteration > MAX_REPAIR_ITERATIONS:
+                break
+
+            report_text = build_verification_report(acceptance["failed"], browser_result)
+            update_current_task_step(chat_id, f"repairing_{iteration}")
             try:
-                spec_repair = ask_ollama_for_site_edit(repair_text, project_name, after_read["files"])
+                spec_repair = ask_ollama_for_site_edit(user_text + "\n\n" + report_text, project_name, after_read["files"])
                 tools_called.append("ask_ollama_for_site_edit_repair")
                 write_result_repair = apply_file_updates(project_name, spec_repair["files"])
                 tools_called.append("apply_file_updates")
@@ -1131,42 +1285,10 @@ def edit_workspace_site_workflow(
                     spec["summary"] = spec_repair.get("summary") or spec.get("summary")
                     if spec_repair.get("notes"):
                         spec["notes"] = spec_repair["notes"]
-                    after_read = read_workspace_project_files(project_name)
-                    tools_called.append("read_workspace_project_files")
-                    acceptance = run_acceptance_checks(user_text, before_files, after_read["files"])
-                    tools_called.append("run_acceptance_checks")
             except Exception:
-                pass
-
-        update_current_task_step(chat_id, "checking_preview")
-        status = preview_status(project_name)
-        tools_called.append("preview_status")
-        if not status.get("running") and any(word in user_text.lower() for word in RESTART_PREVIEW_WORDS):
-            start_preview(project_name)
-            tools_called.append("start_preview")
-            status = preview_status(project_name)
-            tools_called.append("preview_status")
-
-        preview_url = ""
-        curl_result = None
-        browser_result = None
-        if status.get("running") and status.get("port"):
-            curl_result = curl_check(int(status["port"]))
-            preview_url = preview_url_for_port(int(status["port"]))
-            tools_called.append("curl_check")
-            try:
-                if playwright_available():
-                    update_current_task_step(chat_id, "browser_check")
-                    browser_result = check_site_with_playwright(project_name, f"http://127.0.0.1:{status['port']}/")
-                    tools_called.append("check_site_with_playwright")
-                    if browser_result.get("success") is False:
-                        reason = "; ".join(
-                            browser_result.get("errors") or browser_result.get("console_errors") or ["проверка не прошла"]
-                        )
-                        acceptance["failed"].append(f"браузерная проверка: {reason}")
-                        acceptance["success"] = False
-            except Exception as browser_exc:
-                browser_result = {"success": None, "skipped": True, "reason": str(browser_exc)}
+                # Can't repair further (e.g. another invalid JSON from Ollama); stop
+                # looping and report the last known (failing) acceptance state below.
+                break
 
         if chat_id:
             memory.set_current_project(chat_id, project_name)
@@ -1193,12 +1315,19 @@ def edit_workspace_site_workflow(
         if not preview_url:
             info["preview_note"] = "Preview не запущен (я его не запускал и не останавливал)."
 
+        browser_caused = bool(browser_result and not browser_result.get("skipped") and browser_result.get("success") is False)
+        non_browser_failed = [f for f in acceptance["failed"] if not f.startswith("браузерная проверка")]
+
         if acceptance["success"]:
             headline = f"Готово! Я изменил сайт {project_name}: {spec.get('summary') or 'внес изменения по запросу'}."
             answer = format_user_result(headline, info)
+        elif browser_caused and not non_browser_failed:
+            headline = "Я применил изменения, но автоматическая проверка показала проблему: " + "; ".join(acceptance["failed"])
+            info["warning"] = "Посмотри сайт вручную, прежде чем считать задачу завершенной."
+            answer = format_user_result(headline, info)
         else:
-            headline = "Изменения применены частично, проверка не прошла: " + "; ".join(acceptance["failed"])
-            info["warning"] = "Проверь сайт вручную, прежде чем считать задачу завершенной."
+            headline = "Я не считаю задачу завершенной. Нашел проблемы: " + "; ".join(acceptance["failed"])
+            info["warning"] = "Файлы изменены, но не прошли проверку. Можно попросить меня попробовать снова."
             answer = format_user_result(headline, info)
 
         return (
@@ -1214,6 +1343,7 @@ def edit_workspace_site_workflow(
                 "curl_check": curl_result,
                 "browser_check": browser_result,
                 "acceptance": acceptance,
+                "verification_report": report_text,
             },
         )
     except Exception as e:
@@ -2958,12 +3088,14 @@ async def browser_check_command(update: Update, context: ContextTypes.DEFAULT_TY
         if not playwright_available():
             await update.message.reply_text("Playwright не установлен, браузерная проверка недоступна.")
             return
-        result = check_site_with_playwright(project, f"http://127.0.0.1:{status['port']}/")
+        result = await check_site_with_playwright_async(project, f"http://127.0.0.1:{status['port']}/")
+        save_last_verification(project, result)
         lines = [
             f"Браузерная проверка {project}:",
             f"success: {result.get('success')}",
             f"title: {result.get('title') or '-'}",
-            f"body_present: {result.get('body_present')}",
+            f"body_present: {result.get('body_present')} (length {result.get('body_text_length')})",
+            f"sections_count: {result.get('sections_count')}",
             f"language_buttons_found: {', '.join(result.get('language_buttons_found') or []) or '-'}",
             f"language_switch_ok: {result.get('language_switch_ok')}",
         ]
@@ -3013,7 +3145,9 @@ async def set_background_command(update: Update, context: ContextTypes.DEFAULT_T
         )
         tracker = ProgressTracker(update.message)
         await tracker.step("🧠 Обновляю CSS/HTML под новое фото...")
-        answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
+        answer, debug = edit_workspace_site_workflow(
+            task_text, project, chat_id, expect_background_image=info["relative_path"]
+        )
         await tracker.step("✅ Готово.")
         await reply_long(update.message, answer)
         await maybe_send_intent_debug(update.message, context, debug)
@@ -3076,22 +3210,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tracker.step("💾 Скачиваю и сохраняю изображение...")
         file_bytes = bytes(await tg_file.download_as_bytearray())
         saved = save_telegram_image_to_project(project, file_bytes, original_name=original_name, mime_type=mime_type)
+        if not Path(saved["path"]).is_file():
+            raise ToolError(f"Файл не сохранился: {saved['path']}")
 
-        relative_name = Path(saved["relative_path"]).name
+        relative_path = saved["relative_path"]
         if pillow_available():
             webp_path = str(Path(saved["path"]).with_suffix(".webp"))
             try:
                 convert_to_webp(saved["path"], webp_path)
-                relative_name = Path(webp_path).name
+                if Path(webp_path).is_file():
+                    relative_path = str(Path(saved["relative_path"]).with_suffix(".webp"))
             except ToolError:
                 pass
 
         await tracker.step("🧠 Обновляю CSS/HTML под новое фото...")
         task_text = (
-            f"Используй изображение assets/img/{relative_name} как фон hero-секции "
+            f"Используй изображение {relative_path} как фон hero-секции "
             "(background-image, cover, по центру, без потери читаемости текста). Сохрани остальной функционал."
         )
-        answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
+        answer, debug = edit_workspace_site_workflow(
+            task_text, project, chat_id, expect_background_image=relative_path
+        )
         await tracker.step("✅ Готово.")
         await reply_long(message, answer)
         await maybe_send_intent_debug(message, context, debug)
@@ -3569,9 +3708,14 @@ async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, d
     if "curl_check" in debug_info:
         lines.append(f"curl_check: {debug_info.get('curl_check')}")
     if "browser_check" in debug_info:
-        lines.append(f"browser_check: {debug_info.get('browser_check')}")
+        browser_check = debug_info.get("browser_check")
+        lines.append(f"browser_check: {browser_check}")
+        if isinstance(browser_check, dict) and browser_check.get("screenshot_path"):
+            lines.append(f"screenshot_path: {browser_check['screenshot_path']}")
     if "acceptance" in debug_info:
         lines.append(f"acceptance: {debug_info.get('acceptance')}")
+    if debug_info.get("verification_report"):
+        lines.append(f"verification_report:\n{debug_info['verification_report']}")
     lines.append(f"рабочая папка Jarvis: {config.get_write_root()}")
     if message:
         await message.reply_text("\n".join(lines))
@@ -3630,6 +3774,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             preview_lines = []
         server_host_env = os.getenv("SERVER_HOST", "").strip()
         lan_ip = detect_lan_ip()
+        if playwright_available():
+            pw_smoke = await playwright_async_smoke_check()
+            playwright_line = "ok" if pw_smoke.get("ok") else f"fail ({pw_smoke.get('reason')})"
+        else:
+            playwright_line = "not installed"
+        last_verification = get_last_verification()
+        if last_verification:
+            verification_line = (
+                f"{last_verification.get('project_name')}: success={last_verification.get('success')} "
+                f"at {last_verification.get('checked_at')}"
+            )
+            screenshot_line = last_verification.get("screenshot_path") or "-"
+        else:
+            verification_line = "-"
+            screenshot_line = "-"
         text = "\n".join(
             [
                 "Jarvis status:",
@@ -3654,8 +3813,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 *(preview_lines or ["- нет запущенных preview"]),
                 f"SERVER_HOST (env): {server_host_env or '-'}",
                 f"LAN IP (hostname -I): {lan_ip or '-'}",
-                f"Playwright: {'installed' if playwright_available() else 'not installed'}",
+                f"Playwright async check: {playwright_line}",
                 f"Pillow: {'installed' if pillow_available() else 'not installed'}",
+                f"Last verification: {verification_line}",
+                f"Last screenshot: {screenshot_line}",
                 f"Debug mode (agent_debug): {'on' if context.user_data.get('agent_debug') else 'off'}",
                 f"Last errors count: {errors['count']}",
                 f"Last error: {errors['last_timestamp'] or '-'} {errors['last_type'] or ''}".strip(),

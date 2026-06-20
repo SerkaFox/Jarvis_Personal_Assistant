@@ -23,7 +23,7 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         temp_db = str(Path(self.tmp.name) / "data" / "jarvis.db")
         os.environ["JARVIS_DB_PATH"] = temp_db
         config.JARVIS_DB_PATH = temp_db
-        os.environ["SERVER_HOST"] = "http://127.0.0.1"
+        os.environ["SERVER_HOST"] = "http://192.168.0.50"
 
     def tearDown(self):
         try:
@@ -155,7 +155,7 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertIn("ask_ollama_for_site_spec", debug["tools_called"])
         self.assertIn("write_text_file", debug["tools_called"])
         self.assertIn("start_preview", debug["tools_called"])
-        self.assertIn("preview_url:", answer)
+        self.assertIn("Открыть сайт:", answer)
         self.assertTrue((Path(self.tmp.name) / "sitebota" / "index.html").exists())
         stop_preview("sitebota")
 
@@ -163,9 +163,9 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         from bot import workspace_where_answer
 
         answer, debug = workspace_where_answer("missing_site", chat_id="test")
-        self.assertIn("exists: false", answer)
-        self.assertIn("Проект не найден в WRITE_ROOT", answer)
+        self.assertIn("Не нашел проект missing_site", answer)
         self.assertEqual(debug["detected"]["intent"], "where_project")
+        self.assertEqual(debug["errors"], ["project not found"])
 
     def test_create_site_workflow_creates_real_files_and_last_action(self):
         from bot import create_site_workflow, fixture_site_spec, get_last_action
@@ -180,7 +180,8 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertIn("ask_ollama_for_site_spec", debug["tools_called"])
         self.assertIn("write_text_file", debug["tools_called"])
         self.assertIn("verify_project_files", debug["tools_called"])
-        self.assertIn("Создал проект", answer)
+        self.assertIn("Готово! Я создал сайт", answer)
+        self.assertNotIn("tools_called", answer)
         self.assertTrue((Path(self.tmp.name) / "sitebota_test" / "index.html").is_file())
         action = get_last_action("test")
         self.assertTrue(action["success"])
@@ -200,10 +201,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         )
         self.assertIn("start_preview", debug["tools_called"])
         self.assertIn("curl_localhost", debug["tools_called"])
-        self.assertIn("preview_url:", answer)
+        self.assertIn("Открыть сайт:", answer)
         action = get_last_action("test")
         self.assertTrue(action["success"])
-        self.assertTrue(action["preview_url"].startswith("http://127.0.0.1:"))
+        self.assertTrue(action["preview_url"].startswith("http://192.168.0.50:"))
         stop_preview("sitebota_preview_test")
 
     def test_workspace_where_reports_preview_url_after_create_and_preview(self):
@@ -218,9 +219,8 @@ class WriteSandboxSmokeTests(unittest.TestCase):
             site_spec_provider=fixture_site_spec,
         )
         answer, debug = workspace_where_answer("sitebota_where_test", chat_id="test")
-        self.assertIn("exists: true", answer)
-        self.assertIn("preview running: True", answer)
-        self.assertIn("url: http://127.0.0.1:", answer)
+        self.assertIn("Сайт sitebota_where_test запущен.", answer)
+        self.assertIn("Открыть сайт: http://192.168.0.50:", answer)
         self.assertEqual(debug["detected"]["intent"], "where_project")
         stop_preview("sitebota_where_test")
 
@@ -229,8 +229,8 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
         save_last_action("test", {"intent": "create_site", "project_name": "ghost", "success": False, "error": "tool failed"})
         answer, _debug = workspace_where_answer(None, chat_id="test")
-        self.assertIn("Я не вижу подтверждения", answer)
-        self.assertNotIn("Создал проект", answer)
+        self.assertIn("Не вижу подтвержденного созданного сайта", answer)
+        self.assertNotIn("Готово! Я создал сайт", answer)
 
     def test_ollama_fake_bash_response_is_rejected(self):
         from bot import ask_ollama_for_site_spec
@@ -327,9 +327,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
         with patch("bot.stop_preview", return_value={"success": False, "stopped": False, "project": "ghost", "checks": {"process_alive": True, "port_listening": True, "curl_responds": True}, "error": "still running"}):
             text = bot._format_stop_result("stop_preview result:", bot.stop_preview("ghost"))
-        self.assertIn("success: False", text)
-        self.assertNotIn("Остановил", text)
-        self.assertNotIn("остановлен", text.lower())
+            debug_text = bot._format_stop_result("stop_preview result:", bot.stop_preview("ghost"), debug=True)
+        self.assertIn("Не смог остановить preview ghost", text)
+        self.assertIn("Причина: still running", text)
+        self.assertNotIn("success: False", text)
+        self.assertIn("success: False", debug_text)
 
     def test_stop_delete_answer_routes_stop_phrase_instead_of_chat(self):
         import bot
@@ -339,7 +341,7 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         bot.memory.set_current_project("nl_test_chat", "nlstop")
         answer, debug = bot.stop_delete_answer("останови сервер", chat_id="nl_test_chat")
         self.assertEqual(debug["detected"]["intent"], "stop_preview")
-        self.assertIn("success:", answer)
+        self.assertIn("Остановил preview nlstop", answer)
         self.assertFalse(bot.preview_status("nlstop")["running"])
 
     def test_stop_delete_answer_requires_explicit_project_for_vague_delete(self):

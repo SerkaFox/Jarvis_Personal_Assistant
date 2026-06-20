@@ -94,6 +94,8 @@ def save_telegram_image_to_project(
     img_dir = _project_img_dir(project_name)
     dest = img_dir / filename
     dest.write_bytes(file_bytes)
+    if not dest.is_file() or dest.stat().st_size != len(file_bytes):
+        raise ToolError(f"Не удалось сохранить изображение на диск: {dest}")
 
     project = _validate_project_name(project_name)
     relative = str(IMG_SUBDIR / filename)

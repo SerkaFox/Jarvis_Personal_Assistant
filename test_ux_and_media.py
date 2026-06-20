@@ -16,6 +16,14 @@ def _pillow_installed() -> bool:
     return True
 
 
+def _playwright_installed() -> bool:
+    try:
+        from playwright.async_api import async_playwright  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 class FormatResultTests(unittest.TestCase):
     def test_format_user_result_hides_tools_called(self):
         from bot import format_user_result
@@ -214,7 +222,8 @@ class AcceptanceCheckTests(unittest.TestCase):
         before = [{"path": "index.html", "content": "<html></html>"}]
         html = (
             '<header><button data-lang="ru">RU</button><button data-lang="es">ES</button>'
-            '<button data-lang="en">EN</button></header><main><section>x</section></main>'
+            '<button data-lang="en">EN</button></header>'
+            '<main><section><div class="card">x</div></section></main>'
             "<script>document.addEventListener('click', function(e){ if(e.target.dataset.lang)"
             " setLang(e.target.dataset.lang); });</script>"
             "<style>.card{animation: spin 1s;} @keyframes spin{ from{transform:rotate(0);}"
@@ -343,6 +352,192 @@ class BrowserCheckTests(unittest.TestCase):
         self.assertTrue(result["skipped"])
         self.assertIsNone(result["success"])
         self.assertEqual(result["errors"], [])
+
+    @unittest.skipUnless(_playwright_installed(), "Playwright not installed")
+    def test_sync_check_does_not_crash_inside_running_asyncio_loop(self):
+        import asyncio
+
+        from tools_browser import check_site_with_playwright
+
+        async def runner():
+            return check_site_with_playwright("loopcheck", "data:text/html,<html><body>hi</body></html>")
+
+        result = asyncio.run(runner())
+        joined_errors = " ".join(result.get("errors") or [])
+        self.assertNotIn("asyncio loop", joined_errors)
+        self.assertNotIn("Sync API", joined_errors)
+
+    @unittest.skipUnless(_playwright_installed(), "Playwright not installed")
+    def test_async_check_works_against_real_server(self):
+        import asyncio
+        import http.server
+        import threading
+
+        from tools_browser import check_site_with_playwright_async
+
+        tmp = tempfile.TemporaryDirectory(prefix="jarvis_pw_http_")
+        (Path(tmp.name) / "index.html").write_text("<html><head><title>T</title></head><body><h1>hi</h1></body></html>", encoding="utf-8")
+        handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(*args, directory=tmp.name, **kwargs)
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = asyncio.run(check_site_with_playwright_async("pwasync", f"http://127.0.0.1:{port}/"))
+        finally:
+            httpd.shutdown()
+            tmp.cleanup()
+        self.assertTrue(result["success"], result.get("errors"))
+        self.assertEqual(result["title"], "T")
+        self.assertTrue(result["body_present"])
+
+
+class RepairLoopAndBackgroundTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="jarvis_repair_test_")
+        self.old_write_mode = os.environ.get("WRITE_MODE_ENABLED")
+        self.old_write_root = os.environ.get("WRITE_ROOT")
+        self.old_db_path = os.environ.get("JARVIS_DB_PATH")
+        os.environ["WRITE_MODE_ENABLED"] = "true"
+        os.environ["WRITE_ROOT"] = self.tmp.name
+        import config
+
+        self.old_config_db_path = config.JARVIS_DB_PATH
+        temp_db = str(Path(self.tmp.name) / "data" / "jarvis.db")
+        os.environ["JARVIS_DB_PATH"] = temp_db
+        config.JARVIS_DB_PATH = temp_db
+
+    def tearDown(self):
+        import config
+
+        try:
+            from tools_preview import list_previews, stop_preview
+
+            for item in list_previews()["previews"]:
+                stop_preview(item["project"])
+        except Exception:
+            pass
+        if self.old_write_mode is None:
+            os.environ.pop("WRITE_MODE_ENABLED", None)
+        else:
+            os.environ["WRITE_MODE_ENABLED"] = self.old_write_mode
+        if self.old_write_root is None:
+            os.environ.pop("WRITE_ROOT", None)
+        else:
+            os.environ["WRITE_ROOT"] = self.old_write_root
+        if self.old_db_path is None:
+            os.environ.pop("JARVIS_DB_PATH", None)
+        else:
+            os.environ["JARVIS_DB_PATH"] = self.old_db_path
+        config.JARVIS_DB_PATH = self.old_config_db_path
+        self.tmp.cleanup()
+
+    def test_repair_loop_caps_at_two_iterations(self):
+        from bot import edit_workspace_site_workflow
+        from tools_write import create_static_site
+
+        create_static_site("repairloop")
+
+        calls = {"n": 0}
+
+        def always_missing_es(user_text, project_name, current_files):
+            calls["n"] += 1
+            return {
+                "action": "edit_workspace_site",
+                "project_name": project_name,
+                "summary": "tries but never adds ES",
+                "files": [
+                    {
+                        "path": "index.html",
+                        "content": (
+                            '<header><button data-lang="ru">RU</button><button data-lang="en">EN</button></header>'
+                            "<script>document.addEventListener('click', function(e){ if(e.target.dataset.lang)"
+                            " setLang(e.target.dataset.lang); });</script>"
+                        ),
+                    }
+                ],
+                "notes": [],
+            }
+
+        with patch("bot.ask_ollama_for_site_edit", side_effect=always_missing_es):
+            answer, debug = edit_workspace_site_workflow(
+                "сделай переключение языков ru/en/es", "repairloop", chat_id="rl"
+            )
+
+        # initial attempt + MAX_REPAIR_ITERATIONS(2) repairs = 3 generation calls total
+        self.assertEqual(calls["n"], 3)
+        self.assertFalse(debug["acceptance"]["success"])
+        self.assertIn("Я не считаю задачу завершенной", answer)
+        self.assertNotIn("tools_called", answer)
+
+    @unittest.skipUnless(_pillow_installed() and _playwright_installed(), "Pillow/Playwright not installed")
+    def test_background_image_workflow_passes_when_css_references_real_visible_image(self):
+        from PIL import Image
+
+        from bot import edit_workspace_site_workflow
+        from tools_media import save_telegram_image_to_project
+        from tools_preview import start_preview
+        from tools_write import create_static_site
+
+        create_static_site("bgsite")
+        start_preview("bgsite")
+
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10), color=(0, 0, 255)).save(buf, format="JPEG")
+        saved = save_telegram_image_to_project("bgsite", buf.getvalue(), original_name="hero.jpg", mime_type="image/jpeg")
+        image_name = Path(saved["relative_path"]).name
+
+        def bg_spec(user_text, project_name, current_files):
+            return {
+                "action": "edit_workspace_site",
+                "project_name": project_name,
+                "summary": "added hero background",
+                "files": [
+                    {
+                        "path": "assets/css/style.css",
+                        "content": f".hero{{background-image:url('../img/{image_name}');background-size:cover;}}",
+                    }
+                ],
+                "notes": [],
+            }
+
+        with patch("bot.ask_ollama_for_site_edit", side_effect=bg_spec):
+            answer, debug = edit_workspace_site_workflow(
+                f"используй изображение assets/img/{image_name} как фон hero-секции",
+                "bgsite",
+                chat_id="bg",
+                expect_background_image=saved["relative_path"],
+            )
+
+        self.assertTrue(debug["acceptance"]["success"], debug["acceptance"]["failed"])
+        self.assertIn("Готово!", answer)
+        self.assertTrue(debug["browser_check"]["background_image_loaded"])
+
+    def test_background_image_workflow_fails_when_css_does_not_reference_image(self):
+        from bot import edit_workspace_site_workflow
+        from tools_write import create_static_site
+
+        create_static_site("bgsite_bad")
+
+        def bad_bg_spec(user_text, project_name, current_files):
+            return {
+                "action": "edit_workspace_site",
+                "project_name": project_name,
+                "summary": "did nothing useful",
+                "files": [{"path": "assets/css/style.css", "content": "body{color:red}"}],
+                "notes": [],
+            }
+
+        with patch("bot.ask_ollama_for_site_edit", side_effect=bad_bg_spec):
+            answer, debug = edit_workspace_site_workflow(
+                "используй изображение assets/img/missing-hero.jpg как фон",
+                "bgsite_bad",
+                chat_id="bg2",
+                expect_background_image="assets/img/missing-hero.jpg",
+            )
+
+        self.assertFalse(debug["acceptance"]["success"])
+        self.assertTrue(any("фон" in f for f in debug["acceptance"]["failed"]))
 
 
 if __name__ == "__main__":

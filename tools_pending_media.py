@@ -126,6 +126,24 @@ def mark_media_used(media_id: int, project_name: str, saved_path: str) -> None:
         conn.commit()
 
 
+def mark_media_failed(media_id: int, project_name: str = "", saved_path: str = "") -> None:
+    """Marks a pending media item as failed (workflow did not complete). Never
+    sets status='used', so a failed attempt doesn't silently consume the photo."""
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            update pending_media
+               set status = 'failed',
+                   used_at = ?,
+                   used_project = ?,
+                   saved_path = ?
+             where id = ?
+            """,
+            (_now_utc_iso(), str(project_name), str(saved_path), int(media_id)),
+        )
+        conn.commit()
+
+
 def clear_old_pending_media(max_age_minutes: int = 240) -> int:
     cutoff = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=max_age_minutes)
     cutoff_iso = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")

@@ -139,7 +139,10 @@ def list_project_images(project_name: str) -> dict[str, Any]:
     return {"project_name": _validate_project_name(project_name), "images": images, "count": len(images)}
 
 
-def set_hero_background(project_name: str, image_relative_path: str) -> dict[str, Any]:
+def _resolve_project_image_path(project_name: str, image_relative_path: str) -> dict[str, Any]:
+    """Read-only: validates project name and that the path stays inside
+    assets/img, then resolves it. Does not touch the filesystem and does not
+    require the file to exist yet."""
     ensure_write_root()
     project = _validate_project_name(project_name)
     root = resolve_write_path(project).resolve()
@@ -150,9 +153,14 @@ def set_hero_background(project_name: str, image_relative_path: str) -> dict[str
     img_dir = (root / IMG_SUBDIR).resolve()
     if img_dir != candidate and img_dir not in candidate.parents:
         raise ToolError("Изображение должно быть внутри assets/img проекта")
-    if not candidate.is_file():
-        raise ToolError(f"Изображение не найдено: {candidate}")
     return {"project_name": project, "relative_path": cleaned, "path": str(candidate)}
+
+
+def set_hero_background(project_name: str, image_relative_path: str) -> dict[str, Any]:
+    info = _resolve_project_image_path(project_name, image_relative_path)
+    if not Path(info["path"]).is_file():
+        raise ToolError(f"Изображение не найдено: {info['path']}")
+    return info
 
 
 async def download_telegram_file(bot, file_id: str, dest_path: str) -> dict[str, Any]:
@@ -253,10 +261,13 @@ def set_fixed_background(project_name: str, image_relative_path: str) -> dict[st
 
 
 def verify_background_asset(project_name: str, image_relative_path: str) -> dict[str, Any]:
-    info = set_hero_background(project_name, image_relative_path)
+    """Read-only check: never creates, modifies, or writes CSS/HTML/image files.
+    Reports whether the image exists on disk and whether the CSS already
+    references it; does not raise just because the image is missing."""
+    info = _resolve_project_image_path(project_name, image_relative_path)
     project = info["project_name"]
     root = resolve_write_path(project).resolve()
-    img_path = (root / info["relative_path"]).resolve()
+    img_path = Path(info["path"])
     css_path = (root / CSS_PATH).resolve()
     ok_img = img_path.is_file() and img_path.stat().st_size > 0
     ok_css = css_path.is_file()

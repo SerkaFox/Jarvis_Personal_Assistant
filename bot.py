@@ -68,6 +68,7 @@ from tools_media import (
 from tools_pending_media import (
     clear_old_pending_media,
     get_latest_pending_media,
+    mark_media_failed,
     mark_media_used,
     save_pending_media,
 )
@@ -3203,6 +3204,33 @@ def _wants_background_from_latest_photo(text: str) -> bool:
     return any(phrase in lowered for phrase in BACKGROUND_AFTER_PHOTO_PHRASES)
 
 
+async def _check_background_live(project_name: str, base_url: str, relative_image: str) -> dict[str, Any]:
+    """Read-only liveness check: confirms image/CSS are reachable over HTTP and,
+    if Playwright is available, that the background-image is actually applied
+    on the rendered page. Never writes anything."""
+    image_url = f"{base_url}/{relative_image}"
+    css_url = f"{base_url}/assets/css/style.css"
+    img_resp = requests.get(image_url, timeout=5)
+    css_resp = requests.get(css_url, timeout=5)
+    result = {
+        "image_status": img_resp.status_code,
+        "css_status": css_resp.status_code,
+        "background_image_loaded": None,
+    }
+    if img_resp.status_code != 200 or css_resp.status_code != 200:
+        result["ok"] = False
+        return result
+    if playwright_available():
+        browser = await check_site_with_playwright_async(
+            project_name, f"{base_url}/", expect_background_image=relative_image
+        )
+        result["background_image_loaded"] = browser.get("background_image_loaded")
+        result["ok"] = browser.get("background_image_loaded") is not False
+    else:
+        result["ok"] = True
+    return result
+
+
 async def add_background_image_workflow(
     message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3253,19 +3281,23 @@ async def add_background_image_workflow(
         except Exception:
             pass
         relative_image = f"assets/img/{out_name}"
-        mark_media_used(int(media["id"]), project_name, str(out_abs))
 
         step = 4
         update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "update_css")
         await tracker.step(f"Шаг {step}/{total}: обновляю CSS...")
-        css_info = set_fixed_background(project_name, relative_image)
+        set_fixed_background(project_name, relative_image)
 
         step = 5
         update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "verify_assets")
         await tracker.step(f"Шаг {step}/{total}: проверяю, что файл доступен с сайта...")
         verify = verify_background_asset(project_name, relative_image)
         if not verify.get("success"):
-            raise ToolError("Файл/ссылка в CSS не подтверждены: " + str(verify))
+            raise ToolError(
+                "Файл или ссылка в CSS не подтверждены "
+                f"(файл найден: {verify.get('image_exists')}, "
+                f"CSS найден: {verify.get('css_exists')}, "
+                f"CSS ссылается на файл: {verify.get('css_references_image')})"
+            )
         status = preview_status(project_name)
         if not status.get("running"):
             status = start_preview(project_name)
@@ -3273,41 +3305,51 @@ async def add_background_image_workflow(
         if not port:
             raise ToolError("Не удалось определить порт preview")
         base_url = f"http://127.0.0.1:{port}"
-        image_url = f"{base_url}/{relative_image}"
-        css_url = f"{base_url}/assets/css/style.css"
-        img_resp = requests.get(image_url, timeout=5)
-        css_resp = requests.get(css_url, timeout=5)
-        if img_resp.status_code != 200:
-            raise ToolError(f"Картинка не отдается: HTTP {img_resp.status_code} {image_url}")
-        if css_resp.status_code != 200:
-            raise ToolError(f"CSS не отдается: HTTP {css_resp.status_code} {css_url}")
 
         step = 6
         update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "browser_check")
         await tracker.step(f"Шаг {step}/{total}: проверяю страницу в браузере...")
-        browser_note = ""
-        if playwright_available():
-            browser = await check_site_with_playwright_async(project_name, f"{base_url}/", expect_background_image=relative_image)
-            ok_bg = browser.get("background_image_loaded")
-            if ok_bg is False:
-                raise ToolError("Браузер не подтвердил background-image (есть ошибки загрузки ресурсов)")
-            browser_note = "Проверка: страница открылась, фон загружается."
+        live = await _check_background_live(project_name, base_url, relative_image)
+        repaired = False
+        if not live["ok"]:
+            await tracker.step("⚠️ Фон не подтвердился, пробую исправить CSS-путь...")
+            set_fixed_background(project_name, relative_image)
+            live = await _check_background_live(project_name, base_url, relative_image)
+            repaired = True
+        if not live["ok"]:
+            raise ToolError(
+                "Не удалось подтвердить фон даже после автоисправления CSS-пути "
+                f"(картинка HTTP {live['image_status']}, CSS HTTP {live['css_status']}, "
+                f"фон виден в браузере: {live['background_image_loaded']})"
+            )
+
+        mark_media_used(int(media["id"]), project_name, str(out_abs))
+
+        if live["background_image_loaded"]:
+            browser_note = "Проверка: фон подтверждён браузером."
         else:
-            browser_note = "Проверка браузером недоступна (Playwright не установлен)."
+            browser_note = "Проверка: файлы отдаются с сайта (браузерная проверка недоступна)."
+        if repaired:
+            browser_note += " Потребовалось автоисправление CSS-пути."
 
         await tracker.step("✅ Готово. Фото добавлено как фиксированный фон.")
         await message.reply_text(
             "\n".join(
                 [
-                    f"Готово. Фото добавлено как фиксированный фон на сайте {project_name}.",
-                    f"Файл: {relative_image}",
-                    f"Изменил: assets/css/style.css",
+                    "Готово. Фото добавлено как фиксированный фон сайта.",
+                    f"Проект: {project_name}",
+                    f"Файл изображения: {relative_image}",
                     f"Открыть сайт: {preview_url_for_port(port)}",
                     browser_note,
                 ]
             )
         )
     except Exception as e:
+        try:
+            saved_hint = str(locals().get("out_abs", "") or "")
+            mark_media_failed(int(media["id"]), project_name, saved_hint)
+        except Exception:
+            pass
         save_last_error(chat_id=chat_id, user_id=user_id, handler="add_background_image_workflow", error=e, user_text=str(getattr(message, "text", "") or getattr(message, "caption", "") or ""))
         await message.reply_text(f"Не смог добавить фото на фон (шаг {step}/{total}): {e}")
     finally:

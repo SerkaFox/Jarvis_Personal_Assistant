@@ -19,6 +19,8 @@ data/screenshots/
 data/current_task.json
 data/last_verification.json
 data/screenshots/
+data/proposed_plugins/
+data/selfdev_jobs/
 workspace/
 jarvis_workspace/
 *.pid

@@ -23,6 +23,8 @@ from telegram.ext import (
 from dotenv import load_dotenv
 
 import config
+import plugin_manager
+import self_improvement
 from action_schemas import extract_json_object, validate_create_static_site_action, validate_edit_workspace_site_action
 from agent import answer_with_tools
 from intent_router import detect_intent, extract_mentioned_project, format_workspace_inventory, handle_detected_intent
@@ -3808,6 +3810,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/debug_on, /debug_off - aliases for debug mode",
                 "/debug_last_intent - последний intent",
                 "/router_test <text> - semantic router classify_intent без выполнения tools",
+                "/workflow_debug_on, /workflow_debug_off - debug деталей planner/workflow",
+                "/selfdev_on, /selfdev_off - режим self-improvement (suggest/off)",
+                "/selfdev_propose <задача> - предложить новый plugin для незнакомой задачи",
+                "/selfdev_run <job_id> <запрос> - dry-run: can_handle score без изменений",
+                "/selfdev_test <job_id> - прогнать safety-проверки предложенного plugin",
+                "/selfdev_install <job_id> - установить plugin после успешных проверок",
+                "/selfdev_rollback <job_id> - откатить установленный plugin",
+                "/selfdev_status [job_id] - статус self-improvement задачи",
+                "/plugins - список установленных plugins",
+                "/plugin_show <name> - детали plugin",
                 "/tts_test - проверить TTS",
                 "/patch, /apply_patch, /test, /deploy - отключены на read-only этапе",
             ]
@@ -3941,6 +3953,265 @@ async def debug_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def debug_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await agent_debug_off(update, context)
+
+
+def _effective_selfdev_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    override = context.user_data.get("selfdev_mode_override")
+    return override if override in config.SELFDEV_MODES else config.get_selfdev_mode()
+
+
+async def workflow_debug_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    context.user_data["workflow_debug"] = True
+    await update.message.reply_text("Workflow debug: on")
+
+
+async def workflow_debug_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    context.user_data["workflow_debug"] = False
+    await update.message.reply_text("Workflow debug: off")
+
+
+async def selfdev_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    context.user_data["selfdev_mode_override"] = "suggest"
+    await update.message.reply_text(
+        "Self-improvement: suggest включён. Если я не найду подходящий workflow/plugin для задачи, "
+        "предложу план нового навыка вместо обычного ответа. Установка только через /selfdev_install <job_id>."
+    )
+
+
+async def selfdev_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    context.user_data["selfdev_mode_override"] = "off"
+    await update.message.reply_text("Self-improvement выключен.")
+
+
+async def selfdev_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    mode = _effective_selfdev_mode(context)
+    job_id = context.args[0] if context.args else context.user_data.get("selfdev_last_job_id")
+    if not job_id:
+        await update.message.reply_text(f"SELFDEV_MODE: {mode}\nНет текущей selfdev задачи.")
+        return
+    report = self_improvement.get_job_report(job_id)
+    if not report:
+        await update.message.reply_text(f"SELFDEV_MODE: {mode}\nJob {job_id} не найден.")
+        return
+    lines = [
+        f"SELFDEV_MODE: {mode}",
+        f"job_id: {job_id}",
+        f"plugin: {report.get('plugin_name')}",
+        f"status: {report.get('status')}",
+        f"step: {report.get('step')}",
+        "files: " + (", ".join(report.get("files") or []) or "-"),
+    ]
+    if report.get("checks"):
+        lines.append("checks: " + ", ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in report["checks"].items()))
+    if report.get("errors"):
+        lines.append("errors: " + "; ".join(str(e) for e in report["errors"]))
+    await reply_long(update.message, "\n".join(lines))
+
+
+async def selfdev_propose_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /selfdev_propose <текст задачи>")
+        return
+    mode = _effective_selfdev_mode(context)
+    if mode == "off":
+        await update.message.reply_text("Self-improvement выключен. Включи: /selfdev_on")
+        return
+    user_text = " ".join(context.args)
+    chat_id, user_id = chat_user_ids(update)
+    await update.message.reply_text("🧠 Думаю над планом нового навыка...")
+    try:
+        plugin_context = {"project_name": memory.get_current_project(chat_id), "chat_id": chat_id}
+        spec = self_improvement.propose_plugin(user_text, plugin_context)
+        job_id = self_improvement.new_job_id()
+        self_improvement.write_plugin_to_sandbox(job_id, spec)
+        context.user_data["selfdev_last_job_id"] = job_id
+        await reply_long(update.message, _format_selfdev_proposal(spec, job_id))
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="selfdev_propose_command", error=e, user_text=user_text)
+        await update.message.reply_text(f"Не смог подготовить план: {e}")
+
+
+def _format_selfdev_proposal(spec: dict, job_id: str) -> str:
+    lines = [
+        "Я пока не умею это делать сам. Подготовил план нового навыка:",
+        f"Название: {spec['plugin_name']}",
+        f"Что будет уметь: {spec['description']}",
+        "Файлы:",
+    ]
+    lines.extend(f"- {f['path']}" for f in spec["files"])
+    if spec.get("risks"):
+        lines.append("Риски: " + "; ".join(spec["risks"]))
+    lines.append(f"job_id: {job_id}")
+    lines.append(f"Сначала проверь: /selfdev_test {job_id}")
+    lines.append(f"Напиши /selfdev_install {job_id}, если разрешаешь подключить.")
+    return "\n".join(lines)
+
+
+async def selfdev_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    job_id = context.args[0] if context.args else context.user_data.get("selfdev_last_job_id")
+    if not job_id:
+        await update.message.reply_text("Использование: /selfdev_test <job_id>")
+        return
+    await update.message.reply_text(f"🧪 Прогоняю проверки для {job_id}...")
+    try:
+        report = self_improvement.run_selfdev_checks(job_id)
+        checks = report.get("checks", {})
+        lines = [f"Проверки job {job_id}: {'все пройдены' if report.get('success') else 'есть проблемы'}"]
+        lines.extend(f"- {name}: {'OK' if ok else 'FAIL'}" for name, ok in checks.items())
+        if not report.get("success"):
+            lines.append("Ошибки: " + "; ".join(str(e) for e in report.get("errors") or []))
+        else:
+            lines.append(f"Можно ставить: /selfdev_install {job_id}")
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка проверки: {e}")
+
+
+async def selfdev_install_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    job_id = context.args[0] if context.args else context.user_data.get("selfdev_last_job_id")
+    if not job_id:
+        await update.message.reply_text("Использование: /selfdev_install <job_id>")
+        return
+    chat_id, user_id = chat_user_ids(update)
+    await update.message.reply_text(f"📦 Устанавливаю plugin из job {job_id}...")
+    try:
+        report = self_improvement.install_plugin(job_id)
+        await reply_long(
+            update.message,
+            "\n".join(
+                [
+                    f"Plugin {report.get('plugin_name')} установлен и сервис перезапущен.",
+                    "Файлы: " + ", ".join(report.get("installed_paths") or []),
+                ]
+            ),
+        )
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="selfdev_install_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Установка не удалась: {e}")
+
+
+async def selfdev_rollback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /selfdev_rollback <job_id>")
+        return
+    job_id = context.args[0]
+    try:
+        result = self_improvement.rollback_selfdev(job_id)
+        await update.message.reply_text(f"Откатил до {result.get('rolled_back_to')}, сервис перезапущен.")
+    except Exception as e:
+        await update.message.reply_text(f"Rollback не удался: {e}")
+
+
+async def plugins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    items = plugin_manager.list_plugins()
+    if not items:
+        await update.message.reply_text("Установленных plugins пока нет.")
+        return
+    lines = ["Установленные plugins:"]
+    lines.extend(f"- {p['name']} v{p['version']}: {p['description']}" for p in items)
+    await reply_long(update.message, "\n".join(lines))
+
+
+async def plugin_show_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /plugin_show <name>")
+        return
+    name = context.args[0]
+    module = plugin_manager.get_plugin_by_name(name)
+    if not module:
+        await update.message.reply_text(f"Plugin {name} не найден.")
+        return
+    await update.message.reply_text(
+        f"{module.PLUGIN_NAME} v{module.PLUGIN_VERSION}\n{module.PLUGIN_DESCRIPTION}\nфайл: {Path(module.__file__).name}"
+    )
+
+
+async def selfdev_run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /selfdev_run <job_id> <тестовый запрос>")
+        return
+    job_id = context.args[0]
+    test_prompt = " ".join(context.args[1:])
+    chat_id, _ = chat_user_ids(update)
+    try:
+        result = self_improvement.dry_run_plugin(
+            job_id, test_prompt, {"project_name": memory.get_current_project(chat_id), "chat_id": chat_id}
+        )
+        await reply_long(
+            update.message,
+            "\n".join(
+                [
+                    f"Dry-run job {job_id} ({result['plugin_name']}):",
+                    f"can_handle score: {result['can_handle_score']:.2f}",
+                    f"parsed_task: {result['parsed_task']}",
+                    result["planned"],
+                ]
+            ),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Dry-run не удался: {e}")
+
+
+async def _maybe_handle_via_plugin_or_selfdev(
+    user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: str
+) -> tuple[str, dict] | None:
+    """Called only when the normal router/intent system found nothing usable
+    for an action-like message. Tries an installed plugin first (by
+    can_handle score); if none matches and SELFDEV_MODE != off, proposes a
+    brand-new plugin instead of falling back to generic chat. Returns None
+    (caller keeps the original answer) if neither applies or propose_plugin
+    itself fails (e.g. Ollama unreachable)."""
+    plugin_context = {"project_name": memory.get_current_project(chat_id), "chat_id": chat_id}
+    match = plugin_manager.select_plugin(user_text, plugin_context)
+    if match:
+        module, score = match
+        result = await plugin_manager.safe_dispatch(module, update, context, {"user_text": user_text, **plugin_context})
+        answer = str(result.get("answer") or result.get("message") or ("Готово." if result.get("success") else "Не получилось."))
+        return answer, {
+            "detected": {"intent": "plugin", "plugin": module.PLUGIN_NAME, "score": score},
+            "tools_called": [f"plugin:{module.PLUGIN_NAME}"],
+            "errors": [] if result.get("success") else [str(result.get("error") or "plugin failed")],
+        }
+
+    if _effective_selfdev_mode(context) == "off":
+        return None
+    try:
+        spec = self_improvement.propose_plugin(user_text, plugin_context)
+        job_id = self_improvement.new_job_id()
+        self_improvement.write_plugin_to_sandbox(job_id, spec)
+        context.user_data["selfdev_last_job_id"] = job_id
+        return _format_selfdev_proposal(spec, job_id), {
+            "detected": {"intent": "selfdev_propose", "job_id": job_id},
+            "tools_called": ["propose_plugin"],
+            "errors": [],
+        }
+    except Exception:
+        logging.exception("selfdev propose_plugin failed during routing fallback")
+        return None
 
 
 async def debug_last_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4241,6 +4512,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not isinstance(debug_info, dict):
                 debug_info = {}
             debug_info.setdefault("pending_task", pending_task)
+            if (debug_info.get("detected") or {}).get("intent") in ("normal_chat", "unknown") and semantic_router.is_action_like(
+                user_text
+            ):
+                intercepted = await _maybe_handle_via_plugin_or_selfdev(user_text, update, context, chat_id)
+                if intercepted:
+                    answer, intercepted_debug = intercepted
+                    intercepted_debug.setdefault("pending_task", pending_task)
+                    debug_info = intercepted_debug
         except requests.exceptions.ConnectionError as e:
             save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
             answer = (
@@ -4431,6 +4710,18 @@ def main():
     app.add_handler(CommandHandler("agent_debug_off", agent_debug_off))
     app.add_handler(CommandHandler("debug_on", debug_on))
     app.add_handler(CommandHandler("debug_off", debug_off))
+    app.add_handler(CommandHandler("workflow_debug_on", workflow_debug_on))
+    app.add_handler(CommandHandler("workflow_debug_off", workflow_debug_off))
+    app.add_handler(CommandHandler("selfdev_on", selfdev_on))
+    app.add_handler(CommandHandler("selfdev_off", selfdev_off))
+    app.add_handler(CommandHandler("selfdev_status", selfdev_status_command))
+    app.add_handler(CommandHandler("selfdev_propose", selfdev_propose_command))
+    app.add_handler(CommandHandler("selfdev_test", selfdev_test_command))
+    app.add_handler(CommandHandler("selfdev_install", selfdev_install_command))
+    app.add_handler(CommandHandler("selfdev_rollback", selfdev_rollback_command))
+    app.add_handler(CommandHandler("selfdev_run", selfdev_run_command))
+    app.add_handler(CommandHandler("plugins", plugins_command))
+    app.add_handler(CommandHandler("plugin_show", plugin_show_command))
     app.add_handler(CommandHandler("debug_last_intent", debug_last_intent))
     app.add_handler(CommandHandler("router_test", router_test_command))
     app.add_handler(CommandHandler("tts_test", tts_test))

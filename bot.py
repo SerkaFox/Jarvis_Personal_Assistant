@@ -3347,77 +3347,6 @@ def _wants_fixed_attachment(text: str) -> bool:
     return any(word in lowered for word in FIXED_ATTACHMENT_WORDS)
 
 
-IMAGE_LISTING_PHRASES = (
-    "какие фото", "какие фотки", "какие изображения", "какие картинки",
-    "какие фоны", "какой фон", "фото для фона", "фотографии для фона",
-    "картинки для фона", "изображения для фона", "покажи фото", "покажи изображения",
-    "background files", "background images", "what images", "what photos",
-    "images in project", "photos in project", "show images", "list images",
-    "qué imágenes", "que imagenes", "qué fondos", "que fondos", "imágenes del proyecto",
-    "archivos de imagen",
-)
-
-FILE_LISTING_PHRASES = (
-    "какие файлы", "найди файлы", "что лежит в папке", "что лежит в проекте",
-    "список файлов", "покажи файлы", "покажи список файлов", "файлы проекта",
-    "list files", "find files", "what files", "files in project", "show files",
-    "archivos en el proyecto", "lista de archivos", "qué archivos", "que archivos",
-)
-
-
-def _wants_image_listing(text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(phrase in lowered for phrase in IMAGE_LISTING_PHRASES)
-
-
-def _wants_file_listing(text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(phrase in lowered for phrase in FILE_LISTING_PHRASES)
-
-
-def _answer_file_listing_question(user_text: str, project: str) -> tuple[str, dict]:
-    """Deterministic, read-only answer for "what files/images do you have"
-    questions -- never lets Ollama improvise file names. Always backed by
-    list_workspace_project_images/list_workspace_project_files, which only
-    ever report files that genuinely exist under WRITE_ROOT/<project>."""
-    wants_images = _wants_image_listing(user_text)
-    try:
-        if wants_images:
-            result = list_workspace_project_images(project)
-            images = result["images"]
-            if not images:
-                searched = ", ".join(result["searched_dirs"]) or "assets/img, assets/images, static/img, public/img"
-                answer = f"В проекте {project} изображений не найдено (искал в: {searched})."
-            else:
-                lines = [f"В проекте {project} нашёл изображения:"]
-                lines.extend(f"- {img['path']}" for img in images)
-                answer = "\n".join(lines)
-            tools_called = ["list_workspace_project_images"]
-        else:
-            result = list_workspace_project_files(project, depth=3)
-            files = result["files"]
-            if not files:
-                answer = f"В проекте {project} файлов не найдено."
-            else:
-                shown = files[:100]
-                lines = [f"В проекте {project} нашёл файлы:"]
-                lines.extend(f"- {f['path']}" for f in shown)
-                if len(files) > len(shown):
-                    lines.append(f"... и ещё {len(files) - len(shown)} файлов")
-                answer = "\n".join(lines)
-            tools_called = ["list_workspace_project_files"]
-        return answer, {
-            "detected": {"intent": "list_workspace_files", "project": project},
-            "tools_called": tools_called,
-            "errors": [],
-        }
-    except ToolError as e:
-        return (
-            f"Не смог получить список файлов проекта {project}: {e}",
-            {"detected": {"intent": "list_workspace_files", "project": project}, "tools_called": [], "errors": [str(e)]},
-        )
-
-
 async def _check_background_live(project_name: str, base_url: str, relative_image: str) -> dict[str, Any]:
     """Read-only liveness check: confirms image/CSS are reachable over HTTP and,
     if Playwright is available, that the background-image is actually applied
@@ -4286,29 +4215,41 @@ async def selfdev_run_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Dry-run не удался: {e}")
 
 
+async def _try_installed_plugin(
+    user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: str
+) -> tuple[str, dict] | None:
+    """Universal extension point: scores user_text against every installed
+    plugin's can_handle() and dispatches to the best match above threshold.
+    This is how new capabilities should be added going forward (see
+    plugins/workspace_inspector.py) instead of one-off phrase branches in
+    bot.py. Returns None if no plugin is confident enough -- caller falls
+    through to the normal router."""
+    plugin_context = {"project_name": _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id), "chat_id": chat_id}
+    match = plugin_manager.select_plugin(user_text, plugin_context)
+    if not match:
+        return None
+    module, score = match
+    result = await plugin_manager.safe_dispatch(module, update, context, {"user_text": user_text, **plugin_context})
+    answer = str(result.get("answer") or result.get("message") or ("Готово." if result.get("success") else "Не получилось."))
+    return answer, {
+        "detected": {"intent": "plugin", "plugin": module.PLUGIN_NAME, "score": score},
+        "tools_called": [f"plugin:{module.PLUGIN_NAME}"],
+        "errors": [] if result.get("success") else [str(result.get("error") or "plugin failed")],
+    }
+
+
 async def _maybe_handle_via_plugin_or_selfdev(
     user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: str
 ) -> tuple[str, dict] | None:
     """Called only when the normal router/intent system found nothing usable
-    for an action-like message. Tries an installed plugin first (by
-    can_handle score); if none matches and SELFDEV_MODE != off, proposes a
-    brand-new plugin instead of falling back to generic chat. Returns None
-    (caller keeps the original answer) if neither applies or propose_plugin
-    itself fails (e.g. Ollama unreachable)."""
-    plugin_context = {"project_name": memory.get_current_project(chat_id), "chat_id": chat_id}
-    match = plugin_manager.select_plugin(user_text, plugin_context)
-    if match:
-        module, score = match
-        result = await plugin_manager.safe_dispatch(module, update, context, {"user_text": user_text, **plugin_context})
-        answer = str(result.get("answer") or result.get("message") or ("Готово." if result.get("success") else "Не получилось."))
-        return answer, {
-            "detected": {"intent": "plugin", "plugin": module.PLUGIN_NAME, "score": score},
-            "tools_called": [f"plugin:{module.PLUGIN_NAME}"],
-            "errors": [] if result.get("success") else [str(result.get("error") or "plugin failed")],
-        }
-
+    for an action-like message (an installed plugin already had its shot
+    earlier in handle_text via _try_installed_plugin). If SELFDEV_MODE !=
+    off, proposes a brand-new plugin instead of falling back to generic
+    chat. Returns None (caller keeps the original answer) if selfdev is off
+    or propose_plugin itself fails (e.g. Ollama unreachable)."""
     if _effective_selfdev_mode(context) == "off":
         return None
+    plugin_context = {"project_name": memory.get_current_project(chat_id), "chat_id": chat_id}
     try:
         spec = self_improvement.propose_plugin(user_text, plugin_context)
         job_id = self_improvement.new_job_id()
@@ -4574,13 +4515,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if _wants_image_listing(user_text) or _wants_file_listing(user_text):
-            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
-            if project:
-                answer, _debug_info = _answer_file_listing_question(user_text, project)
-                await reply_long(update.message, answer)
-                return
-
         available_media = get_latest_available_media(chat_id)
         if _wants_background_from_latest_photo(user_text, has_pending_media=bool(available_media)):
             if not available_media:
@@ -4596,6 +4530,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update.message, context, project_name=project, media=available_media, target=target, fixed=fixed
             )
             return
+
+        # Installed plugins (plugin_manager) get first refusal on free text via
+        # their own can_handle() score -- this is the general extension point
+        # for "Jarvis doesn't know how to do X yet" cases (see
+        # plugins/workspace_inspector.py for the reference pattern: semantic
+        # routing decides applicability, a safe deterministic tool does the
+        # work, never an LLM guessing). Only dispatches when some plugin is
+        # confident; otherwise falls through to the normal router below.
+        plugin_answer = await _try_installed_plugin(user_text, update, context, chat_id)
+        if plugin_answer:
+            answer, _plugin_debug_info = plugin_answer
+            await reply_long(update.message, answer)
+            return
+
         recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
         message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
         use_agent = bool(context.user_data.get("agent_enabled"))

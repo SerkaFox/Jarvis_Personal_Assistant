@@ -369,3 +369,40 @@ Creates real files under `/home/seradmin/jarvis_workspace/Botosite` when write m
 ```text
 сколько мне лет?
 ```
+
+## Plugins & Self-Improvement
+
+Jarvis can be extended with plugins instead of growing more phrase-matching
+branches in `bot.py`. A plugin is a single file under `plugins/<name>.py`
+exposing `PLUGIN_NAME`, `PLUGIN_VERSION`, `PLUGIN_DESCRIPTION`,
+`can_handle(user_text, context) -> float`, `async handle(update, context,
+parsed_task) -> dict`, and `smoke_tests()`. `plugin_manager.py` loads every
+`plugins/*.py` file, validates the interface, and scores `can_handle()`
+against incoming text -- the best match above threshold gets dispatched
+before the normal semantic router runs (see `_try_installed_plugin` in
+`bot.py`).
+
+See [`docs/selfdev/workspace_inspector.md`](docs/selfdev/workspace_inspector.md)
+for the reference example: `plugins/workspace_inspector.py` answers "what
+files/images do you have" questions using only deterministic, read-only
+WRITE_ROOT tools, so it can never hallucinate a file name.
+
+If no installed plugin or existing workflow can handle a request, Jarvis can
+propose a brand-new one via `self_improvement.py`'s controlled pipeline:
+
+```text
+/selfdev_on, /selfdev_off       -- enable/disable proposing new skills (default: suggest)
+/selfdev_propose <task>         -- ask Ollama (local only) for a new plugin spec, sandboxed
+/selfdev_run <job_id> <prompt>  -- dry-run: can_handle score + parsed task, no changes
+/selfdev_test <job_id>          -- py_compile + forbidden-import scan + real unittest run
+/selfdev_install <job_id>       -- copy into plugins/+tests/, commit, restart, health-check
+/selfdev_rollback <job_id>      -- git reset --hard to the pre-install commit
+/plugins, /plugin_show <name>   -- list/inspect installed plugins
+```
+
+Self-improvement only ever writes inside `plugins/`, `tests/`, `skills/`,
+`docs/selfdev/` (an allowlist, not a denylist) -- `.env`, `bot.py`,
+`config.py`, `venv/`, `data/*.db`, and anything outside the project root are
+never reachable by generated code. `install_plugin` always re-runs the
+safety checks fresh, and rolls back automatically if the post-install
+restart or health check fails.

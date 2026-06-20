@@ -43,6 +43,22 @@ def _init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+    _ensure_columns(conn)
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Additive schema migration: failed_at/failed_reason/retry_count track
+    failed attempts separately from used_at so 'failed' never reuses the
+    'used' bookkeeping columns (avoids 'failed sets used' confusion)."""
+    existing = {row["name"] for row in conn.execute("pragma table_info(pending_media)").fetchall()}
+    for column, ddl in (
+        ("failed_at", "text"),
+        ("failed_reason", "text"),
+        ("retry_count", "integer default 0"),
+    ):
+        if column not in existing:
+            conn.execute(f"alter table pending_media add column {column} {ddl}")
+    conn.commit()
 
 
 def save_pending_media(
@@ -126,22 +142,64 @@ def mark_media_used(media_id: int, project_name: str, saved_path: str) -> None:
         conn.commit()
 
 
-def mark_media_failed(media_id: int, project_name: str = "", saved_path: str = "") -> None:
-    """Marks a pending media item as failed (workflow did not complete). Never
-    sets status='used', so a failed attempt doesn't silently consume the photo."""
+def mark_media_failed(media_id: int, project_name: str = "", saved_path: str = "", reason: str = "") -> None:
+    """Marks a pending media item as failed (workflow did not complete).
+    Sets status='failed' and records failed_at/failed_reason -- it never
+    touches used_at/sets status='used', so a failed attempt doesn't silently
+    consume the photo and stays distinguishable from a real success.
+    get_latest_available_media() can still return it for a retry."""
     with _get_conn() as conn:
         conn.execute(
             """
             update pending_media
                set status = 'failed',
-                   used_at = ?,
+                   failed_at = ?,
+                   failed_reason = ?,
                    used_project = ?,
-                   saved_path = ?
+                   saved_path = ?,
+                   retry_count = coalesce(retry_count, 0) + 1
              where id = ?
             """,
-            (_now_utc_iso(), str(project_name), str(saved_path), int(media_id)),
+            (_now_utc_iso(), str(reason or "")[:500], str(project_name), str(saved_path), int(media_id)),
         )
         conn.commit()
+
+
+def get_latest_available_media(chat_id: str, max_age_minutes: int = 60) -> dict[str, Any] | None:
+    """Returns the most recent media usable for a background-image workflow:
+    an unconsumed 'pending' item if there is one, otherwise the most recent
+    'failed' item within max_age_minutes -- so the user can say "попробуй
+    ещё раз" without resending the photo."""
+    pending = get_latest_pending_media(chat_id, max_age_minutes=max_age_minutes)
+    if pending:
+        return pending
+    cutoff = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=max_age_minutes)
+    cutoff_iso = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            select *
+            from pending_media
+            where chat_id = ?
+              and status = 'failed'
+              and received_at >= ?
+            order by id desc
+            limit 1
+            """,
+            (str(chat_id), cutoff_iso),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_media_any_status(chat_id: str) -> dict[str, Any] | None:
+    """Returns the most recent pending_media row for a chat regardless of
+    status, for /last_media diagnostics."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "select * from pending_media where chat_id = ? order by id desc limit 1",
+            (str(chat_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def clear_old_pending_media(max_age_minutes: int = 240) -> int:

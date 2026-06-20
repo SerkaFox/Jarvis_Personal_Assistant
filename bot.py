@@ -60,6 +60,7 @@ from tools_media import (
     pillow_available,
     save_telegram_image_to_project,
     set_hero_background,
+    resolve_existing_project_image,
     optimize_image_to_webp,
     save_image_to_project,
     set_fixed_background,
@@ -67,6 +68,8 @@ from tools_media import (
 )
 from tools_pending_media import (
     clear_old_pending_media,
+    get_latest_available_media,
+    get_latest_media_any_status,
     get_latest_pending_media,
     mark_media_failed,
     mark_media_used,
@@ -167,7 +170,12 @@ def get_system_prompt() -> str:
 
 
 def is_allowed(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == ALLOWED_USER_ID
+    # Read the env var at call time rather than the ALLOWED_USER_ID module
+    # constant: tests import bot.py before some test modules get a chance to
+    # set ALLOWED_USER_ID, which would otherwise bake in a stale value (0)
+    # for the rest of the process.
+    allowed_id = int(os.getenv("ALLOWED_USER_ID", "0"))
+    return bool(update.effective_user) and update.effective_user.id == allowed_id
 
 
 def ask_ollama(user_text: str, chat_id: str | None = None) -> str:
@@ -3154,7 +3162,7 @@ async def set_background_command(update: Update, context: ContextTypes.DEFAULT_T
     project, image_name = context.args[0], context.args[1]
     chat_id, user_id = chat_user_ids(update)
     try:
-        info = set_hero_background(project, f"assets/img/{image_name}")
+        info = resolve_existing_project_image(project, f"assets/img/{image_name}")
         task_text = (
             f"Используй изображение {info['relative_path']} как фон hero-секции "
             "(background-image, cover, по центру, без потери читаемости текста). Сохрани остальной функционал."
@@ -3170,6 +3178,40 @@ async def set_background_command(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="set_background_command", error=e, user_text=update.message.text or "")
         await update.message.reply_text(f"Ошибка /set_background: {e}")
+
+
+async def last_media_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    media = get_latest_media_any_status(chat_id)
+    if not media:
+        await update.message.reply_text("Фото ещё не присылали.")
+        return
+    lines = [
+        f"Статус: {media.get('status') or '-'}",
+        f"Проект: {media.get('used_project') or '-'}",
+        f"Файл: {media.get('saved_path') or '-'}",
+    ]
+    if media.get("status") == "failed":
+        lines.append(f"Причина: {media.get('failed_reason') or '-'}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def retry_media_background_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /retry_media_background <project> [hero]")
+        return
+    project = context.args[0]
+    target = "hero_background" if len(context.args) > 1 and "hero" in context.args[1].lower() else "whole_page_background"
+    chat_id, _ = chat_user_ids(update)
+    media = get_latest_available_media(chat_id)
+    if not media:
+        await update.message.reply_text("Нет фото для повтора. Пришли фото ещё раз.")
+        return
+    await add_background_image_workflow(update.message, context, project_name=project, media=media, target=target)
 
 
 IMAGE_CAPTION_PHRASES = (
@@ -3189,19 +3231,81 @@ BACKGROUND_AFTER_PHOTO_PHRASES = (
     "сделай фоном сайта",
     "поставь на задний фон",
     "поставь как фон",
+    "поставь его фоном",
+    "поставь это фоном",
+    "поставь фото фоном",
+    "поставь её фоном",
+    "сделай это фото фоном",
+    "сделай его фоном",
+    "сделай фото фоном",
+    "добавь это фото в hero",
+    "добавь фото в hero",
+    "добавь это фото как фон",
+    "поставь его фоном на блок херо",
+    "поставь фото фоном на hero",
+    "фоном на блок херо",
+    "фоном на hero",
     "add it as background",
     "use it as background",
     "as background",
     "set as background",
+    "use this photo as hero background",
+    "use this photo as background",
+    "use it as hero background",
     "usalo como fondo",
     "úsalo como fondo",
     "como fondo",
+    "pon esta foto como fondo del hero",
+    "pon esta foto como fondo",
+)
+
+# Broader fallback: if pending_media exists and the text combines *any* photo
+# reference word with *any* background/hero reference word, treat it as a
+# background-from-photo request even if the exact phrase isn't in the list
+# above. This must win over the generic edit_workspace_site routing.
+PHOTO_REFERENCE_WORDS = (
+    "фото", "фотк", "фотограф", "снимок", "картинк", "изображен",
+    "это", "него", "ее", "её", "его",
+    "photo", "picture", "image", "this photo", "this picture", "this image",
+    "esta foto", "esa foto", "la foto",
+)
+BACKGROUND_REFERENCE_WORDS = (
+    "фон", "background", "hero", "херо", "fondo",
 )
 
 
-def _wants_background_from_latest_photo(text: str) -> bool:
+def _wants_background_from_latest_photo(text: str, *, has_pending_media: bool = False) -> bool:
     lowered = (text or "").lower()
-    return any(phrase in lowered for phrase in BACKGROUND_AFTER_PHOTO_PHRASES)
+    if any(phrase in lowered for phrase in BACKGROUND_AFTER_PHOTO_PHRASES):
+        return True
+    if not has_pending_media:
+        # The broad word-combination heuristic below is only safe to apply
+        # when we already know there's a photo waiting -- otherwise generic
+        # phrases like "поменяй фон, это плохо смотрится" would misfire.
+        return False
+    has_photo_ref = any(word in lowered for word in PHOTO_REFERENCE_WORDS)
+    has_background_ref = any(word in lowered for word in BACKGROUND_REFERENCE_WORDS)
+    return has_photo_ref and has_background_ref
+
+
+HERO_TARGET_WORDS = (
+    "hero", "херо", "блок херо", "hero block", "hero section", "hero-секц", "героическ",
+)
+
+
+def _wants_hero_target(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(word in lowered for word in HERO_TARGET_WORDS)
+
+
+FIXED_ATTACHMENT_WORDS = (
+    "закрепи", "зафиксир", "закреплён", "закреплен", "fixed", "fija", "fijo",
+)
+
+
+def _wants_fixed_attachment(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(word in lowered for word in FIXED_ATTACHMENT_WORDS)
 
 
 async def _check_background_live(project_name: str, base_url: str, relative_image: str) -> dict[str, Any]:
@@ -3237,7 +3341,14 @@ async def add_background_image_workflow(
     *,
     project_name: str,
     media: dict[str, Any],
+    target: str = "whole_page_background",
+    fixed: bool = False,
 ) -> None:
+    """Downloads/converts the pending photo and applies it as a CSS background.
+    target == "hero_background" scopes the CSS to the page's hero element
+    (tools_media.set_hero_background); otherwise it's a whole-page body
+    background (tools_media.set_fixed_background). Never calls Ollama/
+    edit_workspace_site -- this is a deterministic, targeted CSS-only patch."""
     chat_id = str(message.chat.id) if getattr(message, "chat", None) else ""
     user_id = str(message.from_user.id) if getattr(message, "from_user", None) else ""
     tracker = ProgressTracker(message)
@@ -3245,8 +3356,14 @@ async def add_background_image_workflow(
     save_current_task(chat_id, intent, project_name, "starting")
     step = 0
     total = 6
+    hero = target == "hero_background"
     try:
-        await tracker.step(f"🖼 Фото найдено, добавляю его на фон сайта {project_name}...")
+        intro = (
+            f"🖼 Пробую применить последнее фото как фон hero-блока сайта {project_name}..."
+            if hero
+            else f"🖼 Пробую применить последнее фото как фон сайта {project_name}..."
+        )
+        await tracker.step(intro)
 
         step = 1
         update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "download_telegram")
@@ -3284,8 +3401,11 @@ async def add_background_image_workflow(
 
         step = 4
         update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "update_css")
-        await tracker.step(f"Шаг {step}/{total}: обновляю CSS...")
-        set_fixed_background(project_name, relative_image)
+        await tracker.step(f"Шаг {step}/{total}: обновляю CSS{' для hero-блока' if hero else ''}...")
+        if hero:
+            set_hero_background(project_name, relative_image, fixed=fixed)
+        else:
+            set_fixed_background(project_name, relative_image)
 
         step = 5
         update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "verify_assets")
@@ -3313,7 +3433,10 @@ async def add_background_image_workflow(
         repaired = False
         if not live["ok"]:
             await tracker.step("⚠️ Фон не подтвердился, пробую исправить CSS-путь...")
-            set_fixed_background(project_name, relative_image)
+            if hero:
+                set_hero_background(project_name, relative_image, fixed=fixed)
+            else:
+                set_fixed_background(project_name, relative_image)
             live = await _check_background_live(project_name, base_url, relative_image)
             repaired = True
         if not live["ok"]:
@@ -3326,32 +3449,45 @@ async def add_background_image_workflow(
         mark_media_used(int(media["id"]), project_name, str(out_abs))
 
         if live["background_image_loaded"]:
-            browser_note = "Проверка: фон подтверждён браузером."
+            check_note = "Проверка: изображение отдаётся сайтом HTTP 200. Браузер подтвердил фон."
         else:
-            browser_note = "Проверка: файлы отдаются с сайта (браузерная проверка недоступна)."
+            check_note = (
+                "Проверка: изображение отдаётся сайтом HTTP 200. "
+                "Браузерная проверка недоступна, но файл изображения и CSS проверены."
+            )
         if repaired:
-            browser_note += " Потребовалось автоисправление CSS-пути."
+            check_note += " Потребовалось автоисправление CSS-пути."
 
-        await tracker.step("✅ Готово. Фото добавлено как фиксированный фон.")
+        await tracker.step("✅ Готово.")
+        headline = (
+            "Готово. Фото применено как фон hero-блока сайта."
+            if hero
+            else "Готово. Фото применено как фон сайта."
+        )
         await message.reply_text(
             "\n".join(
                 [
-                    "Готово. Фото добавлено как фиксированный фон сайта.",
+                    headline,
                     f"Проект: {project_name}",
-                    f"Файл изображения: {relative_image}",
+                    f"Фото сохранено: {relative_image}",
+                    "CSS обновлён: assets/css/style.css",
+                    check_note,
                     f"Открыть сайт: {preview_url_for_port(port)}",
-                    browser_note,
                 ]
             )
         )
     except Exception as e:
+        downloaded_ok = "out_abs" in locals()
         try:
             saved_hint = str(locals().get("out_abs", "") or "")
-            mark_media_failed(int(media["id"]), project_name, saved_hint)
+            mark_media_failed(int(media["id"]), project_name, saved_hint, reason=str(e))
         except Exception:
             pass
         save_last_error(chat_id=chat_id, user_id=user_id, handler="add_background_image_workflow", error=e, user_text=str(getattr(message, "text", "") or getattr(message, "caption", "") or ""))
-        await message.reply_text(f"Не смог добавить фото на фон (шаг {step}/{total}): {e}")
+        if downloaded_ok:
+            await message.reply_text(f"Фото скачано, но не удалось применить фон: {e}")
+        else:
+            await message.reply_text(f"Фото не было скачано, поэтому CSS не трогал. ({e})")
     finally:
         clear_current_task(chat_id)
 
@@ -3403,12 +3539,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'Напиши, например: "добавь это фото на фон сайта hola".'
         )
 
-        if _wants_image_on_site(caption) or _wants_background_from_latest_photo(caption):
+        if _wants_image_on_site(caption) or _wants_background_from_latest_photo(caption, has_pending_media=True):
             project = _workspace_project_from_context(caption, chat_id) or memory.get_current_project(chat_id)
             if not project:
                 await message.reply_text("На какой сайт добавить фото? Напиши имя проекта, например: hola")
                 return
-            await add_background_image_workflow(message, context, project_name=project, media=media)
+            target = "hero_background" if _wants_hero_target(caption) else "whole_page_background"
+            fixed = _wants_fixed_attachment(caption)
+            await add_background_image_workflow(
+                message, context, project_name=project, media=media, target=target, fixed=fixed
+            )
     except Exception as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_photo", error=e, user_text=caption)
         await message.reply_text(f"Ошибка обработки фото: {e}")
@@ -3635,6 +3775,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/browser_check <project> - проверить запущенный preview через Playwright",
                 "/images <project> - список изображений проекта (assets/img)",
                 "/set_background <project> <image_name> - поставить изображение фоном hero-секции",
+                "/last_media - статус последнего присланного фото",
+                "/retry_media_background <project> [hero] - повторить применение последнего фото без повторной отправки",
                 "/new_flask <name> - создать Flask-проект в WRITE_ROOT",
                 "/write_file <project>/<file> <content> - записать текстовый файл",
                 "/delete_file <project>/<file> - удалить файл из WRITE_ROOT",
@@ -4051,16 +4193,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if _wants_background_from_latest_photo(user_text):
-            media = get_latest_pending_media(chat_id)
-            if not media:
+        available_media = get_latest_available_media(chat_id)
+        if _wants_background_from_latest_photo(user_text, has_pending_media=bool(available_media)):
+            if not available_media:
                 await update.message.reply_text("Я не вижу последнего фото. Пришли фото еще раз.")
                 return
             project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
             if not project:
                 await update.message.reply_text("На какой сайт добавить фото? Напиши имя проекта, например: hola")
                 return
-            await add_background_image_workflow(update.message, context, project_name=project, media=media)
+            target = "hero_background" if _wants_hero_target(user_text) else "whole_page_background"
+            fixed = _wants_fixed_attachment(user_text)
+            await add_background_image_workflow(
+                update.message, context, project_name=project, media=available_media, target=target, fixed=fixed
+            )
             return
         recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
         message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
@@ -4270,6 +4416,8 @@ def main():
     app.add_handler(CommandHandler("browser_check", browser_check_command))
     app.add_handler(CommandHandler("images", images_command))
     app.add_handler(CommandHandler("set_background", set_background_command))
+    app.add_handler(CommandHandler("last_media", last_media_command))
+    app.add_handler(CommandHandler("retry_media_background", retry_media_background_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("forget", forget_command))

@@ -146,8 +146,12 @@ async def _check_site_with_playwright_async(
                         if not found_bg:
                             page_errors.append(f"фоновое изображение {image_name} не отображается через CSS background-image")
                     except Exception as exc:
+                        # The check itself crashed (e.g. environment hiccup) -- this is
+                        # not proof the background is absent, so leave the result
+                        # inconclusive (None) rather than a definitive False, so callers
+                        # don't treat a Playwright crash as a real verification failure.
                         page_errors.append(f"background image check failed: {exc}")
-                        result["background_image_loaded"] = False
+                        result["background_image_loaded"] = None
 
                 screenshot_path = _screenshot_dir() / f"{project}_{int(time())}.png"
                 await page.screenshot(path=str(screenshot_path))

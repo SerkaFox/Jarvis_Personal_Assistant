@@ -156,11 +156,129 @@ def _resolve_project_image_path(project_name: str, image_relative_path: str) -> 
     return {"project_name": project, "relative_path": cleaned, "path": str(candidate)}
 
 
-def set_hero_background(project_name: str, image_relative_path: str) -> dict[str, Any]:
+def resolve_existing_project_image(project_name: str, image_relative_path: str) -> dict[str, Any]:
+    """Read-only: validates the path and requires the file to already exist."""
     info = _resolve_project_image_path(project_name, image_relative_path)
     if not Path(info["path"]).is_file():
         raise ToolError(f"Изображение не найдено: {info['path']}")
     return info
+
+
+_HERO_CLASS_RE = re.compile(r'class\s*=\s*"([^"]*\bhero[\w-]*\b[^"]*)"', re.IGNORECASE)
+_HERO_ID_RE = re.compile(r'id\s*=\s*"([^"]*\bhero[\w-]*\b[^"]*)"', re.IGNORECASE)
+_HEADER_TAG_RE = re.compile(r"<header\b([^>]*)>", re.IGNORECASE)
+_SECTION_TAG_RE = re.compile(r"<section\b([^>]*)>", re.IGNORECASE)
+_CLASS_ATTR_RE = re.compile(r'class\s*=\s*"([^"]*)"')
+
+
+def _inject_attrs_with_hero_class(attrs: str) -> str:
+    class_match = _CLASS_ATTR_RE.search(attrs)
+    if class_match:
+        return attrs[: class_match.start(1)] + (class_match.group(1) + " jarvis-hero").strip() + attrs[class_match.end(1) :]
+    return attrs + ' class="jarvis-hero"'
+
+
+def _ensure_hero_selector(index_path: Path) -> tuple[str, bool]:
+    """Finds an existing hero-ish element in index.html (.hero/.hero-section/
+    #hero or similar) and returns a CSS selector for it. If none exists, makes
+    one minimal, deterministic patch -- adds class="jarvis-hero" to the first
+    <header> or <section> tag (or falls back to body, untouched) -- and
+    returns the new selector. Never touches <script> content. Returns
+    (css_selector, html_was_modified)."""
+    if not index_path.is_file():
+        return "body", False
+    html = index_path.read_text(encoding="utf-8", errors="replace")
+
+    class_match = _HERO_CLASS_RE.search(html)
+    if class_match:
+        classes = class_match.group(1).split()
+        hero_class = next((c for c in classes if "hero" in c.lower()), classes[0])
+        return f".{hero_class}", False
+
+    id_match = _HERO_ID_RE.search(html)
+    if id_match:
+        return f"#{id_match.group(1)}", False
+
+    for tag_re, tag_name in ((_HEADER_TAG_RE, "header"), (_SECTION_TAG_RE, "section")):
+        tag_match = tag_re.search(html)
+        if tag_match:
+            new_attrs = _inject_attrs_with_hero_class(tag_match.group(1))
+            patched = html[: tag_match.start()] + f"<{tag_name}{new_attrs}>" + html[tag_match.end() :]
+            index_path.write_text(patched, encoding="utf-8")
+            return ".jarvis-hero", True
+
+    return "body", False
+
+
+def set_hero_background(project_name: str, image_relative_path: str, *, fixed: bool = False) -> dict[str, Any]:
+    """Sets the image as the background of the page's hero element specifically
+    (auto-detected via .hero/.hero-section/#hero; otherwise the first
+    <header>/<section> is minimally patched with class="jarvis-hero"; otherwise
+    falls back to body). Writes an idempotent, marker-delimited CSS block
+    referencing assets/img via a relative ../img/<file> url, with cover/center/
+    no-repeat and a translucent overlay for text contrast. background-attachment
+    is only set to fixed when explicitly requested. Never rewrites the rest of
+    the site and never touches JS."""
+    info = resolve_existing_project_image(project_name, image_relative_path)
+    project = info["project_name"]
+    root = resolve_write_path(project).resolve()
+    css_path = (root / CSS_PATH).resolve()
+    if not css_path.is_file():
+        raise ToolError(f"CSS не найден: {css_path}")
+    index_path = (root / "index.html").resolve()
+    selector, html_patched = _ensure_hero_selector(index_path)
+
+    image_name = Path(info["relative_path"]).name
+    css_url = f'url(\"../img/{image_name}\")'
+    attachment = "fixed" if fixed else "scroll"
+    marker_start = "/* jarvis-hero-background:start */"
+    marker_end = "/* jarvis-hero-background:end */"
+    block = "\n".join(
+        [
+            marker_start,
+            f"{selector}{{",
+            "  position: relative;",
+            f"  background-image: {css_url};",
+            "  background-size: cover;",
+            "  background-position: center;",
+            "  background-repeat: no-repeat;",
+            f"  background-attachment: {attachment};",
+            "}",
+            f"{selector}::before{{",
+            '  content: "";',
+            "  position: absolute;",
+            "  inset: 0;",
+            "  background: rgba(0, 0, 0, 0.35);",
+            "  pointer-events: none;",
+            "}",
+            f"{selector} > * {{",
+            "  position: relative;",
+            "  z-index: 1;",
+            "}",
+            "@media (prefers-reduced-motion: reduce){",
+            f"  {selector}{{ background-attachment: scroll; }}",
+            "}",
+            marker_end,
+            "",
+        ]
+    )
+    original = css_path.read_text(encoding="utf-8", errors="replace")
+    if marker_start in original and marker_end in original:
+        before, _mid = original.split(marker_start, 1)
+        _old, after = _mid.split(marker_end, 1)
+        updated = before.rstrip() + "\n\n" + block + after.lstrip()
+    else:
+        updated = original.rstrip() + "\n\n" + block
+    css_path.write_text(updated, encoding="utf-8")
+    logging.info("tools_media set_hero_background %s -> %s (%s)", project, css_path, selector)
+    return {
+        "project_name": project,
+        "css_path": str(css_path),
+        "image_relative_path": info["relative_path"],
+        "css_url": css_url,
+        "target_selector": selector,
+        "html_patched": html_patched,
+    }
 
 
 async def download_telegram_file(bot, file_id: str, dest_path: str) -> dict[str, Any]:
@@ -221,7 +339,7 @@ def set_fixed_background(project_name: str, image_relative_path: str) -> dict[st
     """Updates assets/css/style.css to reference the image as a fixed background.
     The URL is written as url(\"../img/<file>\") and inserted idempotently."""
     ensure_write_root()
-    info = set_hero_background(project_name, image_relative_path)
+    info = resolve_existing_project_image(project_name, image_relative_path)
     project = info["project_name"]
     root = resolve_write_path(project).resolve()
     css_path = (root / CSS_PATH).resolve()

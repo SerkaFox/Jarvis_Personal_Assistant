@@ -2,9 +2,25 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+# Force (not setdefault) -- some other test module imported earlier in a full
+# suite run may have already triggered config.py's load_dotenv(), which would
+# otherwise populate ALLOWED_USER_ID from the real .env and make is_allowed()
+# reject the fake test users below. This must win regardless of import order.
+os.environ["ALLOWED_USER_ID"] = "123"
+os.environ.setdefault("TELEGRAM_TOKEN", "test-token")
+os.environ.setdefault("PYTHON_DOTENV_DISABLED", "1")
 
 import config
+
+
+def _pillow_installed() -> bool:
+    try:
+        import PIL  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
@@ -150,9 +166,10 @@ class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
 
         called = {}
 
-        async def fake_workflow(message, context, *, project_name, media):
+        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
             called["project"] = project_name
             called["media_id"] = media["id"]
+            called["target"] = target
             await message.reply_text("ok")
 
         with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow):
@@ -168,6 +185,158 @@ class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
         update = FakeUpdate("помести на фон сайта hola")
         await bot.handle_text(update, FakeContext())
         self.assertTrue(any("не вижу последнего фото" in reply.lower() for reply in update.message.replies))
+
+    async def test_hero_phrase_with_pending_photo_routes_to_media_workflow_not_edit(self):
+        from tools_pending_media import save_pending_media
+        import bot
+        import memory
+        from test_error_smoke import FakeContext, FakeUpdate
+
+        save_pending_media("456", "123", "file_hero1", file_unique_id="uh1", mime_type="image/jpeg", size_bytes=100)
+        memory.set_current_project("456", "hola")
+
+        called = {}
+
+        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
+            called["project"] = project_name
+            called["target"] = target
+            await message.reply_text("ok")
+
+        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow), \
+             patch.object(bot, "edit_workspace_site_workflow") as edit_mock:
+            update = FakeUpdate("вот фото, поставь его фоном на блок херо на сайте")
+            await bot.handle_text(update, FakeContext())
+
+        self.assertEqual(called.get("project"), "hola")
+        self.assertEqual(called.get("target"), "hero_background")
+        edit_mock.assert_not_called()
+
+    async def test_hero_phrase_with_explicit_project_extracts_project_and_hero_target(self):
+        from tools_pending_media import save_pending_media
+        import bot
+        from test_error_smoke import FakeContext, FakeUpdate
+
+        save_pending_media("456", "123", "file_hero2", file_unique_id="uh2", mime_type="image/jpeg", size_bytes=100)
+
+        called = {}
+
+        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
+            called["project"] = project_name
+            called["target"] = target
+            await message.reply_text("ok")
+
+        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow), \
+             patch.object(bot, "edit_workspace_site_workflow") as edit_mock:
+            update = FakeUpdate("поставь фото фоном на hero сайта hola")
+            await bot.handle_text(update, FakeContext())
+
+        self.assertEqual(called.get("project"), "hola")
+        self.assertEqual(called.get("target"), "hero_background")
+        edit_mock.assert_not_called()
+
+    def test_failed_media_can_be_retried_via_get_latest_available_media(self):
+        from tools_pending_media import (
+            get_latest_available_media,
+            get_latest_pending_media,
+            mark_media_failed,
+            save_pending_media,
+        )
+
+        item = save_pending_media("456", "123", "file_retry", file_unique_id="uretry", mime_type="image/jpeg", size_bytes=10)
+        mark_media_failed(int(item["id"]), "hola", "", reason="boom")
+
+        self.assertIsNone(get_latest_pending_media("456"))
+        retried = get_latest_available_media("456")
+        self.assertIsNotNone(retried)
+        self.assertEqual(retried["id"], item["id"])
+        self.assertEqual(retried["status"], "failed")
+
+    def test_set_hero_background_writes_correct_url_and_selector(self):
+        from tools_write import create_project_dir, write_text_file
+        from tools_media import set_hero_background
+
+        create_project_dir("herourl")
+        write_text_file("herourl", "assets/css/style.css", "body{color:#000}\n", overwrite=False)
+        write_text_file(
+            "herourl", "index.html", '<html><body><header class="hero"></header></body></html>', overwrite=False
+        )
+        img_path = Path(self.tmp.name) / "herourl" / "assets" / "img" / "bg.webp"
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"RIFF0000WEBP")
+
+        result = set_hero_background("herourl", "assets/img/bg.webp")
+        css_text = Path(result["css_path"]).read_text(encoding="utf-8")
+        self.assertIn('url("../img/bg.webp")', css_text)
+        self.assertEqual(result["target_selector"], ".hero")
+
+    def test_set_hero_background_does_not_touch_js(self):
+        from tools_write import create_static_site
+        from tools_media import set_hero_background
+
+        create_static_site("herojs")
+        js_path = Path(self.tmp.name) / "herojs" / "assets" / "js" / "main.js"
+        before = js_path.read_text(encoding="utf-8")
+        img_path = Path(self.tmp.name) / "herojs" / "assets" / "img" / "bg.webp"
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"RIFF0000WEBP")
+
+        set_hero_background("herojs", "assets/img/bg.webp")
+        after = js_path.read_text(encoding="utf-8")
+        self.assertEqual(before, after)
+
+    def test_add_background_image_workflow_never_calls_ollama_or_full_site_edit(self):
+        import inspect
+        import bot
+
+        source = inspect.getsource(bot.add_background_image_workflow)
+        self.assertNotIn("ask_ollama_for_site_edit", source)
+        self.assertNotIn("edit_workspace_site_workflow", source)
+
+    @unittest.skipUnless(_pillow_installed(), "Pillow not installed")
+    async def test_add_background_image_workflow_success_message_has_no_internal_details(self):
+        from tools_write import create_static_site
+        from tools_pending_media import save_pending_media
+        from tools_preview import stop_preview
+        import bot
+
+        create_static_site("fullflow")
+        media = save_pending_media("456", "123", "file_full", file_unique_id="ufull", mime_type="image/jpeg", size_bytes=10)
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10), color=(0, 0, 255)).save(buf, format="JPEG")
+        fake_bytes = buf.getvalue()
+
+        async def fake_save_image_to_project(bot_obj, project_name, file_id, original_name=None, mime_type=None):
+            from tools_media import save_telegram_image_to_project
+
+            return save_telegram_image_to_project(project_name, fake_bytes, original_name="x.jpg", mime_type="image/jpeg")
+
+        message = AsyncMock()
+        message.chat = type("C", (), {"id": "456"})()
+        message.from_user = type("U", (), {"id": "123"})()
+        message.text = ""
+        message.caption = ""
+
+        try:
+            with patch.object(bot, "save_image_to_project", fake_save_image_to_project), \
+                 patch.object(bot, "playwright_available", return_value=False):
+                await bot.add_background_image_workflow(
+                    message, context=AsyncMock(), project_name="fullflow", media=media, target="hero_background"
+                )
+        finally:
+            try:
+                stop_preview("fullflow")
+            except Exception:
+                pass
+
+        replies = [call.args[0] for call in message.reply_text.call_args_list]
+        final = replies[-1] if replies else ""
+        self.assertIn("Готово", final)
+        for forbidden in ("tools_called", "WRITE_ROOT", "curl_check", "set_hero_background", "verify_background_asset"):
+            self.assertNotIn(forbidden, final)
 
 
 class PlaywrightAsyncOnlyTests(unittest.TestCase):

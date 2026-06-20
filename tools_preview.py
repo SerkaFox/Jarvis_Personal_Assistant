@@ -78,23 +78,29 @@ def _is_own_preview_process(record: dict[str, Any]) -> bool:
 
 
 def _port_free(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("0.0.0.0", port))
-            return True
-        except OSError:
-            return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", port))
+                return True
+            except OSError:
+                return False
+    except PermissionError:
+        return False
 
 
 def _port_listening(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
-        try:
-            sock.connect(("127.0.0.1", port))
-            return True
-        except OSError:
-            return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            try:
+                sock.connect(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+    except PermissionError:
+        return False
 
 
 def _find_listening_pid(port: int) -> int | None:
@@ -159,6 +165,16 @@ def _select_port() -> int:
         if _port_free(port):
             return port
     raise ToolError(f"Нет свободных preview ports в диапазоне {start}..{end}")
+
+
+def network_sockets_available() -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            sock.bind(("127.0.0.1", 0))
+            return True
+    except Exception:
+        return False
 
 
 def find_free_port() -> int:

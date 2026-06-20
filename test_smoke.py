@@ -84,7 +84,7 @@ class JarvisSmokeTests(unittest.TestCase):
         with patch("intent_router.find_git_repos") as mocked:
             result = handle_detected_intent({"intent": "workspace_inventory"})
         mocked.assert_not_called()
-        self.assertIn("WRITE_ROOT", result["answer"])
+        self.assertIn("Рабочая папка Jarvis:", result["answer"])
         self.assertEqual(result["tools_called"], ["workspace_inventory", "list_previews", "scan_listening_ports"])
 
     def test_secret_and_hidden_paths_are_blocked(self):

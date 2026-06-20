@@ -100,8 +100,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertIn("assets/", tree)
 
     def test_preview_start_and_stop_botosite(self):
-        from tools_preview import preview_status, start_preview, stop_preview
+        from tools_preview import network_sockets_available, preview_status, start_preview, stop_preview
         from tools_write import create_static_site
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_static_site("Botosite")
         started = start_preview("Botosite")
@@ -115,8 +118,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertFalse(preview_status("Botosite")["running"])
 
     def test_sitebota_create_preview_and_stop(self):
-        from tools_preview import start_preview, stop_preview
+        from tools_preview import network_sockets_available, start_preview, stop_preview
         from tools_write import create_static_site, verify_static_site
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         result = create_static_site("sitebota", title="Sitebota", description="Лендинг о функциях Jarvis")
         self.assertTrue(result["success"])
@@ -148,7 +154,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
     def test_natural_language_sitebota_create_and_preview(self):
         from bot import fixture_site_spec, write_mode_answer
-        from tools_preview import stop_preview
+        from tools_preview import network_sockets_available, stop_preview
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         with patch("bot.ask_ollama_for_site_spec", side_effect=fixture_site_spec):
             answer, debug = write_mode_answer("создай сайт sitebota в рабочей папке и запусти временный сервер", chat_id="test")
@@ -190,7 +199,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
     def test_create_and_preview_workflow_starts_preview_and_last_action(self):
         from bot import create_site_workflow, fixture_site_spec, get_last_action
-        from tools_preview import stop_preview
+        from tools_preview import network_sockets_available, stop_preview
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         answer, debug = create_site_workflow(
             "создай сайт sitebota_preview_test",
@@ -209,7 +221,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
     def test_workspace_where_reports_preview_url_after_create_and_preview(self):
         from bot import create_site_workflow, fixture_site_spec, workspace_where_answer
-        from tools_preview import stop_preview
+        from tools_preview import network_sockets_available, stop_preview
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_site_workflow(
             "создай сайт sitebota_where_test",
@@ -253,8 +268,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
             )
 
     def test_stop_preview_verifies_port_and_process_closed(self):
-        from tools_preview import preview_status, start_preview, stop_preview
+        from tools_preview import network_sockets_available, preview_status, start_preview, stop_preview
         from tools_write import create_static_site
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_static_site("stopcheck")
         started = start_preview("stopcheck")
@@ -282,8 +300,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
             stop_preview_by_port(22)
 
     def test_stop_preview_by_port_stops_registered_preview(self):
-        from tools_preview import port_is_listening, start_preview, stop_preview_by_port
+        from tools_preview import network_sockets_available, port_is_listening, start_preview, stop_preview_by_port
         from tools_write import create_static_site
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_static_site("portstop")
         started = start_preview("portstop")
@@ -311,8 +332,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
                 delete_workspace_dir(bad_name, confirm_token=f"DELETE:{bad_name}")
 
     def test_delete_workspace_dir_stops_running_preview_first(self):
-        from tools_preview import port_is_listening, preview_status, start_preview
+        from tools_preview import network_sockets_available, port_is_listening, preview_status, start_preview
         from tools_write import create_static_site, delete_workspace_dir
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_static_site("deletewithpreview")
         started = start_preview("deletewithpreview")
@@ -335,6 +359,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
     def test_stop_delete_answer_routes_stop_phrase_instead_of_chat(self):
         import bot
+        from tools_preview import network_sockets_available
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         bot.create_static_site("nlstop")
         bot.start_preview("nlstop")
@@ -353,6 +381,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
 
     def test_selftest_stop_delete_result_success(self):
         from bot import selftest_stop_delete_result
+        from tools_preview import network_sockets_available
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         result = selftest_stop_delete_result()
         self.assertTrue(result["success"], result)
@@ -362,8 +394,11 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         self.assertFalse((Path(self.tmp.name) / "__jarvis_stop_delete_test__").exists())
 
     def test_workspace_inventory_reports_real_project_and_preview_fields(self):
-        from tools_preview import stop_preview, start_preview
+        from tools_preview import network_sockets_available, stop_preview, start_preview
         from tools_write import create_static_site, workspace_inventory
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_static_site("invproj")
         started = start_preview("invproj")
@@ -393,7 +428,7 @@ class WriteSandboxSmokeTests(unittest.TestCase):
         import bot
 
         text = bot._workspace_status_text()
-        self.assertIn("WRITE_ROOT:", text)
+        self.assertIn("Рабочая папка Jarvis:", text)
         self.assertIn(self.tmp.name, text)
         self.assertIn("нет проектов", text)
 
@@ -408,6 +443,10 @@ class WriteSandboxSmokeTests(unittest.TestCase):
     def test_scan_listening_ports_flags_unregistered_preview_as_suspicious(self):
         from tools_preview import scan_listening_ports, stop_preview
         from tools_write import create_static_site, delete_workspace_dir
+        from tools_preview import network_sockets_available
+
+        if not network_sockets_available():
+            self.skipTest("network sockets not permitted in this test environment")
 
         create_static_site("suspectproj")
         from tools_preview import start_preview

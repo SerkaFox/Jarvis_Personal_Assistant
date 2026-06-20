@@ -16,6 +16,9 @@ data/last_actions.json
 data/current_task.json
 data/last_verification.json
 data/screenshots/
+data/current_task.json
+data/last_verification.json
+data/screenshots/
 workspace/
 jarvis_workspace/
 *.pid

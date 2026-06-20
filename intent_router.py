@@ -258,7 +258,7 @@ def _format_projects() -> tuple[str, list[str]]:
 
 def format_workspace_inventory(data: dict[str, Any], ports: dict[str, Any]) -> str:
     lines = [
-        f"WRITE_ROOT: {data.get('write_root')}",
+        f"Рабочая папка Jarvis: {data.get('write_root')}",
         f"exists: {data.get('exists')}",
         f"writable: {data.get('writable')}",
     ]

@@ -1,18 +1,20 @@
 import logging
 import mimetypes
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from tools_fs import ToolError
-from tools_write import _validate_project_name, ensure_write_root, resolve_write_path
+from tools_write import _validate_project_name, ensure_write_root, resolve_write_path, write_project_text_file
 
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
 IMG_SUBDIR = Path("assets") / "img"
+CSS_PATH = Path("assets") / "css" / "style.css"
 
 
 def pillow_available() -> bool:
@@ -151,3 +153,123 @@ def set_hero_background(project_name: str, image_relative_path: str) -> dict[str
     if not candidate.is_file():
         raise ToolError(f"Изображение не найдено: {candidate}")
     return {"project_name": project, "relative_path": cleaned, "path": str(candidate)}
+
+
+async def download_telegram_file(bot, file_id: str, dest_path: str) -> dict[str, Any]:
+    """Downloads a Telegram file to a destination path (inside WRITE_ROOT).
+    bot is telegram.Bot from python-telegram-bot."""
+    if not file_id:
+        raise ToolError("file_id не задан")
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tg_file = await bot.get_file(file_id)
+    data = bytes(await tg_file.download_as_bytearray())
+    dest.write_bytes(data)
+    if not dest.is_file() or dest.stat().st_size != len(data) or len(data) <= 0:
+        raise ToolError(f"Не удалось скачать файл Telegram: {dest}")
+    return {"path": str(dest), "bytes": len(data)}
+
+
+def optimize_image_to_webp(
+    input_path: str,
+    output_path: str,
+    max_width: int = 1920,
+    quality: int = 82,
+) -> dict[str, Any]:
+    return convert_to_webp(input_path, output_path, max_width=max_width, quality=quality)
+
+
+async def save_image_to_project(
+    bot,
+    project_name: str,
+    telegram_file_id: str,
+    original_name: str | None = None,
+    mime_type: str | None = None,
+) -> dict[str, Any]:
+    """Downloads from Telegram, saves to WRITE_ROOT/<project>/assets/img, returns paths."""
+    ensure_write_root()
+    project = _validate_project_name(project_name)
+    root = resolve_write_path(project).resolve()
+    img_dir = _project_img_dir(project)
+    tmp_name = f"tg_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    suffix = Path(original_name or "").suffix.lower()
+    if suffix not in ALLOWED_IMAGE_EXTENSIONS:
+        suffix = ".jpg"
+    tmp_path = (img_dir / f"{tmp_name}{suffix}").resolve()
+    if root not in tmp_path.parents:
+        raise ToolError("Сохранение изображения вне проекта запрещено")
+    downloaded = await download_telegram_file(bot, telegram_file_id, str(tmp_path))
+    file_bytes = tmp_path.read_bytes()
+    saved = save_telegram_image_to_project(project, file_bytes, original_name=original_name, mime_type=mime_type)
+    try:
+        if tmp_path.is_file():
+            tmp_path.unlink()
+    except Exception:
+        pass
+    return {**saved, "downloaded_bytes": downloaded["bytes"]}
+
+
+def set_fixed_background(project_name: str, image_relative_path: str) -> dict[str, Any]:
+    """Updates assets/css/style.css to reference the image as a fixed background.
+    The URL is written as url(\"../img/<file>\") and inserted idempotently."""
+    ensure_write_root()
+    info = set_hero_background(project_name, image_relative_path)
+    project = info["project_name"]
+    root = resolve_write_path(project).resolve()
+    css_path = (root / CSS_PATH).resolve()
+    if not css_path.is_file():
+        raise ToolError(f"CSS не найден: {css_path}")
+    image_name = Path(info["relative_path"]).name
+    css_url = f'url(\"../img/{image_name}\")'
+    marker_start = "/* jarvis-fixed-background:start */"
+    marker_end = "/* jarvis-fixed-background:end */"
+    block = "\n".join(
+        [
+            marker_start,
+            "body{",
+            f"  background-image: {css_url};",
+            "  background-size: cover;",
+            "  background-position: center;",
+            "  background-repeat: no-repeat;",
+            "  background-attachment: fixed;",
+            "}",
+            "@media (prefers-reduced-motion: reduce){",
+            "  body{ background-attachment: scroll; }",
+            "}",
+            marker_end,
+            "",
+        ]
+    )
+    original = css_path.read_text(encoding="utf-8", errors="replace")
+    if marker_start in original and marker_end in original:
+        before, _mid = original.split(marker_start, 1)
+        _old, after = _mid.split(marker_end, 1)
+        updated = before.rstrip() + "\n\n" + block + after.lstrip()
+    else:
+        updated = original.rstrip() + "\n\n" + block
+    css_path.write_text(updated, encoding="utf-8")
+    logging.info("tools_media set_fixed_background %s -> %s", project, css_path)
+    return {"project_name": project, "css_path": str(css_path), "image_relative_path": info["relative_path"], "css_url": css_url}
+
+
+def verify_background_asset(project_name: str, image_relative_path: str) -> dict[str, Any]:
+    info = set_hero_background(project_name, image_relative_path)
+    project = info["project_name"]
+    root = resolve_write_path(project).resolve()
+    img_path = (root / info["relative_path"]).resolve()
+    css_path = (root / CSS_PATH).resolve()
+    ok_img = img_path.is_file() and img_path.stat().st_size > 0
+    ok_css = css_path.is_file()
+    css_text = css_path.read_text(encoding="utf-8", errors="replace") if ok_css else ""
+    image_name = Path(info["relative_path"]).name
+    expected = f"../img/{image_name}"
+    ok_ref = expected in css_text
+    return {
+        "project_name": project,
+        "image_path": str(img_path),
+        "css_path": str(css_path),
+        "image_exists": ok_img,
+        "css_exists": ok_css,
+        "css_references_image": ok_ref,
+        "success": bool(ok_img and ok_css and ok_ref),
+    }

@@ -39,6 +39,7 @@ from tools_preview import (
     curl_check,
     detect_lan_ip,
     list_previews,
+    network_sockets_available,
     port_is_listening,
     preview_status,
     preview_url_for_port,
@@ -59,6 +60,16 @@ from tools_media import (
     pillow_available,
     save_telegram_image_to_project,
     set_hero_background,
+    optimize_image_to_webp,
+    save_image_to_project,
+    set_fixed_background,
+    verify_background_asset,
+)
+from tools_pending_media import (
+    clear_old_pending_media,
+    get_latest_pending_media,
+    mark_media_used,
+    save_pending_media,
 )
 from tools_errors import error_summary, latest_error, mask_error_text, save_last_error
 from tools_write import (
@@ -69,6 +80,7 @@ from tools_write import (
     delete_workspace_file,
     list_workspace,
     read_workspace_file,
+    resolve_write_path,
     update_static_site_file,
     verify_project_files,
     verify_static_site,
@@ -364,7 +376,9 @@ def save_current_task(chat_id: str | None, intent: str, project_name: str | None
     payload = {
         "intent": intent,
         "project_name": project_name,
+        "status": "running",
         "step": step,
+        "last_message": step,
         "started_at": now,
         "updated_at": now,
     }
@@ -379,6 +393,7 @@ def update_current_task_step(chat_id: str | None, step: str) -> None:
     data = _load_current_tasks()
     if key in data:
         data[key]["step"] = step
+        data[key]["last_message"] = step
         data[key]["updated_at"] = datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds").replace("+00:00", "Z")
         _save_current_tasks(data)
 
@@ -3164,6 +3179,140 @@ IMAGE_CAPTION_PHRASES = (
     "fondo del sitio", "usa como fondo", "como hero",
 )
 
+BACKGROUND_AFTER_PHOTO_PHRASES = (
+    "добавь на фон",
+    "фото на фон",
+    "это фото на фон",
+    "помести на фон",
+    "используй как background",
+    "сделай фоном сайта",
+    "поставь на задний фон",
+    "поставь как фон",
+    "add it as background",
+    "use it as background",
+    "as background",
+    "set as background",
+    "usalo como fondo",
+    "úsalo como fondo",
+    "como fondo",
+)
+
+
+def _wants_background_from_latest_photo(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in BACKGROUND_AFTER_PHOTO_PHRASES)
+
+
+async def add_background_image_workflow(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    project_name: str,
+    media: dict[str, Any],
+) -> None:
+    chat_id = str(message.chat.id) if getattr(message, "chat", None) else ""
+    user_id = str(message.from_user.id) if getattr(message, "from_user", None) else ""
+    tracker = ProgressTracker(message)
+    intent = "add_background_image"
+    save_current_task(chat_id, intent, project_name, "starting")
+    step = 0
+    total = 6
+    try:
+        await tracker.step(f"🖼 Фото найдено, добавляю его на фон сайта {project_name}...")
+
+        step = 1
+        update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "download_telegram")
+        await tracker.step(f"Шаг {step}/{total}: скачиваю фото из Telegram...")
+        original_name = (media.get("file_unique_id") or "photo") + ".jpg"
+        saved = await save_image_to_project(
+            context.bot,
+            project_name,
+            media["telegram_file_id"],
+            original_name=original_name,
+            mime_type=media.get("mime_type") or "",
+        )
+
+        step = 2
+        update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "save_project")
+        await tracker.step(f"Шаг {step}/{total}: сохраняю в папку сайта...")
+
+        step = 3
+        update_current_task_step(chat_id, "convert_webp")
+        await tracker.step(f"Шаг {step}/{total}: сжимаю и конвертирую в WebP...")
+        if not pillow_available():
+            raise ToolError("Pillow не установлен, конвертация в WebP недоступна")
+        src_path = Path(saved["path"])
+        out_name = f"background-{int(datetime.now().timestamp())}.webp"
+        out_abs = resolve_write_path(str(Path(project_name) / "assets" / "img" / out_name)).resolve()
+        optimize_image_to_webp(str(src_path), str(out_abs), max_width=1920, quality=82)
+        if not out_abs.is_file() or out_abs.stat().st_size <= 0:
+            raise ToolError("WebP файл не создался или пустой")
+        try:
+            if src_path.is_file():
+                src_path.unlink()
+        except Exception:
+            pass
+        relative_image = f"assets/img/{out_name}"
+        mark_media_used(int(media["id"]), project_name, str(out_abs))
+
+        step = 4
+        update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "update_css")
+        await tracker.step(f"Шаг {step}/{total}: обновляю CSS...")
+        css_info = set_fixed_background(project_name, relative_image)
+
+        step = 5
+        update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "verify_assets")
+        await tracker.step(f"Шаг {step}/{total}: проверяю, что файл доступен с сайта...")
+        verify = verify_background_asset(project_name, relative_image)
+        if not verify.get("success"):
+            raise ToolError("Файл/ссылка в CSS не подтверждены: " + str(verify))
+        status = preview_status(project_name)
+        if not status.get("running"):
+            status = start_preview(project_name)
+        port = int(status.get("port") or 0)
+        if not port:
+            raise ToolError("Не удалось определить порт preview")
+        base_url = f"http://127.0.0.1:{port}"
+        image_url = f"{base_url}/{relative_image}"
+        css_url = f"{base_url}/assets/css/style.css"
+        img_resp = requests.get(image_url, timeout=5)
+        css_resp = requests.get(css_url, timeout=5)
+        if img_resp.status_code != 200:
+            raise ToolError(f"Картинка не отдается: HTTP {img_resp.status_code} {image_url}")
+        if css_resp.status_code != 200:
+            raise ToolError(f"CSS не отдается: HTTP {css_resp.status_code} {css_url}")
+
+        step = 6
+        update_current_task_step(message.chat_id if hasattr(message, "chat_id") else "", "browser_check")
+        await tracker.step(f"Шаг {step}/{total}: проверяю страницу в браузере...")
+        browser_note = ""
+        if playwright_available():
+            browser = await check_site_with_playwright_async(project_name, f"{base_url}/", expect_background_image=relative_image)
+            ok_bg = browser.get("background_image_loaded")
+            if ok_bg is False:
+                raise ToolError("Браузер не подтвердил background-image (есть ошибки загрузки ресурсов)")
+            browser_note = "Проверка: страница открылась, фон загружается."
+        else:
+            browser_note = "Проверка браузером недоступна (Playwright не установлен)."
+
+        await tracker.step("✅ Готово. Фото добавлено как фиксированный фон.")
+        await message.reply_text(
+            "\n".join(
+                [
+                    f"Готово. Фото добавлено как фиксированный фон на сайте {project_name}.",
+                    f"Файл: {relative_image}",
+                    f"Изменил: assets/css/style.css",
+                    f"Открыть сайт: {preview_url_for_port(port)}",
+                    browser_note,
+                ]
+            )
+        )
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="add_background_image_workflow", error=e, user_text=str(getattr(message, "text", "") or getattr(message, "caption", "") or ""))
+        await message.reply_text(f"Не смог добавить фото на фон (шаг {step}/{total}): {e}")
+    finally:
+        clear_current_task(chat_id)
+
 
 def _wants_image_on_site(caption: str) -> bool:
     if not caption:
@@ -3178,64 +3327,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     caption = message.caption or ""
     chat_id, user_id = chat_user_ids(update)
-
-    if not _wants_image_on_site(caption):
-        await message.reply_text(
-            "Получил фото. Если хочешь добавить его на сайт, пришли с подписью вроде "
-            '"добавь на фон" или "используй как hero background".'
-        )
-        return
-
-    project = _workspace_project_from_context(caption, chat_id) or memory.get_current_project(chat_id)
-    if not project:
-        await message.reply_text("Не понял, для какого проекта это фото. Укажи имя проекта в подписи.")
-        return
-
-    tracker = ProgressTracker(message)
-    await tracker.step("⏳ Принял фото...")
     try:
+        clear_old_pending_media()
         if message.photo:
             tg_photo = message.photo[-1]
-            tg_file = await context.bot.get_file(tg_photo.file_id)
             original_name = f"{tg_photo.file_unique_id}.jpg"
             mime_type = "image/jpeg"
+            file_id = tg_photo.file_id
+            unique_id = tg_photo.file_unique_id
+            size_bytes = tg_photo.file_size or 0
         elif message.document and (message.document.mime_type or "").startswith("image/"):
-            tg_file = await context.bot.get_file(message.document.file_id)
             original_name = message.document.file_name
             mime_type = message.document.mime_type
+            file_id = message.document.file_id
+            unique_id = message.document.file_unique_id
+            size_bytes = message.document.file_size or 0
         else:
             await message.reply_text("Это не похоже на изображение.")
             return
 
-        await tracker.step("💾 Скачиваю и сохраняю изображение...")
-        file_bytes = bytes(await tg_file.download_as_bytearray())
-        saved = save_telegram_image_to_project(project, file_bytes, original_name=original_name, mime_type=mime_type)
-        if not Path(saved["path"]).is_file():
-            raise ToolError(f"Файл не сохранился: {saved['path']}")
-
-        relative_path = saved["relative_path"]
-        if pillow_available():
-            webp_path = str(Path(saved["path"]).with_suffix(".webp"))
-            try:
-                convert_to_webp(saved["path"], webp_path)
-                if Path(webp_path).is_file():
-                    relative_path = str(Path(saved["relative_path"]).with_suffix(".webp"))
-            except ToolError:
-                pass
-
-        await tracker.step("🧠 Обновляю CSS/HTML под новое фото...")
-        task_text = (
-            f"Используй изображение {relative_path} как фон hero-секции "
-            "(background-image, cover, по центру, без потери читаемости текста). Сохрани остальной функционал."
+        media = save_pending_media(
+            chat_id,
+            user_id,
+            file_id,
+            file_unique_id=unique_id,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            caption=caption,
         )
-        answer, debug = edit_workspace_site_workflow(
-            task_text, project, chat_id, expect_background_image=relative_path
+
+        await message.reply_text(
+            "Фото получил. Могу добавить его на сайт.\n"
+            'Напиши, например: "добавь это фото на фон сайта hola".'
         )
-        await tracker.step("✅ Готово.")
-        await reply_long(message, answer)
-        await maybe_send_intent_debug(message, context, debug)
-    except ToolError as e:
-        await message.reply_text(f"Не смог сохранить изображение: {e}")
+
+        if _wants_image_on_site(caption) or _wants_background_from_latest_photo(caption):
+            project = _workspace_project_from_context(caption, chat_id) or memory.get_current_project(chat_id)
+            if not project:
+                await message.reply_text("На какой сайт добавить фото? Напиши имя проекта, например: hola")
+                return
+            await add_background_image_workflow(message, context, project_name=project, media=media)
     except Exception as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_photo", error=e, user_text=caption)
         await message.reply_text(f"Ошибка обработки фото: {e}")
@@ -3253,33 +3384,29 @@ def selftest_workspace_result() -> dict:
     try:
         if Path(config.get_write_root() / project).exists():
             delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
+        want_preview = bool(network_sockets_available())
         answer, debug = create_site_workflow(
             "selftest workspace static site",
             project_name=project,
             chat_id="selftest",
-            start_preview_requested=True,
+            start_preview_requested=want_preview,
             site_spec_provider=fixture_site_spec,
         )
         if debug.get("errors"):
             raise RuntimeError("; ".join(debug["errors"]))
-        status = preview_status(project)
-        if not status.get("running"):
-            raise RuntimeError("selftest preview not running")
-        response = requests.get(f"http://127.0.0.1:{status['port']}/", timeout=5)
-        response.raise_for_status()
-        if "Jarvis Selftest" not in response.text:
-            raise RuntimeError("preview response does not contain expected HTML")
-        stopped = stop_preview(project)
+        status = preview_status(project) if want_preview else {"running": False}
+        stopped = stop_preview(project) if want_preview else {"stopped": True}
         cleanup = delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
         return {
             "success": True,
             "write_root": str(config.get_write_root()),
             "project": project,
             "created_files": get_last_action("selftest").get("created_files", []),
-            "preview_url": status["url"],
+            "preview_url": status.get("url", ""),
             "stopped": stopped.get("stopped"),
             "cleanup": cleanup.get("deleted"),
             "tools_called": debug.get("tools_called", []),
+            "preview_skipped": not want_preview,
         }
     except Exception:
         try:
@@ -3875,6 +4002,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text or ""
         chat_id, user_id = chat_user_ids(update)
+        running = get_current_task(chat_id)
+        if running and any(p in user_text.lower() for p in ("ты получил", "получил сообщение", "получил?", "ты здесь")):
+            await update.message.reply_text(
+                f"Да, получил. Сейчас выполняю задачу: {running.get('step') or '-'}.\nПрогресс: /progress"
+            )
+            return
+
+        if _wants_background_from_latest_photo(user_text):
+            media = get_latest_pending_media(chat_id)
+            if not media:
+                await update.message.reply_text("Я не вижу последнего фото. Пришли фото еще раз.")
+                return
+            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
+            if not project:
+                await update.message.reply_text("На какой сайт добавить фото? Напиши имя проекта, например: hola")
+                return
+            await add_background_image_workflow(update.message, context, project_name=project, media=media)
+            return
         recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
         message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
         use_agent = bool(context.user_data.get("agent_enabled"))

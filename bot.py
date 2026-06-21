@@ -79,6 +79,16 @@ from tools_pending_media import (
     save_pending_media,
 )
 from tools_errors import error_summary, latest_error, mask_error_text, save_last_error
+from tools_site_state import (
+    format_site_state_answer,
+    get_site_requirements,
+    infer_requirements_from_text,
+    inspect_site_state,
+    load_site_state,
+    save_site_state,
+)
+from tools_snapshot import list_snapshots, rollback_project, snapshot_project
+from tools_site_checks import run_acceptance_checks as run_persistent_acceptance_checks
 from tools_write import (
     create_flask_site,
     create_project_dir,
@@ -589,8 +599,41 @@ def ask_ollama_for_site_spec(user_text: str, project_name: str) -> dict:
     return validate_create_static_site_action(data, expected_project_name=project_name)
 
 
-def ask_ollama_for_site_edit(user_text: str, project_name: str, current_files: list[dict]) -> dict:
+def _must_preserve_lines(requirements: dict[str, Any] | None) -> list[str]:
+    """Human-readable "do not remove this" list built from persisted
+    requirements (tools_site_state) -- handed to Ollama so a task about one
+    feature can't silently delete an unrelated one that an earlier task
+    already established."""
+    requirements = requirements or {}
+    lines = []
+    if requirements.get("background_required"):
+        lines.append("фон (background-image) на hero/body -- должен остаться видимым")
+    if requirements.get("language_switcher_required"):
+        langs = ", ".join(c.upper() for c in (requirements.get("languages") or [])) or "RU/EN/ES"
+        lines.append(f"переключатель языков ({langs}) с рабочими кнопками и обработчиком клика")
+    if requirements.get("single_language_visible"):
+        lines.append("одновременно виден текст только ОДНОГО языка, остальные скрыты (display:none/hidden)")
+    if requirements.get("slider_required"):
+        lines.append("слайдер/карусель")
+    if requirements.get("weather_required"):
+        lines.append("блок погоды (JS fetch к Open-Meteo) без console errors")
+    if requirements.get("footer_required"):
+        lines.append("<footer> блок")
+    return lines
+
+
+def ask_ollama_for_site_edit(
+    user_text: str, project_name: str, current_files: list[dict], requirements: dict[str, Any] | None = None
+) -> dict:
     files_block = "\n\n".join(f"--- {f['path']} ---\n{f['content']}" for f in current_files)
+    must_preserve = _must_preserve_lines(requirements)
+    must_preserve_block = (
+        "\nОБЯЗАТЕЛЬНО СОХРАНИ в финальном коде (даже если задача про другое):\n"
+        + "\n".join(f"- {line}" for line in must_preserve)
+        + "\n"
+        if must_preserve
+        else ""
+    )
     prompt = f"""
 Верни только JSON. Не пиши markdown. Не пиши bash-команды. Не используй mkdir/cat/python/http.server.
 Твоя задача: отредактировать существующий статический сайт workspace-проекта "{project_name}" по запросу пользователя.
@@ -618,7 +661,7 @@ def ask_ollama_for_site_edit(user_text: str, project_name: str, current_files: l
 - если просят добавить погоду для Бильбао, используй клиентский JS fetch к Open-Meteo
   (https://api.open-meteo.com/v1/forecast?latitude=43.2630&longitude=-2.9350&current_weather=true),
   без API key, с try/catch и текстовым fallback на случай ошибки запроса.
-
+{must_preserve_block}
 Текущие файлы проекта:
 {files_block}
 
@@ -680,6 +723,8 @@ def format_user_result(headline: str, info: dict | None = None) -> str:
     if notes:
         notes_text = "; ".join(str(n) for n in notes) if isinstance(notes, (list, tuple)) else str(notes)
         lines.append(f"Заметки: {notes_text}")
+    if info.get("rollback"):
+        lines.append(f"↩️ {info['rollback']}")
     if info.get("warning"):
         lines.append(f"⚠️ {info['warning']}")
     return "\n".join(lines)
@@ -1178,6 +1223,17 @@ def build_verification_report(failed_checks: list[str], browser_result: dict | N
     return "\n".join(lines)
 
 
+KEEP_DESPITE_FAILURE_PHRASES = (
+    "оставь всё равно", "оставь все равно", "оставь как есть", "не откатывай",
+    "не откатывать", "keep anyway", "leave it anyway", "don't rollback", "no rollback",
+)
+
+
+def _wants_keep_despite_failure(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in KEEP_DESPITE_FAILURE_PHRASES)
+
+
 def edit_workspace_site_workflow(
     user_text: str,
     project_name: str,
@@ -1196,6 +1252,7 @@ def edit_workspace_site_workflow(
         "curl_check": None,
         "error": "",
         "tools_called": tools_called,
+        "rolled_back": False,
     }
     if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
         action["error"] = "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env"
@@ -1213,9 +1270,19 @@ def edit_workspace_site_workflow(
             raise RuntimeError("Не нашел текстовых файлов проекта для редактирования")
         before_files = read_result["files"]
 
+        update_current_task_step(chat_id, "snapshotting")
+        snapshot = snapshot_project(project_name, reason=user_text[:200])
+        tools_called.append("snapshot_project")
+
+        update_current_task_step(chat_id, "merging_requirements")
+        inferred_requirements = infer_requirements_from_text(user_text)
+        site_state = save_site_state(project_name, inferred_requirements) if inferred_requirements else load_site_state(project_name)
+        requirements = site_state["requirements"]
+        tools_called.append("save_site_state")
+
         update_current_task_step(chat_id, "asking_ollama")
         try:
-            spec = ask_ollama_for_site_edit(user_text, project_name, before_files)
+            spec = ask_ollama_for_site_edit(user_text, project_name, before_files, requirements=requirements)
         except Exception as e:
             action["error"] = str(e)
             action["tools_called"] = tools_called
@@ -1261,7 +1328,7 @@ def edit_workspace_site_workflow(
         # send a structured report of ONLY the failed checks back to Ollama and retry.
         # Capped at MAX_REPAIR_ITERATIONS repair attempts so a stubborn failure can't
         # loop forever or run away with Ollama calls.
-        acceptance = {"success": True, "failed": [], "checks": {}}
+        acceptance = {"success": True, "failed": [], "critical_failed": [], "checks": {}}
         browser_result: dict | None = None
         curl_result = None
         preview_url = ""
@@ -1288,7 +1355,7 @@ def edit_workspace_site_workflow(
                     tools_called.append("check_site_with_playwright")
                     save_last_verification(project_name, browser_result)
 
-            acceptance = run_acceptance_checks(
+            text_acceptance = run_acceptance_checks(
                 user_text,
                 before_files,
                 after_read["files"],
@@ -1296,6 +1363,23 @@ def edit_workspace_site_workflow(
                 expect_background_image=expect_background_image,
             )
             tools_called.append("run_acceptance_checks")
+            persistent_acceptance = run_persistent_acceptance_checks(
+                project_name, requirements, files=after_read["files"], browser_result=browser_result
+            )
+            tools_called.append("run_persistent_acceptance_checks")
+
+            # Every failure from the legacy per-message heuristic check is treated
+            # as critical (it always blocked "Готово" before this feature existed);
+            # the new persistent, requirement-driven check additionally flags which
+            # of ITS failures are critical (see tools_site_checks.run_acceptance_checks).
+            combined_failed = list(dict.fromkeys(text_acceptance["failed"] + persistent_acceptance["failed"]))
+            combined_critical = list(dict.fromkeys(text_acceptance["failed"] + persistent_acceptance["critical_failed"]))
+            acceptance = {
+                "success": not combined_critical,
+                "failed": combined_failed,
+                "critical_failed": combined_critical,
+                "checks": {**text_acceptance["checks"], **persistent_acceptance["checks"]},
+            }
 
             if acceptance["success"] or iteration > MAX_REPAIR_ITERATIONS:
                 break
@@ -1303,7 +1387,9 @@ def edit_workspace_site_workflow(
             report_text = build_verification_report(acceptance["failed"], browser_result)
             update_current_task_step(chat_id, f"repairing_{iteration}")
             try:
-                spec_repair = ask_ollama_for_site_edit(user_text + "\n\n" + report_text, project_name, after_read["files"])
+                spec_repair = ask_ollama_for_site_edit(
+                    user_text + "\n\n" + report_text, project_name, after_read["files"], requirements=requirements
+                )
                 tools_called.append("ask_ollama_for_site_edit_repair")
                 write_result_repair = apply_file_updates(project_name, spec_repair["files"])
                 tools_called.append("apply_file_updates")
@@ -1322,6 +1408,13 @@ def edit_workspace_site_workflow(
         if chat_id:
             memory.set_current_project(chat_id, project_name)
 
+        kept_despite_failure = _wants_keep_despite_failure(user_text)
+        rollback_result: dict | None = None
+        if not acceptance["success"] and not kept_despite_failure:
+            update_current_task_step(chat_id, "rolling_back")
+            rollback_result = rollback_project(project_name, snapshot["snapshot_id"])
+            tools_called.append("rollback_project")
+
         action.update(
             {
                 "success": bool(acceptance["success"]),
@@ -1330,6 +1423,8 @@ def edit_workspace_site_workflow(
                 "preview_url": preview_url,
                 "curl_check": curl_result,
                 "tools_called": tools_called,
+                "rolled_back": bool(rollback_result),
+                "snapshot_id": snapshot["snapshot_id"],
             }
         )
         save_last_action(chat_id, action)
@@ -1344,19 +1439,19 @@ def edit_workspace_site_workflow(
         if not preview_url:
             info["preview_note"] = "Preview не запущен (я его не запускал и не останавливал)."
 
-        browser_caused = bool(browser_result and not browser_result.get("skipped") and browser_result.get("success") is False)
-        non_browser_failed = [f for f in acceptance["failed"] if not f.startswith("браузерная проверка")]
-
         if acceptance["success"]:
             headline = f"Готово! Я изменил сайт {project_name}: {spec.get('summary') or 'внес изменения по запросу'}."
             answer = format_user_result(headline, info)
-        elif browser_caused and not non_browser_failed:
-            headline = "Я применил изменения, но автоматическая проверка показала проблему: " + "; ".join(acceptance["failed"])
-            info["warning"] = "Посмотри сайт вручную, прежде чем считать задачу завершенной."
+        elif rollback_result is not None:
+            headline = "Я попробовал, проверка не прошла, изменения откатил: " + "; ".join(acceptance["failed"])
+            info["modified_files"] = []
+            info["rollback"] = f"Файлы восстановлены из snapshot {snapshot['snapshot_id']} (см. /site_snapshots {project_name})."
             answer = format_user_result(headline, info)
         else:
-            headline = "Я не считаю задачу завершенной. Нашел проблемы: " + "; ".join(acceptance["failed"])
-            info["warning"] = "Файлы изменены, но не прошли проверку. Можно попросить меня попробовать снова."
+            headline = "Проверка не прошла, но ты попросил оставить изменения как есть -- не откатываю: " + "; ".join(
+                acceptance["failed"]
+            )
+            info["warning"] = f"Можно вернуть прежнюю версию: /site_rollback {project_name} {snapshot['snapshot_id']}"
             answer = format_user_result(headline, info)
 
         return (
@@ -1372,17 +1467,32 @@ def edit_workspace_site_workflow(
                 "curl_check": curl_result,
                 "browser_check": browser_result,
                 "acceptance": acceptance,
+                "snapshot_id": snapshot["snapshot_id"],
+                "rolled_back": bool(rollback_result),
+                "requirements": requirements,
                 "verification_report": report_text,
             },
         )
     except Exception as e:
         action["error"] = str(e)
         action["tools_called"] = tools_called
+        rolled_back_on_error = False
+        snapshot_local = locals().get("snapshot")
+        if snapshot_local:
+            try:
+                rollback_project(project_name, snapshot_local["snapshot_id"])
+                tools_called.append("rollback_project")
+                rolled_back_on_error = True
+                action["rolled_back"] = True
+                action["snapshot_id"] = snapshot_local["snapshot_id"]
+            except ToolError:
+                pass
         save_last_action(chat_id, action)
         save_last_error(chat_id=chat_id or "", user_id="", handler="edit_workspace_site_workflow", error=e, user_text=user_text)
         clear_current_task(chat_id)
+        suffix = " Файлы откатил до состояния до правки." if rolled_back_on_error else ""
         return (
-            f"Не смог отредактировать сайт {project_name}: {e}",
+            f"Не смог отредактировать сайт {project_name}: {e}.{suffix}",
             {"detected": {"intent": "edit_workspace_site", "project": project_name}, "tools_called": tools_called, "errors": [str(e)]},
         )
 
@@ -3067,6 +3177,169 @@ async def edit_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка /edit_site: {e}")
 
 
+async def site_check_workflow(project_name: str, chat_id: str | None = None) -> tuple[str, dict]:
+    """Read-only acceptance check against the project's persisted requirements
+    (tools_site_state) and -- if a preview can be reached -- a real browser
+    check. Never edits files, never calls Ollama. This is what "А где фон?"
+    and similar status questions should run instead of just preview_start."""
+    tools_called: list[str] = []
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        msg = "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env"
+        return msg, {"detected": {"intent": "site_check", "project": project_name}, "tools_called": tools_called, "errors": [msg]}
+    try:
+        requirements = get_site_requirements(project_name)
+        tools_called.append("get_site_requirements")
+        files = read_workspace_project_files(project_name)["files"]
+        tools_called.append("read_workspace_project_files")
+
+        status = preview_status(project_name)
+        tools_called.append("preview_status")
+        if not status.get("running"):
+            start_preview(project_name)
+            tools_called.append("start_preview")
+            status = preview_status(project_name)
+            tools_called.append("preview_status")
+
+        browser_result = None
+        preview_url = ""
+        if status.get("running") and status.get("port"):
+            preview_url = preview_url_for_port(int(status["port"]))
+            if playwright_available():
+                browser_result = await check_site_with_playwright_async(project_name, f"http://127.0.0.1:{status['port']}/")
+                tools_called.append("check_site_with_playwright_async")
+                save_last_verification(project_name, browser_result)
+
+        acceptance = run_persistent_acceptance_checks(project_name, requirements, files=files, browser_result=browser_result)
+        tools_called.append("run_persistent_acceptance_checks")
+        inspected = inspect_site_state(project_name)
+        tools_called.append("inspect_site_state")
+
+        lines = [f"Проверка сайта {project_name}:"]
+        if acceptance["success"]:
+            lines.append("Все проверки по сохранённым требованиям пройдены.")
+        else:
+            lines.append("Найдены проблемы:")
+            lines.extend(f"- {item}" for item in acceptance["failed"])
+        if requirements.get("background_required"):
+            lines.append(
+                f"Фон: {'есть, ' + inspected['background_image_path'] if inspected['has_background'] else 'не найден в CSS'}."
+            )
+        if preview_url:
+            lines.append(f"Preview: {preview_url}")
+        answer = "\n".join(lines)
+        return answer, {
+            "detected": {"intent": "site_check", "project": project_name},
+            "tools_called": tools_called,
+            "errors": [] if acceptance["success"] else acceptance["failed"],
+            "acceptance": acceptance,
+            "inspected": inspected,
+        }
+    except ToolError as e:
+        return (
+            f"Не смог проверить сайт {project_name}: {e}",
+            {"detected": {"intent": "site_check", "project": project_name}, "tools_called": tools_called, "errors": [str(e)]},
+        )
+
+
+async def site_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_state <project>")
+        return
+    project = context.args[0]
+    try:
+        await reply_long(update.message, format_site_state_answer(project))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_state: {e}")
+
+
+async def site_snapshots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_snapshots <project>")
+        return
+    project = context.args[0]
+    try:
+        snapshots = list_snapshots(project)
+        if not snapshots:
+            await update.message.reply_text(f"Снапшотов для {project} ещё нет.")
+            return
+        lines = [f"Снапшоты {project} (новые сверху):"]
+        for snap in snapshots[:20]:
+            reason = (snap.get("reason") or "")[:60]
+            lines.append(f"- {snap['snapshot_id']} ({snap.get('created_at', '-')}) {reason}")
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_snapshots: {e}")
+
+
+async def site_rollback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /site_rollback <project> <snapshot_id>")
+        return
+    project, snapshot_id = context.args[0], context.args[1]
+    try:
+        result = rollback_project(project, snapshot_id)
+        if result["success"]:
+            await update.message.reply_text(
+                f"Откатил {project} к snapshot {snapshot_id}. Восстановлено файлов: {len(result['restored_files'])}."
+            )
+        else:
+            await update.message.reply_text(f"Откат не полностью удался: {'; '.join(result['errors']) or 'неизвестная ошибка'}")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_rollback: {e}")
+
+
+async def site_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_check <project>")
+        return
+    project = context.args[0]
+    chat_id, _ = chat_user_ids(update)
+    try:
+        answer, debug = await site_check_workflow(project, chat_id=chat_id)
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_check: {e}")
+
+
+async def repair_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /repair_site <project>")
+        return
+    project = context.args[0]
+    chat_id, _ = chat_user_ids(update)
+    try:
+        check_answer, check_debug = await site_check_workflow(project, chat_id=chat_id)
+        acceptance = check_debug.get("acceptance") or {}
+        if acceptance.get("success"):
+            await reply_long(update.message, f"Проверка сайта {project} уже проходит, чинить нечего.\n\n{check_answer}")
+            return
+        failed = acceptance.get("failed") or []
+        task_text = "Почини сайт: исправь проблемы из автоматической проверки, не убирая существующий функционал.\n" + "\n".join(
+            f"- {item}" for item in failed
+        )
+        tracker = ProgressTracker(update.message)
+        await tracker.step("🧪 Нашел проблемы, пробую починить...")
+        answer, debug = edit_workspace_site_workflow(task_text, project, chat_id)
+        await tracker.step("✅ Готово.")
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        chat_id, user_id = chat_user_ids(update)
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="repair_site_command", error=e, user_text=update.message.text or "")
+        await update.message.reply_text(f"Ошибка /repair_site: {e}")
+
+
 async def current_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -3345,6 +3618,21 @@ FIXED_ATTACHMENT_WORDS = (
 def _wants_fixed_attachment(text: str) -> bool:
     lowered = (text or "").lower()
     return any(word in lowered for word in FIXED_ATTACHMENT_WORDS)
+
+
+SITE_STATUS_QUESTION_PHRASES = (
+    "где фон", "а где фон", "почему нет фона", "пропал фон", "фон пропал", "фон не виден", "фон не отображается",
+    "что не так с сайтом", "почему сайт сломан", "сайт сломан", "проверь сайт", "проверь сайт на ошибки",
+    "работают ли языки", "переключение языков работает", "языки работают", "языки переключаются",
+    "where is the background", "background is missing", "is the background working", "check the site",
+    "what's wrong with the site", "site is broken", "is the language switcher working",
+    "dónde está el fondo", "donde esta el fondo", "revisa el sitio",
+)
+
+
+def _wants_site_status_check(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in SITE_STATUS_QUESTION_PHRASES)
 
 
 async def _check_background_live(project_name: str, base_url: str, relative_image: str) -> dict[str, Any]:
@@ -3808,7 +4096,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/create_site <project> - создать статический сайт и проверить файлы",
                 "/create_and_preview <project> - создать сайт, проверить файлы и запустить preview",
                 "/where <project> - показать путь, файлы и preview status проекта",
-                "/edit_site <project> <задача> - отредактировать существующий сайт через Ollama",
+                "/edit_site <project> <задача> - отредактировать существующий сайт через Ollama (snapshot + rollback при провале проверки)",
+                "/site_state <project> - сохранённые требования к сайту и что реально есть в файлах",
+                "/site_snapshots <project> - список снапшотов до правок (для отката)",
+                "/site_rollback <project> <snapshot_id> - откатить файлы проекта к снапшоту",
+                "/site_check <project> - read-only проверка сайта по сохранённым требованиям (без правок)",
+                "/repair_site <project> - найти проблемы через /site_check и попробовать их исправить",
                 "/current_task - текущая выполняемая задача",
                 "/progress - прогресс текущей задачи или последнее действие",
                 "/browser_check <project> - проверить запущенный preview через Playwright",
@@ -4531,6 +4824,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Status questions ("где фон?", "проверь сайт", "почему сайт сломан?")
+        # must run a deterministic, read-only site_check against the project's
+        # persisted requirements -- never just preview_start, and never a guess
+        # from Ollama about whether a feature is there.
+        if _wants_site_status_check(user_text):
+            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
+            if not project:
+                await update.message.reply_text("Какой сайт проверить? Напиши имя проекта, например: hola")
+                return
+            answer, debug = await site_check_workflow(project, chat_id=chat_id)
+            await reply_long(update.message, answer)
+            await maybe_send_intent_debug(update.message, context, debug)
+            return
+
         # Installed plugins (plugin_manager) get first refusal on free text via
         # their own can_handle() score -- this is the general extension point
         # for "Jarvis doesn't know how to do X yet" cases (see
@@ -4763,6 +5070,11 @@ def main():
     app.add_handler(CommandHandler("ls", files_command))
     app.add_handler(CommandHandler("tree_project", tree_project_command))
     app.add_handler(CommandHandler("set_background", set_background_command))
+    app.add_handler(CommandHandler("site_state", site_state_command))
+    app.add_handler(CommandHandler("site_snapshots", site_snapshots_command))
+    app.add_handler(CommandHandler("site_rollback", site_rollback_command))
+    app.add_handler(CommandHandler("site_check", site_check_command))
+    app.add_handler(CommandHandler("repair_site", repair_site_command))
     app.add_handler(CommandHandler("last_media", last_media_command))
     app.add_handler(CommandHandler("retry_media_background", retry_media_background_command))
     app.add_handler(CommandHandler("memory", memory_command))

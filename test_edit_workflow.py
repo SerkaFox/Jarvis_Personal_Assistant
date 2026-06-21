@@ -9,7 +9,7 @@ import config
 import semantic_router as sr
 
 
-def fixture_site_edit_spec(user_text, project_name, current_files):
+def fixture_site_edit_spec(user_text, project_name, current_files, requirements=None):
     return {
         "action": "edit_workspace_site",
         "project_name": project_name,

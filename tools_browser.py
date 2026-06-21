@@ -42,6 +42,9 @@ def _empty_result(project_name: str, url: str) -> dict[str, Any]:
         "language_switch_ok": None,
         "background_image_loaded": None,
         "screenshot_path": None,
+        "failed_resources": [],
+        "visible_language_blocks": {},
+        "single_language_visible_ok": None,
     }
 
 
@@ -51,6 +54,40 @@ def _skipped_result(project_name: str, url: str, reason: str = "Playwright не 
     result["skipped"] = True
     result["reason"] = reason
     return result
+
+
+async def _visible_language_blocks_async(page) -> dict[str, bool]:
+    """Heuristic check for "single_language_visible": for each language code,
+    is there at least one non-empty, actually-rendered (display!=none,
+    visibility!=hidden, has layout box) element tagged with that language
+    currently visible? Used to catch sites that render RU/EN/ES content all
+    at once instead of switching between them."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const codes = ['ru', 'en', 'es'];
+                const result = {};
+                for (const code of codes) {
+                    const els = document.querySelectorAll(
+                        `[data-lang="${code}"], [data-lang="${code.toUpperCase()}"], .lang-${code}, [lang="${code}"]`
+                    );
+                    let visible = false;
+                    for (const el of els) {
+                        const text = (el.innerText || '').trim();
+                        if (!text) continue;
+                        const style = getComputedStyle(el);
+                        if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) {
+                            visible = true;
+                            break;
+                        }
+                    }
+                    result[code] = visible;
+                }
+                return result;
+            }"""
+        )
+    except Exception:
+        return {}
 
 
 async def _find_lang_buttons_async(page) -> list[tuple[str, Any]]:
@@ -86,9 +123,11 @@ async def _check_site_with_playwright_async(
     project = _validate_project_name(project_name)
     console_errors: list[str] = []
     page_errors: list[str] = []
+    failed_resources: list[str] = []
     result = _empty_result(project, url)
     result["console_errors"] = console_errors
     result["errors"] = page_errors
+    result["failed_resources"] = failed_resources
 
     try:
         async with async_playwright() as p:
@@ -97,6 +136,10 @@ async def _check_site_with_playwright_async(
                 page = await browser.new_page()
                 page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
                 page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+                page.on(
+                    "response",
+                    lambda resp: failed_resources.append(f"{resp.status} {resp.url}") if resp.status >= 400 else None,
+                )
                 response = await page.goto(url, timeout=15000, wait_until="load")
                 if response is None or not response.ok:
                     page_errors.append(f"HTTP status: {response.status if response else 'no response'}")
@@ -110,6 +153,8 @@ async def _check_site_with_playwright_async(
                     result["sections_count"] = await page.locator("section").count()
                 except Exception:
                     result["sections_count"] = 0
+
+                visible_blocks = await _visible_language_blocks_async(page)
 
                 lang_buttons = await _find_lang_buttons_async(page)
                 result["language_buttons_found"] = [code for code, _loc in lang_buttons]
@@ -127,6 +172,11 @@ async def _check_site_with_playwright_async(
                         except Exception as exc:
                             page_errors.append(f"language button {code} click failed: {exc}")
                     result["language_switch_ok"] = switched
+                    visible_blocks = await _visible_language_blocks_async(page)
+
+                result["visible_language_blocks"] = visible_blocks
+                visible_count = sum(1 for visible in visible_blocks.values() if visible)
+                result["single_language_visible_ok"] = (visible_count <= 1) if visible_blocks else None
 
                 if expect_background_image:
                     image_name = Path(expect_background_image).name

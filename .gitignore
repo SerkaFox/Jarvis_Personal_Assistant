@@ -21,6 +21,8 @@ data/last_verification.json
 data/screenshots/
 data/proposed_plugins/
 data/selfdev_jobs/
+data/workspace_state/
+data/workspace_snapshots/
 workspace/
 jarvis_workspace/
 *.pid

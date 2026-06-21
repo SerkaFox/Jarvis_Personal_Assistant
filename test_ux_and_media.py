@@ -440,7 +440,7 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def always_missing_es(user_text, project_name, current_files):
+        def always_missing_es(user_text, project_name, current_files, requirements=None):
             calls["n"] += 1
             return {
                 "action": "edit_workspace_site",
@@ -467,8 +467,16 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
         # initial attempt + MAX_REPAIR_ITERATIONS(2) repairs = 3 generation calls total
         self.assertEqual(calls["n"], 3)
         self.assertFalse(debug["acceptance"]["success"])
-        self.assertIn("Я не считаю задачу завершенной", answer)
+        self.assertIn("проверка не прошла, изменения откатил", answer)
+        self.assertNotIn("Готово", answer)
         self.assertNotIn("tools_called", answer)
+        self.assertTrue(debug["rolled_back"])
+
+        from tools_edit import read_workspace_project_files
+
+        after_rollback = read_workspace_project_files("repairloop")
+        index_html = next(f["content"] for f in after_rollback["files"] if f["path"] == "index.html")
+        self.assertNotIn("setLang", index_html)
 
     @unittest.skipUnless(_pillow_installed() and _playwright_installed(), "Pillow/Playwright not installed")
     def test_background_image_workflow_passes_when_css_references_real_visible_image(self):
@@ -487,7 +495,7 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
         saved = save_telegram_image_to_project("bgsite", buf.getvalue(), original_name="hero.jpg", mime_type="image/jpeg")
         image_name = Path(saved["relative_path"]).name
 
-        def bg_spec(user_text, project_name, current_files):
+        def bg_spec(user_text, project_name, current_files, requirements=None):
             return {
                 "action": "edit_workspace_site",
                 "project_name": project_name,
@@ -519,7 +527,7 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
 
         create_static_site("bgsite_bad")
 
-        def bad_bg_spec(user_text, project_name, current_files):
+        def bad_bg_spec(user_text, project_name, current_files, requirements=None):
             return {
                 "action": "edit_workspace_site",
                 "project_name": project_name,

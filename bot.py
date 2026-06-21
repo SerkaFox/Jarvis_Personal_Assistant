@@ -88,7 +88,10 @@ from tools_site_state import (
     save_site_state,
 )
 from tools_snapshot import list_snapshots, rollback_project, snapshot_project
-from tools_site_checks import run_acceptance_checks as run_persistent_acceptance_checks
+from tools_site_checks import detect_feature_regressions, run_acceptance_checks as run_persistent_acceptance_checks
+from tools_site_operations import apply_operation_plan, validate_operation_plan
+import project_state_manager
+import learning_log
 from tools_write import (
     create_flask_site,
     create_project_dir,
@@ -695,6 +698,90 @@ def ask_ollama_for_site_edit(
     raise last_error or ToolError("Не удалось получить валидный JSON edit spec от Ollama")
 
 
+ALLOWED_OPERATIONS_TEXT = (
+    "- \"add_feature\" / \"update_feature\" / \"repair_feature\" -- требуют поле \"feature\" из списка: "
+    "background, slider, language_switcher, weather, footer\n"
+    "- \"set_background\" (params: target=\"hero\"|\"whole_page\", fixed=true|false, image=\"filename.jpg\" опционально)\n"
+    "- \"add_slider\"\n"
+    "- \"fix_language_switcher\"\n"
+    "- \"add_footer\"\n"
+    "- \"add_weather\"\n"
+    "- \"verify\" -- только проверить текущее состояние, без изменений\n"
+    "- \"rollback\" (params: snapshot_id опционально, иначе откат к последнему успешному)"
+)
+
+
+def ask_ollama_for_operation_plan(user_text: str, project_name: str, project_state: dict[str, Any]) -> dict[str, Any]:
+    """Ollama is only ever allowed to SELECT structured operations here --
+    never author HTML/CSS/JS. validate_operation_plan() (tools_site_operations)
+    is the actual trust boundary; this prompt is just guidance to make valid
+    JSON likely on the first try."""
+    requirements = project_state.get("requirements", {})
+    features = project_state.get("features", {})
+    must_preserve = _must_preserve_lines(requirements)
+    must_preserve_block = (
+        "\nОБЯЗАТЕЛЬНО СОХРАНИ (не предлагай операции, которые могут убрать эти функции):\n"
+        + "\n".join(f"- {line}" for line in must_preserve)
+        + "\n"
+        if must_preserve
+        else ""
+    )
+    feature_status_lines = "\n".join(f"- {name}: {entry.get('status', 'unknown')}" for name, entry in features.items())
+    prompt = f"""
+Верни только JSON. Не пиши markdown, не пиши HTML/CSS/JS код, не пиши shell-команды.
+Ты выбираешь СТРУКТУРНЫЕ операции для редактирования сайта workspace-проекта "{project_name}".
+Ты НЕ можешь писать содержимое файлов напрямую -- только выбрать одну или несколько операций
+из строго фиксированного списка ниже; исполнитель сам сгенерирует безопасный HTML/CSS/JS.
+
+Допустимые операции (поле "op"):
+{ALLOWED_OPERATIONS_TEXT}
+
+Строгий формат:
+{{
+  "operations": [{{"op": "...", "feature": "...", "params": {{}}}}],
+  "summary": "short description"
+}}
+
+Текущее состояние фич проекта:
+{feature_status_lines or '- нет данных'}
+{must_preserve_block}
+Запрос пользователя:
+{user_text}
+""".strip()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты выбираешь структурные операции для Jarvis backend. Возвращай только валидный JSON "
+                "со списком operations из допустимого списка, без HTML/CSS/JS контента."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    last_error: Exception | None = None
+    for attempt in range(2):
+        raw = ask_ollama_messages(messages)
+        try:
+            if looks_like_fake_action_response(raw):
+                raise ToolError("Ollama попыталась вернуть текстовые shell-команды вместо JSON")
+            data = extract_json_object(raw)
+            operations = validate_operation_plan(data)
+            return {"operations": operations, "summary": str(data.get("summary") or "")[:300]}
+        except (ToolError, RuntimeError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Невалидный план. Верни только JSON со списком operations из допустимого списка, "
+                        "без HTML/CSS/JS контента, без markdown."
+                    ),
+                }
+            )
+    raise last_error or ToolError("Не удалось получить валидный operation plan от Ollama")
+
+
 def format_user_result(headline: str, info: dict | None = None) -> str:
     """Human-friendly summary for normal chat mode. No tools_called/WRITE_ROOT/raw JSON."""
     info = info or {}
@@ -1280,9 +1367,14 @@ def edit_workspace_site_workflow(
         requirements = site_state["requirements"]
         tools_called.append("save_site_state")
 
+        before_inspected = inspect_site_state(project_name)
+        tools_called.append("inspect_site_state")
+        project_state = project_state_manager.sync_features_from_inspection(project_name)
+        tools_called.append("sync_features_from_inspection")
+
         update_current_task_step(chat_id, "asking_ollama")
         try:
-            spec = ask_ollama_for_site_edit(user_text, project_name, before_files, requirements=requirements)
+            plan = ask_ollama_for_operation_plan(user_text, project_name, project_state)
         except Exception as e:
             action["error"] = str(e)
             action["tools_called"] = tools_called
@@ -1291,7 +1383,7 @@ def edit_workspace_site_workflow(
                 chat_id=chat_id or "", user_id="", handler="edit_workspace_site_workflow.ask_ollama", error=e, user_text=user_text
             )
             clear_current_task(chat_id)
-            friendly = "Не смог получить корректный план изменений от модели. Я не стал трогать файлы, чтобы не сломать сайт."
+            friendly = "Не смог получить корректный план операций от модели. Я не стал трогать файлы, чтобы не сломать сайт."
             return (
                 friendly,
                 {
@@ -1300,14 +1392,15 @@ def edit_workspace_site_workflow(
                     "errors": [str(e)],
                 },
             )
-        tools_called.append("ask_ollama_for_site_edit")
-        tools_called.append("validate_edit_workspace_site_action")
+        tools_called.append("ask_ollama_for_operation_plan")
+        tools_called.append("validate_operation_plan")
 
-        update_current_task_step(chat_id, "writing_files")
-        write_result = apply_file_updates(project_name, spec["files"])
-        tools_called.append("apply_file_updates")
-        if not write_result["success"]:
-            raise RuntimeError("Запись файлов не подтверждена: " + ("; ".join(write_result["errors"]) or "неизвестная ошибка"))
+        update_current_task_step(chat_id, "applying_operations")
+        apply_result = apply_operation_plan(project_name, plan["operations"])
+        tools_called.append("apply_operation_plan")
+        operations_applied: list[dict] = list(apply_result["applied"])
+        files_changed: list[str] = list(apply_result["files_changed"])
+        plan_summary = plan.get("summary") or ""
 
         update_current_task_step(chat_id, "verifying_structure")
         verify = verify_workspace_project(project_name)
@@ -1324,10 +1417,11 @@ def edit_workspace_site_workflow(
             status = preview_status(project_name)
             tools_called.append("preview_status")
 
-        # Feedback loop: apply -> verify (static + real browser check) -> if it fails,
-        # send a structured report of ONLY the failed checks back to Ollama and retry.
-        # Capped at MAX_REPAIR_ITERATIONS repair attempts so a stubborn failure can't
-        # loop forever or run away with Ollama calls.
+        # Feedback loop: apply operations -> verify (static + persistent requirement
+        # checks + real browser check + feature-regression check) -> if it fails, ask
+        # Ollama for another (still structured-operations-only) plan addressing ONLY
+        # the failed checks. Capped at MAX_REPAIR_ITERATIONS so a stubborn failure
+        # can't loop forever or run away with Ollama calls.
         acceptance = {"success": True, "failed": [], "critical_failed": [], "checks": {}}
         browser_result: dict | None = None
         curl_result = None
@@ -1367,13 +1461,19 @@ def edit_workspace_site_workflow(
                 project_name, requirements, files=after_read["files"], browser_result=browser_result
             )
             tools_called.append("run_persistent_acceptance_checks")
+            after_inspected = inspect_site_state(project_name)
+            tools_called.append("inspect_site_state")
+            regressions = detect_feature_regressions(before_inspected, after_inspected)
+            tools_called.append("detect_feature_regressions")
 
-            # Every failure from the legacy per-message heuristic check is treated
-            # as critical (it always blocked "Готово" before this feature existed);
-            # the new persistent, requirement-driven check additionally flags which
-            # of ITS failures are critical (see tools_site_checks.run_acceptance_checks).
-            combined_failed = list(dict.fromkeys(text_acceptance["failed"] + persistent_acceptance["failed"]))
-            combined_critical = list(dict.fromkeys(text_acceptance["failed"] + persistent_acceptance["critical_failed"]))
+            # Every failure from the legacy per-message heuristic check and every
+            # feature regression is treated as critical; the persistent,
+            # requirement-driven check additionally flags which of ITS failures are
+            # critical (see tools_site_checks.run_acceptance_checks).
+            combined_failed = list(dict.fromkeys(text_acceptance["failed"] + persistent_acceptance["failed"] + regressions))
+            combined_critical = list(
+                dict.fromkeys(text_acceptance["failed"] + persistent_acceptance["critical_failed"] + regressions)
+            )
             acceptance = {
                 "success": not combined_critical,
                 "failed": combined_failed,
@@ -1387,19 +1487,15 @@ def edit_workspace_site_workflow(
             report_text = build_verification_report(acceptance["failed"], browser_result)
             update_current_task_step(chat_id, f"repairing_{iteration}")
             try:
-                spec_repair = ask_ollama_for_site_edit(
-                    user_text + "\n\n" + report_text, project_name, after_read["files"], requirements=requirements
-                )
-                tools_called.append("ask_ollama_for_site_edit_repair")
-                write_result_repair = apply_file_updates(project_name, spec_repair["files"])
-                tools_called.append("apply_file_updates")
-                if write_result_repair["success"]:
-                    write_result["modified_files"] = list(
-                        dict.fromkeys(write_result["modified_files"] + write_result_repair["modified_files"])
-                    )
-                    spec["summary"] = spec_repair.get("summary") or spec.get("summary")
-                    if spec_repair.get("notes"):
-                        spec["notes"] = spec_repair["notes"]
+                plan_repair = ask_ollama_for_operation_plan(user_text + "\n\n" + report_text, project_name, project_state)
+                tools_called.append("ask_ollama_for_operation_plan_repair")
+                apply_result_repair = apply_operation_plan(project_name, plan_repair["operations"])
+                tools_called.append("apply_operation_plan")
+                operations_applied.extend(apply_result_repair["applied"])
+                for path in apply_result_repair["files_changed"]:
+                    if path not in files_changed:
+                        files_changed.append(path)
+                plan_summary = plan_repair.get("summary") or plan_summary
             except Exception:
                 # Can't repair further (e.g. another invalid JSON from Ollama); stop
                 # looping and report the last known (failing) acceptance state below.
@@ -1415,11 +1511,41 @@ def edit_workspace_site_workflow(
             rollback_result = rollback_project(project_name, snapshot["snapshot_id"])
             tools_called.append("rollback_project")
 
+        success_snapshot_id = snapshot["snapshot_id"]
+        if acceptance["success"]:
+            success_snapshot = snapshot_project(project_name, reason=f"after: {plan_summary or user_text[:160]}")
+            success_snapshot_id = success_snapshot["snapshot_id"]
+            tools_called.append("snapshot_project")
+
+        project_state_manager.record_applied_operation(
+            project_name,
+            user_text=user_text,
+            operations=operations_applied,
+            files_changed=files_changed,
+            checks=acceptance,
+            success=bool(acceptance["success"]),
+            snapshot_id=success_snapshot_id if acceptance["success"] else snapshot["snapshot_id"],
+        )
+        tools_called.append("record_applied_operation")
+        learning_log.record(
+            project_name=project_name,
+            chat_id=chat_id,
+            user_text=user_text,
+            detected_intent="edit_workspace_site",
+            before_state=project_state,
+            operation_plan=operations_applied,
+            files_changed=files_changed,
+            checks=acceptance,
+            success=bool(acceptance["success"]),
+            rollback_used=bool(rollback_result),
+        )
+        tools_called.append("learning_log.record")
+
         action.update(
             {
                 "success": bool(acceptance["success"]),
                 "path": verify["path"],
-                "modified_files": write_result["modified_files"],
+                "modified_files": files_changed,
                 "preview_url": preview_url,
                 "curl_check": curl_result,
                 "tools_called": tools_called,
@@ -1432,15 +1558,15 @@ def edit_workspace_site_workflow(
 
         info = {
             "resolved_path": verify["path"],
-            "modified_files": write_result["modified_files"],
+            "modified_files": files_changed,
             "preview_url": preview_url,
-            "notes": spec.get("notes"),
+            "notes": [op.get("detail", "") for op in operations_applied if op.get("detail")],
         }
         if not preview_url:
             info["preview_note"] = "Preview не запущен (я его не запускал и не останавливал)."
 
         if acceptance["success"]:
-            headline = f"Готово! Я изменил сайт {project_name}: {spec.get('summary') or 'внес изменения по запросу'}."
+            headline = f"Готово! Я изменил сайт {project_name}: {plan_summary or 'внес изменения по запросу'}."
             answer = format_user_result(headline, info)
         elif rollback_result is not None:
             headline = "Я попробовал, проверка не прошла, изменения откатил: " + "; ".join(acceptance["failed"])
@@ -1462,7 +1588,8 @@ def edit_workspace_site_workflow(
                 "errors": [] if acceptance["success"] else acceptance["failed"],
                 "resolved_path": verify["path"],
                 "project": project_name,
-                "modified_files": write_result["modified_files"],
+                "modified_files": files_changed,
+                "operations": operations_applied,
                 "preview_url": preview_url,
                 "curl_check": curl_result,
                 "browser_check": browser_result,
@@ -3340,6 +3467,89 @@ async def repair_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Ошибка /repair_site: {e}")
 
 
+async def site_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_history <project>")
+        return
+    project = context.args[0]
+    try:
+        await reply_long(update.message, project_state_manager.format_history_answer(project))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_history: {e}")
+
+
+async def site_last_success_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_last_success <project>")
+        return
+    project = context.args[0]
+    try:
+        await update.message.reply_text(project_state_manager.format_last_success_answer(project))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_last_success: {e}")
+
+
+async def site_diff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_diff <project>")
+        return
+    project = context.args[0]
+    try:
+        await reply_long(update.message, project_state_manager.format_diff_answer(project))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_diff: {e}")
+
+
+async def site_requirements_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /site_requirements <project>")
+        return
+    project = context.args[0]
+    try:
+        await reply_long(update.message, project_state_manager.format_requirements_answer(project))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /site_requirements: {e}")
+
+
+CURRENT_ACTIVITY_QUESTION_PHRASES = (
+    "что делаешь сейчас", "что ты сейчас делаешь", "чем занят", "что сейчас происходит",
+    "what are you doing now", "what are you doing right now", "what's happening now",
+    "qué estás haciendo ahora", "que estas haciendo ahora",
+)
+
+
+def _wants_current_activity(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in CURRENT_ACTIVITY_QUESTION_PHRASES)
+
+
+FEEDBACK_APPROVED_PHRASES = (
+    "да, правильно", "да правильно", "всё верно", "все верно", "хорошо сделал", "так и было нужно",
+    "yes, correct", "that's correct", "looks good", "correcto", "está bien", "esta bien",
+)
+FEEDBACK_REJECTED_PHRASES = (
+    "нет, сломал", "нет сломал", "это сломало", "ты сломал", "стало хуже", "это неправильно",
+    "no, broke", "that broke", "this is wrong", "no, eso rompió", "eso rompio",
+)
+
+
+def _detect_feedback(text: str) -> str | None:
+    lowered = (text or "").lower()
+    if any(phrase in lowered for phrase in FEEDBACK_REJECTED_PHRASES):
+        return "rejected"
+    if any(phrase in lowered for phrase in FEEDBACK_APPROVED_PHRASES):
+        return "approved"
+    return None
+
+
 async def current_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -4102,6 +4312,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/site_rollback <project> <snapshot_id> - откатить файлы проекта к снапшоту",
                 "/site_check <project> - read-only проверка сайта по сохранённым требованиям (без правок)",
                 "/repair_site <project> - найти проблемы через /site_check и попробовать их исправить",
+                "/site_history <project> - история применённых structured operations (success/rollback)",
+                "/site_last_success <project> - последний успешно принятый snapshot",
+                "/site_diff <project> - diff текущих файлов относительно последнего успешного snapshot",
+                "/site_requirements <project> - алиас /site_state (сохранённые требования + что реально есть)",
                 "/current_task - текущая выполняемая задача",
                 "/progress - прогресс текущей задачи или последнее действие",
                 "/browser_check <project> - проверить запущенный preview через Playwright",
@@ -4808,6 +5022,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # "что делаешь сейчас?" must read real current_task/project_state, never
+        # improvise an activity Jarvis isn't actually doing.
+        if _wants_current_activity(user_text):
+            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
+            await update.message.reply_text(project_state_manager.format_current_activity_answer(project, running))
+            return
+
+        # A quiet "да, правильно"/"нет, сломал" after a site edit retroactively
+        # tags the most recent learning_log entry for this chat -- raw material
+        # for future self-improvement, doesn't change behavior live.
+        feedback_status = _detect_feedback(user_text)
+        if feedback_status:
+            project = memory.get_current_project(chat_id)
+            if project and learning_log.mark_last_feedback(project, chat_id=chat_id, status=feedback_status):
+                ack = "Принял, отметил как approved." if feedback_status == "approved" else "Принял, отметил как rejected."
+                await update.message.reply_text(ack)
+                return
+
         available_media = get_latest_available_media(chat_id)
         if _wants_background_from_latest_photo(user_text, has_pending_media=bool(available_media)):
             if not available_media:
@@ -5075,6 +5307,10 @@ def main():
     app.add_handler(CommandHandler("site_rollback", site_rollback_command))
     app.add_handler(CommandHandler("site_check", site_check_command))
     app.add_handler(CommandHandler("repair_site", repair_site_command))
+    app.add_handler(CommandHandler("site_history", site_history_command))
+    app.add_handler(CommandHandler("site_last_success", site_last_success_command))
+    app.add_handler(CommandHandler("site_diff", site_diff_command))
+    app.add_handler(CommandHandler("site_requirements", site_requirements_command))
     app.add_handler(CommandHandler("last_media", last_media_command))
     app.add_handler(CommandHandler("retry_media_background", retry_media_background_command))
     app.add_handler(CommandHandler("memory", memory_command))

@@ -73,6 +73,13 @@ async def _visible_language_blocks_async(page) -> dict[str, bool]:
                     );
                     let visible = false;
                     for (const el of els) {
+                        // Nav/buttons/links are language *controls*, not language
+                        // *content* -- they stay visible regardless of which
+                        // language is active, so they must never count here or
+                        // every language would look permanently visible.
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'button' || tag === 'a' || tag === 'nav') continue;
+                        if (el.closest('button, nav, [role="navigation"]')) continue;
                         const text = (el.innerText || '').trim();
                         if (!text) continue;
                         const style = getComputedStyle(el);

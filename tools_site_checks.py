@@ -176,3 +176,26 @@ def run_acceptance_checks(
         "critical_failed": critical_failed,
         "checks": checks,
     }
+
+
+FEATURE_INSPECTION_KEYS = {
+    "background": "has_background",
+    "language_switcher": "has_language_switcher",
+    "slider": "has_slider",
+    "weather": "has_weather_block",
+    "footer": "has_footer",
+}
+
+
+def detect_feature_regressions(before_inspected: dict[str, Any], after_inspected: dict[str, Any]) -> list[str]:
+    """Compares two tools_site_state.inspect_site_state() snapshots (read-only,
+    real file content) and flags any feature that was actually present before
+    an edit and is gone after it -- the structured-operations executor only
+    ever appends/replaces its own marker block, so this should never fire by
+    construction, but it's the explicit safety net the workflow checks before
+    accepting any edit as successful."""
+    regressions = []
+    for feature, key in FEATURE_INSPECTION_KEYS.items():
+        if before_inspected.get(key) and not after_inspected.get(key):
+            regressions.append(f"{feature}: была реализована, но пропала после правки")
+    return regressions

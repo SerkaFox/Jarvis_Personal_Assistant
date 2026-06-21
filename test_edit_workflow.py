@@ -9,28 +9,13 @@ import config
 import semantic_router as sr
 
 
-def fixture_site_edit_spec(user_text, project_name, current_files, requirements=None):
-    return {
-        "action": "edit_workspace_site",
-        "project_name": project_name,
-        "summary": "Changed style to green and added Bilbao weather widget",
-        "files": [
-            {
-                "path": "assets/css/style.css",
-                "content": "body{background:#0b3d0b;color:#eafbea}\n.weather{color:#bdf7bd}\n",
-            },
-            {
-                "path": "assets/js/main.js",
-                "content": (
-                    "fetch('https://api.open-meteo.com/v1/forecast?latitude=43.2630&longitude=-2.9350"
-                    "&current_weather=true').then(r=>r.json()).then(d=>{"
-                    "document.getElementById('weather').textContent=d.current_weather.temperature+\"C\";"
-                    "}).catch(()=>{document.getElementById('weather').textContent='weather unavailable';});\n"
-                ),
-            },
-        ],
-        "notes": ["green palette", "bilbao weather via open-meteo, no api key, no cdn"],
-    }
+def fixture_operation_plan(user_text, project_name, project_state):
+    # add_slider is a real, deterministic operation (tools_site_operations) --
+    # it touches index.html/assets/css/style.css/assets/js/main.js, which is
+    # enough surface for the workflow-plumbing tests below (preview/tools_called/
+    # current_task) without needing a saved image (set_background) or real
+    # translated content.
+    return {"operations": [{"op": "add_slider", "feature": None, "params": {}}], "summary": "added a slider"}
 
 
 class EditWorkflowSmokeTests(unittest.TestCase):
@@ -129,9 +114,17 @@ class EditWorkflowSmokeTests(unittest.TestCase):
     def test_validate_edit_workspace_site_action_accepts_valid_spec(self):
         from action_schemas import validate_edit_workspace_site_action
 
-        spec = validate_edit_workspace_site_action(
-            fixture_site_edit_spec("x", "sitebota", []), expected_project_name="sitebota"
-        )
+        raw_spec = {
+            "action": "edit_workspace_site",
+            "project_name": "sitebota",
+            "summary": "Changed style to green",
+            "files": [
+                {"path": "assets/css/style.css", "content": "body{background:#0b3d0b;color:#eafbea}\n"},
+                {"path": "assets/js/main.js", "content": "console.log('green');\n"},
+            ],
+            "notes": ["green palette"],
+        }
+        spec = validate_edit_workspace_site_action(raw_spec, expected_project_name="sitebota")
         self.assertEqual(spec["project_name"], "sitebota")
         self.assertEqual(len(spec["files"]), 2)
 
@@ -201,13 +194,11 @@ class EditWorkflowSmokeTests(unittest.TestCase):
         )
         started = start_preview("sitebota")
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=fixture_site_edit_spec):
-            answer, debug = edit_workspace_site_workflow(
-                "поменяй стиль сайта на зеленый и добавь погоду в Бильбао", "sitebota", chat_id="test"
-            )
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=fixture_operation_plan):
+            answer, debug = edit_workspace_site_workflow("добавь слайдер на сайт", "sitebota", chat_id="test")
 
         self.assertNotIn("stop_preview", debug["tools_called"])
-        self.assertIn("apply_file_updates", debug["tools_called"])
+        self.assertIn("apply_operation_plan", debug["tools_called"])
         self.assertTrue(any(p.endswith("assets/css/style.css") for p in debug["modified_files"]))
         self.assertTrue(preview_status("sitebota")["running"])
         self.assertEqual(preview_status("sitebota")["port"], started["port"])
@@ -225,7 +216,7 @@ class EditWorkflowSmokeTests(unittest.TestCase):
         create_static_site("sitebota_lan")
         start_preview("sitebota_lan")
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=fixture_site_edit_spec):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=fixture_operation_plan):
             answer, debug = edit_workspace_site_workflow(
                 "измени стиль на зеленый", "sitebota_lan", chat_id="test"
             )
@@ -240,7 +231,7 @@ class EditWorkflowSmokeTests(unittest.TestCase):
 
         create_static_site("sitebota_stopped")
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=fixture_site_edit_spec):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=fixture_operation_plan):
             answer, debug = edit_workspace_site_workflow(
                 "поменяй стиль на зеленый", "sitebota_stopped", chat_id="test"
             )
@@ -263,7 +254,7 @@ class EditWorkflowSmokeTests(unittest.TestCase):
         from tools_write import create_static_site
 
         create_static_site("sitebota_task")
-        with patch("bot.ask_ollama_for_site_edit", side_effect=fixture_site_edit_spec):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=fixture_operation_plan):
             edit_workspace_site_workflow("поменяй стиль на зеленый", "sitebota_task", chat_id="task_chat")
         self.assertIsNone(get_current_task("task_chat"))
 

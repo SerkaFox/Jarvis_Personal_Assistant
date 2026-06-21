@@ -23,6 +23,7 @@ data/proposed_plugins/
 data/selfdev_jobs/
 data/workspace_state/
 data/workspace_snapshots/
+data/learning_log/
 workspace/
 jarvis_workspace/
 *.pid

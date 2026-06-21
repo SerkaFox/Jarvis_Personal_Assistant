@@ -108,15 +108,17 @@ def save_site_state(project_name: str, updates: dict[str, Any], *, merge: bool =
                 merged[key] = bool(current.get(key)) or bool(value)
             else:
                 merged[key] = bool(value)
-    payload = {
-        "project_name": project,
-        "requirements": merged,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    # Preserve any other top-level keys already in the file (project_state_manager.py
+    # stores features/history/etc. in this same JSON) -- only the requirements/
+    # project_name/updated_at keys belong to this module.
+    raw = _read_raw(project)
+    raw["project_name"] = project
+    raw["requirements"] = merged
+    raw["updated_at"] = datetime.now(timezone.utc).isoformat()
     path = _state_path(project)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+    path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"project_name": project, "requirements": merged, "updated_at": raw["updated_at"]}
 
 
 def infer_requirements_from_text(user_text: str) -> dict[str, Any]:

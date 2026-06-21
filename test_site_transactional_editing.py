@@ -119,6 +119,14 @@ class SiteStateRequirementsTests(_BaseSiteTxTest):
         self.assertNotIn("tools_called", answer)
 
 
+def _verify_only_plan(user_text, project_name, project_state):
+    """Never satisfies any requirement -- proposes only a no-op verify, so
+    whatever requirement the task text implied stays unmet and acceptance
+    must fail every time. Used to exercise rollback/keep-anyway behavior
+    without depending on a real operation being capable of "failing"."""
+    return {"operations": [{"op": "verify", "feature": None, "params": {}}], "summary": "checking"}
+
+
 class TransactionalEditWorkflowTests(_BaseSiteTxTest):
     def test_failed_edit_restores_original_files(self):
         from bot import edit_workspace_site_workflow
@@ -129,17 +137,10 @@ class TransactionalEditWorkflowTests(_BaseSiteTxTest):
         original = read_workspace_project_files("rollbacksite")
         original_html = next(f["content"] for f in original["files"] if f["path"] == "index.html")
 
-        def breaks_sections(user_text, project_name, current_files, requirements=None):
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "removes all sections",
-                "files": [{"path": "index.html", "content": "<html><body>empty</body></html>"}],
-                "notes": [],
-            }
-
-        with patch("bot.ask_ollama_for_site_edit", side_effect=breaks_sections):
-            answer, debug = edit_workspace_site_workflow("поменяй стиль на синий", "rollbacksite", chat_id="rb")
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=_verify_only_plan):
+            answer, debug = edit_workspace_site_workflow(
+                "почини переключение языков ru/en/es", "rollbacksite", chat_id="rb"
+            )
 
         self.assertFalse(debug["acceptance"]["success"])
         self.assertTrue(debug["rolled_back"])
@@ -151,68 +152,50 @@ class TransactionalEditWorkflowTests(_BaseSiteTxTest):
         after_html = next(f["content"] for f in after["files"] if f["path"] == "index.html")
         self.assertEqual(original_html, after_html)
 
-    def test_language_fix_must_preserve_existing_background(self):
+    def test_language_fix_preserves_existing_background_via_real_operations(self):
         from bot import edit_workspace_site_workflow
         from tools_write import create_static_site
-        from tools_site_state import get_site_requirements
+        from tools_site_state import get_site_requirements, inspect_site_state
 
         create_static_site("langbgsite")
 
-        def add_background(user_text, project_name, current_files, requirements=None):
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "added hero background",
-                "files": [
-                    {"path": "assets/css/style.css", "content": ".hero{background-image:url('../img/bg.jpg');}"}
-                ],
-                "notes": [],
-            }
+        def add_background_plan(user_text, project_name, project_state):
+            return {"operations": [{"op": "set_background", "feature": None, "params": {}}], "summary": "added background"}
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=add_background):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=add_background_plan):
+            # set_background needs a real image -- save one directly first.
+            import io
+
+            from PIL import Image
+
+            from tools_media import save_telegram_image_to_project
+
+            buf = io.BytesIO()
+            Image.new("RGB", (10, 10), color=(0, 0, 255)).save(buf, format="JPEG")
+            save_telegram_image_to_project("langbgsite", buf.getvalue(), original_name="hero.jpg", mime_type="image/jpeg")
+
             answer, debug = edit_workspace_site_workflow("сделай фон сайта hero", "langbgsite", chat_id="lb")
         self.assertTrue(debug["acceptance"]["success"], debug["acceptance"]["failed"])
         self.assertTrue(get_site_requirements("langbgsite")["background_required"])
 
-        def fix_language_drops_background(user_text, project_name, current_files, requirements=None):
-            # Misbehaving edit: "fixes" languages but silently drops the
-            # background CSS that an earlier task established.
-            self.assertTrue(requirements.get("background_required"))  # must_preserve was passed in
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "fixed language switching",
-                "files": [
-                    {
-                        "path": "index.html",
-                        "content": (
-                            '<header><button data-lang="ru">RU</button><button data-lang="en">EN</button>'
-                            '<button data-lang="es">ES</button></header>'
-                            "<section>1</section><section>2</section><section>3</section>"
-                            "<section>4</section><section class=\"cards\"><div class=\"card\">card</div></section>"
-                            "<script>document.addEventListener('click', function(e){ if(e.target.dataset.lang)"
-                            " setLang(e.target.dataset.lang); });</script>"
-                        ),
-                    },
-                    {"path": "assets/css/style.css", "content": "body{color:black}"},
-                ],
-                "notes": [],
-            }
+        def fix_language_plan(user_text, project_name, project_state):
+            self.assertTrue(project_state["requirements"].get("background_required"))  # must_preserve context was passed
+            return {"operations": [{"op": "fix_language_switcher", "feature": None, "params": {}}], "summary": "fixed languages"}
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=fix_language_drops_background):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=fix_language_plan):
             answer, debug = edit_workspace_site_workflow(
                 "почини переключение языков ru/en/es", "langbgsite", chat_id="lb"
             )
 
-        self.assertFalse(debug["acceptance"]["success"])
-        self.assertTrue(debug["rolled_back"])
-        self.assertTrue(any("background_present_in_css" in item for item in debug["acceptance"]["failed"]))
-        self.assertIn("проверка не прошла, изменения откатил", answer)
+        self.assertTrue(debug["acceptance"]["success"], debug["acceptance"]["failed"])
+        self.assertIn("Готово", answer)
+        self.assertTrue(inspect_site_state("langbgsite")["has_background"])
+        self.assertTrue(inspect_site_state("langbgsite")["has_language_switcher"])
 
     def test_adding_slider_preserves_language_switcher_and_background(self):
         from bot import edit_workspace_site_workflow
         from tools_write import create_static_site
-        from tools_site_state import save_site_state, get_site_requirements
+        from tools_site_state import save_site_state, get_site_requirements, inspect_site_state
 
         create_static_site("slidersite")
         save_site_state(
@@ -224,35 +207,26 @@ class TransactionalEditWorkflowTests(_BaseSiteTxTest):
                 "single_language_visible": True,
             },
         )
+        import tools_site_operations as ops
 
-        def add_slider_keep_everything(user_text, project_name, current_files, requirements=None):
-            self.assertTrue(requirements.get("background_required"))
-            self.assertTrue(requirements.get("language_switcher_required"))
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "added slider",
-                "files": [
-                    {
-                        "path": "index.html",
-                        "content": (
-                            '<header><button data-lang="ru">RU</button><button data-lang="en">EN</button>'
-                            '<button data-lang="es">ES</button></header>'
-                            '<section class="hero">hero</section>'
-                            '<section class="features">features</section>'
-                            '<section class="slider"><div class="slide">1</div><div class="slide">2</div></section>'
-                            '<section class="cards"><div class="card">card</div></section>'
-                            '<section class="contact">contact</section>'
-                            "<script>document.addEventListener('click', function(e){ if(e.target.dataset.lang)"
-                            " setLang(e.target.dataset.lang); });</script>"
-                        ),
-                    },
-                    {"path": "assets/css/style.css", "content": ".hero{background-image:url('../img/bg.jpg');}"},
-                ],
-                "notes": [],
-            }
+        ops.op_fix_language_switcher("slidersite", {})
+        # set_background needs an image; use a CSS-only marker write instead so
+        # this test stays focused on "does add_slider preserve what's already there".
+        from tools_write import write_project_text_file
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=add_slider_keep_everything):
+        write_project_text_file(
+            "slidersite",
+            "assets/css/style.css",
+            "/* jarvis-hero-background:start */\n.hero{background-image:url('../img/bg.jpg');}\n/* jarvis-hero-background:end */\n",
+            overwrite=True,
+        )
+
+        def add_slider_plan(user_text, project_name, project_state):
+            self.assertTrue(project_state["requirements"].get("background_required"))
+            self.assertTrue(project_state["requirements"].get("language_switcher_required"))
+            return {"operations": [{"op": "add_slider", "feature": None, "params": {}}], "summary": "added slider"}
+
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=add_slider_plan):
             answer, debug = edit_workspace_site_workflow("добавь слайдер с фото", "slidersite", chat_id="sl")
 
         self.assertTrue(debug["acceptance"]["success"], debug["acceptance"]["failed"])
@@ -260,62 +234,42 @@ class TransactionalEditWorkflowTests(_BaseSiteTxTest):
         self.assertFalse(debug["rolled_back"])
         requirements = get_site_requirements("slidersite")
         self.assertTrue(requirements["slider_required"])
-        self.assertTrue(requirements["background_required"])
-        self.assertTrue(requirements["language_switcher_required"])
+        inspected = inspect_site_state("slidersite")
+        self.assertTrue(inspected["has_background"])
+        self.assertTrue(inspected["has_language_switcher"])
+        self.assertTrue(inspected["has_slider"])
 
-    @unittest.skipUnless(_playwright_installed(), "Playwright not installed")
-    def test_hidden_language_buttons_fail_browser_check_and_roll_back(self):
+    def test_feature_regression_safety_net_rolls_back_even_if_an_operation_is_buggy(self):
+        """Defense-in-depth: even if a (hypothetically buggy) operation wipes out
+        an existing feature, detect_feature_regressions must catch it and the
+        workflow must roll back -- not just trust that operations are additive."""
         from bot import edit_workspace_site_workflow
         from tools_write import create_static_site
-        from tools_site_state import save_site_state
-        from tools_preview import start_preview
-        from tools_edit import read_workspace_project_files
+        import tools_site_operations as ops
 
-        create_static_site("hiddenlangsite")
-        save_site_state(
-            "hiddenlangsite",
-            {"language_switcher_required": True, "languages": ["ru", "en", "es"], "single_language_visible": True},
-        )
-        start_preview("hiddenlangsite")
-        original = read_workspace_project_files("hiddenlangsite")
-        original_html = next(f["content"] for f in original["files"] if f["path"] == "index.html")
+        create_static_site("regressionsite")
+        ops.op_fix_language_switcher("regressionsite", {})
 
-        def hidden_buttons_spec(user_text, project_name, current_files, requirements=None):
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "language buttons present but not clickable",
-                "files": [
-                    {
-                        "path": "index.html",
-                        "content": (
-                            "<header>"
-                            '<button data-lang="ru" style="display:none">RU</button>'
-                            '<button data-lang="en" style="display:none">EN</button>'
-                            '<button data-lang="es" style="display:none">ES</button>'
-                            "</header>"
-                            "<section>1</section><section>2</section><section>3</section>"
-                            "<section>4</section><section class=\"cards\"><div class=\"card\">card</div></section>"
-                            "<script>document.addEventListener('click', function(e){ if(e.target.dataset.lang)"
-                            " setLang(e.target.dataset.lang); });</script>"
-                        ),
-                    }
-                ],
-                "notes": [],
-            }
+        def buggy_repair_feature(project_name, params):
+            # Simulates a bug: instead of repairing, it wipes the HTML file,
+            # removing the language buttons/content blocks entirely.
+            from tools_write import write_project_text_file
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=hidden_buttons_spec):
-            answer, debug = edit_workspace_site_workflow(
-                "почини переключение языков ru/en/es", "hiddenlangsite", chat_id="hl"
-            )
+            write_project_text_file(project_name, "index.html", "<html><body>empty</body></html>", overwrite=True)
+            return {"files_changed": ["index.html"], "detail": "buggy repair"}
+
+        def buggy_plan(user_text, project_name, project_state):
+            return {"operations": [{"op": "fix_language_switcher", "feature": None, "params": {}}], "summary": "repair"}
+
+        with patch.object(ops, "OP_DISPATCH", {**ops.OP_DISPATCH, "fix_language_switcher": buggy_repair_feature}):
+            with patch("bot.ask_ollama_for_operation_plan", side_effect=buggy_plan):
+                answer, debug = edit_workspace_site_workflow(
+                    "почини переключение языков ru/en/es", "regressionsite", chat_id="rg"
+                )
 
         self.assertFalse(debug["acceptance"]["success"])
         self.assertTrue(debug["rolled_back"])
-        self.assertIn("проверка не прошла, изменения откатил", answer)
-
-        after = read_workspace_project_files("hiddenlangsite")
-        after_html = next(f["content"] for f in after["files"] if f["path"] == "index.html")
-        self.assertEqual(original_html, after_html)
+        self.assertTrue(any("language_switcher" in item for item in debug["acceptance"]["failed"]))
 
     def test_keep_despite_failure_phrase_skips_rollback(self):
         from bot import edit_workspace_site_workflow
@@ -324,28 +278,15 @@ class TransactionalEditWorkflowTests(_BaseSiteTxTest):
 
         create_static_site("keepsite")
 
-        def breaks_sections(user_text, project_name, current_files, requirements=None):
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "removes all sections",
-                "files": [{"path": "index.html", "content": "<html><body>empty</body></html>"}],
-                "notes": [],
-            }
-
-        with patch("bot.ask_ollama_for_site_edit", side_effect=breaks_sections):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=_verify_only_plan):
             answer, debug = edit_workspace_site_workflow(
-                "поменяй стиль на синий, оставь всё равно", "keepsite", chat_id="ks"
+                "почини переключение языков ru/en/es, оставь всё равно", "keepsite", chat_id="ks"
             )
 
         self.assertFalse(debug["acceptance"]["success"])
         self.assertFalse(debug["rolled_back"])
         self.assertNotIn("Готово", answer)
         self.assertNotIn("tools_called", answer)
-
-        after = read_workspace_project_files("keepsite")
-        after_html = next(f["content"] for f in after["files"] if f["path"] == "index.html")
-        self.assertEqual(after_html, "<html><body>empty</body></html>")
 
 
 if __name__ == "__main__":

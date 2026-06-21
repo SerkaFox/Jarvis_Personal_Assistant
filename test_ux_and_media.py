@@ -182,7 +182,7 @@ class JsonRepairTests(unittest.TestCase):
         with patch("bot.ask_ollama_messages", return_value="I cannot produce JSON for this request."):
             answer, debug = edit_workspace_site_workflow("сделай неонового цвета", "nojsonsite", chat_id="t2")
 
-        self.assertIn("Не смог получить корректный план изменений от модели", answer)
+        self.assertIn("Не смог получить корректный план операций от модели", answer)
         self.assertNotIn("WRITE_ROOT", answer)
         self.assertEqual(css_path.read_text(encoding="utf-8"), original_css)
         self.assertTrue(debug["errors"])
@@ -440,31 +440,20 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def always_missing_es(user_text, project_name, current_files, requirements=None):
+        def never_fixes_language(user_text, project_name, project_state):
+            # Deliberately never proposes fix_language_switcher/add_feature(language_switcher)
+            # -- language_switcher_required gets set (the task text mentions it) but no
+            # operation in the plan ever satisfies it, so acceptance can never succeed
+            # and the repair loop must give up after MAX_REPAIR_ITERATIONS.
             calls["n"] += 1
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "tries but never adds ES",
-                "files": [
-                    {
-                        "path": "index.html",
-                        "content": (
-                            '<header><button data-lang="ru">RU</button><button data-lang="en">EN</button></header>'
-                            "<script>document.addEventListener('click', function(e){ if(e.target.dataset.lang)"
-                            " setLang(e.target.dataset.lang); });</script>"
-                        ),
-                    }
-                ],
-                "notes": [],
-            }
+            return {"operations": [{"op": "verify", "feature": None, "params": {}}], "summary": "checking"}
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=always_missing_es):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=never_fixes_language):
             answer, debug = edit_workspace_site_workflow(
                 "сделай переключение языков ru/en/es", "repairloop", chat_id="rl"
             )
 
-        # initial attempt + MAX_REPAIR_ITERATIONS(2) repairs = 3 generation calls total
+        # initial attempt + MAX_REPAIR_ITERATIONS(2) repairs = 3 plan calls total
         self.assertEqual(calls["n"], 3)
         self.assertFalse(debug["acceptance"]["success"])
         self.assertIn("проверка не прошла, изменения откатил", answer)
@@ -476,7 +465,7 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
 
         after_rollback = read_workspace_project_files("repairloop")
         index_html = next(f["content"] for f in after_rollback["files"] if f["path"] == "index.html")
-        self.assertNotIn("setLang", index_html)
+        self.assertNotIn("jarvis-lang-buttons", index_html)
 
     @unittest.skipUnless(_pillow_installed() and _playwright_installed(), "Pillow/Playwright not installed")
     def test_background_image_workflow_passes_when_css_references_real_visible_image(self):
@@ -495,21 +484,13 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
         saved = save_telegram_image_to_project("bgsite", buf.getvalue(), original_name="hero.jpg", mime_type="image/jpeg")
         image_name = Path(saved["relative_path"]).name
 
-        def bg_spec(user_text, project_name, current_files, requirements=None):
+        def bg_spec(user_text, project_name, project_state):
             return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
+                "operations": [{"op": "set_background", "feature": None, "params": {"target": "hero"}}],
                 "summary": "added hero background",
-                "files": [
-                    {
-                        "path": "assets/css/style.css",
-                        "content": f".hero{{background-image:url('../img/{image_name}');background-size:cover;}}",
-                    }
-                ],
-                "notes": [],
             }
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=bg_spec):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=bg_spec):
             answer, debug = edit_workspace_site_workflow(
                 f"используй изображение assets/img/{image_name} как фон hero-секции",
                 "bgsite",
@@ -527,16 +508,10 @@ class RepairLoopAndBackgroundTests(unittest.TestCase):
 
         create_static_site("bgsite_bad")
 
-        def bad_bg_spec(user_text, project_name, current_files, requirements=None):
-            return {
-                "action": "edit_workspace_site",
-                "project_name": project_name,
-                "summary": "did nothing useful",
-                "files": [{"path": "assets/css/style.css", "content": "body{color:red}"}],
-                "notes": [],
-            }
+        def bad_bg_spec(user_text, project_name, project_state):
+            return {"operations": [{"op": "verify", "feature": None, "params": {}}], "summary": "did nothing useful"}
 
-        with patch("bot.ask_ollama_for_site_edit", side_effect=bad_bg_spec):
+        with patch("bot.ask_ollama_for_operation_plan", side_effect=bad_bg_spec):
             answer, debug = edit_workspace_site_workflow(
                 "используй изображение assets/img/missing-hero.jpg как фон",
                 "bgsite_bad",

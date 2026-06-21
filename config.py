@@ -125,6 +125,12 @@ def get_workspace_snapshots_dir() -> Path:
     return path
 
 
+def get_learning_log_dir() -> Path:
+    path = Path(os.getenv("JARVIS_LEARNING_LOG_DIR", str(_data_dir() / "learning_log"))).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 MAX_FILE_CHARS = env_int("MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS)
 MAX_SEARCH_RESULTS = env_int("MAX_SEARCH_RESULTS", DEFAULT_MAX_SEARCH_RESULTS)
 AGENT_TOOLS_ENABLED = env_bool("AGENT_TOOLS_ENABLED", True)

@@ -147,7 +147,11 @@ def op_set_background(project_name: str, params: dict[str, Any]) -> dict[str, An
         set_fixed_background(project_name, image_path)
     else:
         set_hero_background(project_name, image_path, fixed=fixed)
-    return {"files_changed": ["assets/css/style.css"], "detail": f"background -> {image_path} ({target})"}
+    return {
+        "files_changed": ["assets/css/style.css"],
+        "detail": f"background -> {image_path} ({target})",
+        "image_path": image_path,
+    }
 
 
 SLIDER_CSS_LINES = [

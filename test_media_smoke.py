@@ -159,9 +159,11 @@ class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_text_after_pending_photo_routes_to_background_workflow(self):
         from tools_pending_media import save_pending_media
+        from tools_write import create_static_site
         import bot
         from test_error_smoke import FakeContext, FakeUpdate
 
+        create_static_site("hola")
         save_pending_media("456", "123", "file_1", file_unique_id="u1", mime_type="image/jpeg", size_bytes=100)
 
         called = {}
@@ -178,13 +180,30 @@ class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called["project"], "hola")
         self.assertTrue(any("ok" in reply for reply in update.message.replies))
 
-    async def test_background_request_without_pending_photo_prompts_user(self):
+    async def test_background_request_without_pending_photo_prompts_for_project(self):
+        # No pending photo, no project mentioned that actually exists --
+        # task_orchestrator can't resolve a workspace_project, so it must ask
+        # which site, not guess.
         import bot
         from test_error_smoke import FakeContext, FakeUpdate
 
+        update = FakeUpdate("помести на фон сайта doesnotexist")
+        await bot.handle_text(update, FakeContext())
+        self.assertTrue(any("на какой сайт" in reply.lower() for reply in update.message.replies))
+
+    async def test_background_request_without_pending_photo_falls_back_to_existing_image_source(self):
+        # No pending photo but a real project -- task_orchestrator picks
+        # media_source=existing_project_image (spec item 5). No image saved
+        # yet, so it must fail honestly, never claim "Готово".
+        import bot
+        from tools_write import create_static_site
+        from test_error_smoke import FakeContext, FakeUpdate
+
+        create_static_site("hola")
         update = FakeUpdate("помести на фон сайта hola")
         await bot.handle_text(update, FakeContext())
-        self.assertTrue(any("не вижу последнего фото" in reply.lower() for reply in update.message.replies))
+        self.assertTrue(any("не завершено" in reply.lower() for reply in update.message.replies))
+        self.assertFalse(any("готово" in reply.lower() for reply in update.message.replies))
 
     async def test_hero_phrase_with_pending_photo_routes_to_media_workflow_not_edit(self):
         from tools_pending_media import save_pending_media
@@ -213,9 +232,11 @@ class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hero_phrase_with_explicit_project_extracts_project_and_hero_target(self):
         from tools_pending_media import save_pending_media
+        from tools_write import create_static_site
         import bot
         from test_error_smoke import FakeContext, FakeUpdate
 
+        create_static_site("hola")
         save_pending_media("456", "123", "file_hero2", file_unique_id="uh2", mime_type="image/jpeg", size_bytes=100)
 
         called = {}

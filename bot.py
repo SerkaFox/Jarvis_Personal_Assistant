@@ -89,9 +89,10 @@ from tools_site_state import (
 )
 from tools_snapshot import list_snapshots, rollback_project, snapshot_project
 from tools_site_checks import detect_feature_regressions, run_acceptance_checks as run_persistent_acceptance_checks
-from tools_site_operations import apply_operation_plan, validate_operation_plan
+from tools_site_operations import apply_operation_plan, op_set_background, validate_operation_plan
 import project_state_manager
 import learning_log
+import task_orchestrator
 from tools_write import (
     create_flask_site,
     create_project_dir,
@@ -496,20 +497,37 @@ def _workspace_name_from_text(text: str) -> str | None:
 
 
 def _workspace_project_from_context(text: str, chat_id: str | None) -> str | None:
-    explicit = _workspace_name_from_text(text)
-    if explicit:
-        return explicit
+    """Resolve a WORKSPACE project name, not a git repository.
+
+    Important: this function must never return a random English token from the
+    user's sentence unless that token is an actual workspace project. The old
+    behavior returned the last Latin-looking word and then downstream routing
+    sometimes treated it as a git repo, which produced confusing answers like
+    "Репозиторий не найден: kuki" for a real workspace website.
+    """
+    lowered = (text or "").lower()
     try:
         projects = list_workspace()["projects"]
-        lowered = text.lower()
-        for item in projects:
-            if item["name"].lower() in lowered:
-                return item["name"]
     except Exception:
-        pass
+        projects = []
+
+    names = [str(item.get("name") or "") for item in projects if item.get("name")]
+
+    # 1) Explicit existing workspace project mentioned in free text.
+    for name in names:
+        if re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(name.lower())}(?![A-Za-z0-9_.-])", lowered):
+            return name
+
+    # 2) Explicit slug only if it really exists as a workspace project.
+    explicit = _workspace_name_from_text(text)
+    if explicit and explicit in names:
+        return explicit
+
+    # 3) Last/current project, but only if it still exists.
     action = get_last_action(chat_id)
-    if action and action.get("project_name"):
+    if action and action.get("project_name") and _workspace_project_exists(str(action["project_name"])):
         return str(action["project_name"])
+
     current = memory.get_current_project(chat_id) if chat_id else None
     if current and _workspace_project_exists(current):
         return current
@@ -3013,15 +3031,22 @@ async def delete_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def preview_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    if not context.args:
-        await update.message.reply_text("Использование: /preview_start <project>")
+    chat_id, _ = chat_user_ids(update)
+    project = context.args[0] if context.args else (memory.get_current_project(chat_id) or (get_last_action(chat_id) or {}).get("project_name"))
+    if not project or not _workspace_project_exists(str(project)):
+        projects = ", ".join(item["name"] for item in list_workspace().get("projects", [])) or "-"
+        await update.message.reply_text(
+            "Использование: /preview_start <project>\n"
+            f"Текущий проект не выбран. Доступные workspace-проекты: {projects}"
+        )
         return
+    project = str(project)
     try:
-        result = start_preview(context.args[0])
-        status = preview_status(context.args[0])
+        result = start_preview(project)
+        status = preview_status(project)
         if not result.get("success") or not status.get("running"):
             raise RuntimeError("Preview tool не подтвердил запущенный процесс")
-        chat_id, _ = chat_user_ids(update)
+        memory.set_current_project(chat_id, project)
         save_last_action(
             chat_id,
             {
@@ -3424,11 +3449,16 @@ async def site_rollback_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def site_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    if not context.args:
-        await update.message.reply_text("Использование: /site_check <project>")
-        return
-    project = context.args[0]
     chat_id, _ = chat_user_ids(update)
+    project = context.args[0] if context.args else memory.get_current_project(chat_id)
+    if not project or not _workspace_project_exists(str(project)):
+        projects = ", ".join(item["name"] for item in list_workspace().get("projects", [])) or "-"
+        await update.message.reply_text(
+            "Использование: /site_check <project>\n"
+            f"Текущий проект не выбран. Доступные workspace-проекты: {projects}"
+        )
+        return
+    project = str(project)
     try:
         answer, debug = await site_check_workflow(project, chat_id=chat_id)
         await reply_long(update.message, answer)
@@ -3720,6 +3750,59 @@ async def last_media_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines))
 
 
+async def media_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Same data as /last_media -- explicit name for task_orchestrator's
+    media_source decision (pending_media vs existing_project_image) so it's
+    easy to check what apply_media_to_site will actually use right now."""
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    media = get_latest_media_any_status(chat_id)
+    available = get_latest_available_media(chat_id)
+    lines = [f"pending_media доступна для apply_media_to_site: {'да' if available else 'нет'}"]
+    if media:
+        lines.append(f"Последнее фото -- статус: {media.get('status') or '-'}")
+        lines.append(f"Проект: {media.get('used_project') or '-'}")
+        lines.append(f"Файл: {media.get('saved_path') or '-'}")
+        if media.get("status") == "failed":
+            lines.append(f"Причина: {media.get('failed_reason') or '-'}")
+    else:
+        lines.append("Фото ещё не присылали.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def task_debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    await update.message.reply_text(task_orchestrator.format_last_decision(chat_id))
+
+
+async def project_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fuller technical dump than /site_state: per-feature status table,
+    last_successful_snapshot, last_failed_action, operation history count."""
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /project_state <project>")
+        return
+    project = context.args[0]
+    try:
+        state = project_state_manager.load_project_state(project)
+        lines = [
+            f"project_state {project}:",
+            f"last_successful_snapshot: {state.get('last_successful_snapshot') or '-'}",
+            f"last_failed_action: {'есть, см. /site_history' if state.get('last_failed_action') else '-'}",
+            f"applied_operations_history: {len(state.get('applied_operations_history') or [])} записей",
+            "features:",
+        ]
+        for name, entry in state.get("features", {}).items():
+            lines.append(f"- {name}: {entry.get('status')}")
+        await reply_long(update.message, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /project_state: {e}")
+
+
 async def retry_media_background_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -3845,6 +3928,165 @@ def _wants_site_status_check(text: str) -> bool:
     return any(phrase in lowered for phrase in SITE_STATUS_QUESTION_PHRASES)
 
 
+SITE_FEATURE_CHECK_WORDS = (
+    "слайдер", "slider", "slide", "карусел", "carousel",
+    "рецепт", "recipe", "печень", "cookie",
+    "кнопк", "button", "язык", "language", "idioma",
+    "фон", "background", "hero", "херо",
+    "футер", "footer", "шапк", "header", "погод", "weather",
+)
+
+SITE_CHECK_ACTION_WORDS = (
+    "проверь", "проверить", "есть ли", "найди", "посмотри", "покажи",
+    "работает", "работают", "check", "verify", "find", "show", "revisa", "comprueba",
+)
+
+
+def _wants_workspace_site_check(text: str) -> bool:
+    """Free-text request to inspect a workspace website.
+
+    This deliberately catches requests such as:
+    "проверь, есть ли слайдер с рецептами на сайте kuki"
+    before semantic/git routing. It is not a git/repo question.
+    """
+    lowered = (text or "").lower()
+    if _wants_site_status_check(lowered):
+        return True
+    if "код" in lowered and not any(w in lowered for w in ("сайт", "страниц", "preview", "превью")):
+        return False
+    has_action = any(word in lowered for word in SITE_CHECK_ACTION_WORDS)
+    has_site_hint = any(word in lowered for word in ("сайт", "страниц", "preview", "превью", "website", "site", "sitio"))
+    has_feature = any(word in lowered for word in SITE_FEATURE_CHECK_WORDS)
+    return has_action and (has_site_hint or has_feature)
+
+
+def _workspace_check_feature_report(user_text: str, files: list[dict], browser_result: dict | None = None) -> list[str]:
+    lowered = (user_text or "").lower()
+    by_path = {str(f.get("path") or ""): str(f.get("content") or "") for f in files}
+    html = "\n".join(content for path, content in by_path.items() if path.lower().endswith(".html"))
+    css = "\n".join(content for path, content in by_path.items() if path.lower().endswith(".css"))
+    js = "\n".join(content for path, content in by_path.items() if path.lower().endswith(".js"))
+    all_text = (html + "\n" + css + "\n" + js).lower()
+    html_lower = html.lower()
+    css_lower = css.lower()
+    js_lower = js.lower()
+    lines: list[str] = []
+
+    if any(word in lowered for word in ("слайдер", "slider", "карусел", "carousel", "slide")):
+        has_slider_markup = any(marker in html_lower for marker in ("slider", "slide", "carousel", "data-slide"))
+        has_slider_js = any(marker in js_lower for marker in ("nextslide", "prevslide", "currentslide", "slideindex", "queryselectorall('.slide", "queryselectorall(\".slide"))
+        recipe_required = any(word in lowered for word in ("рецепт", "recipe", "печень", "cookie"))
+        has_recipe_text = any(word in all_text for word in ("рецепт", "recipe", "печень", "cookie", "ингреди", "ingredients", "мука", "сахар"))
+        ok = has_slider_markup and (has_slider_js or "button" in html_lower) and (has_recipe_text if recipe_required else True)
+        if ok:
+            detail = "слайдер найден" + ("; тексты рецептов тоже найдены" if recipe_required else "")
+        else:
+            missing = []
+            if not has_slider_markup:
+                missing.append("нет slider/slide-разметки")
+            if not (has_slider_js or "button" in html_lower):
+                missing.append("нет JS/кнопок навигации")
+            if recipe_required and not has_recipe_text:
+                missing.append("нет текста рецептов")
+            detail = "слайдер не подтверждён: " + ", ".join(missing)
+        lines.append(("✅ " if ok else "❌ ") + detail)
+
+    if any(word in lowered for word in ("язык", "language", "idioma", "кнопк", "button")):
+        found_langs = [code.upper() for code in ("ru", "en", "es") if f'data-lang="{code}"' in all_text or f"data-lang='{code}'" in all_text or f">{code}<" in all_text]
+        has_handler = "addEventListener".lower() in js_lower or "onclick" in html_lower
+        ok = set(found_langs) >= {"RU", "EN", "ES"} and has_handler
+        lines.append(("✅ " if ok else "❌ ") + f"языки: найдены кнопки {', '.join(found_langs) or '-'}; обработчик: {'есть' if has_handler else 'не найден'}")
+        if browser_result and browser_result.get("language_switch_ok") is not None:
+            lines.append(f"Браузерная проверка переключения языков: {browser_result.get('language_switch_ok')}")
+
+    if any(word in lowered for word in ("фон", "background", "hero", "херо")):
+        has_bg = "background-image" in css_lower or "url(" in css_lower
+        bg_target = "hero" if "hero" in css_lower or "херо" in lowered else "body/общий"
+        lines.append(("✅ " if has_bg else "❌ ") + f"фон: {'найден' if has_bg else 'не найден'}; цель: {bg_target}")
+        if browser_result and browser_result.get("background_image_loaded") is not None:
+            lines.append(f"Браузер подтвердил фон: {browser_result.get('background_image_loaded')}")
+
+    if any(word in lowered for word in ("футер", "footer")):
+        ok = "<footer" in html_lower or "footer" in html_lower
+        lines.append(("✅ " if ok else "❌ ") + f"footer: {'найден' if ok else 'не найден'}")
+
+    if any(word in lowered for word in ("шапк", "header")):
+        ok = "<header" in html_lower or "header" in html_lower
+        lines.append(("✅ " if ok else "❌ ") + f"header: {'найден' if ok else 'не найден'}")
+
+    if any(word in lowered for word in ("погод", "weather")):
+        ok = "open-meteo" in all_text or "weather" in all_text or "погод" in all_text
+        lines.append(("✅ " if ok else "❌ ") + f"погода: {'найдена' if ok else 'не найдена'}")
+
+    if not lines:
+        lines.append("Проверил HTML/CSS/JS сайта. Уточни, какую функцию искать: слайдер, языки, фон, footer, weather.")
+    return lines
+
+
+async def workspace_site_feature_check_workflow(project_name: str, user_text: str, chat_id: str | None = None) -> tuple[str, dict]:
+    """Read-only site/feature check for workspace projects.
+
+    Does not touch git/repo tools. Starts preview if needed, reads real files,
+    optionally runs browser check, and returns a human answer.
+    """
+    tools_called: list[str] = []
+    try:
+        if not _workspace_project_exists(project_name):
+            projects = ", ".join(item["name"] for item in list_workspace().get("projects", [])) or "-"
+            msg = f"Workspace-проект {project_name} не найден. Доступные проекты: {projects}"
+            return msg, {"detected": {"intent": "workspace_site_check", "project": project_name}, "tools_called": tools_called, "errors": [msg]}
+
+        read_result = read_workspace_project_files(project_name)
+        tools_called.append("read_workspace_project_files")
+        files = read_result.get("files") or []
+
+        status = preview_status(project_name)
+        tools_called.append("preview_status")
+        if not status.get("running"):
+            start_preview(project_name)
+            tools_called.append("start_preview")
+            status = preview_status(project_name)
+            tools_called.append("preview_status")
+
+        preview_url = ""
+        curl_result = None
+        browser_result = None
+        if status.get("running") and status.get("port"):
+            port = int(status["port"])
+            preview_url = preview_url_for_port(port)
+            curl_result = curl_check(port)
+            tools_called.append("curl_check")
+            if playwright_available():
+                browser_result = await check_site_with_playwright_async(project_name, f"http://127.0.0.1:{port}/")
+                tools_called.append("check_site_with_playwright_async")
+                save_last_verification(project_name, browser_result)
+
+        feature_lines = _workspace_check_feature_report(user_text, files, browser_result=browser_result)
+        lines = [f"Проверил сайт {project_name}."]
+        lines.extend(feature_lines)
+        if curl_result:
+            lines.append(f"HTTP-проверка: {curl_result.get('status') or curl_result.get('status_code') or ('OK' if curl_result.get('success') else 'ошибка')}")
+        if preview_url:
+            lines.append(f"Открыть сайт: {preview_url}")
+        if chat_id:
+            memory.set_current_project(chat_id, project_name)
+        return "\n".join(lines), {
+            "detected": {"intent": "workspace_site_check", "project": project_name},
+            "tools_called": tools_called,
+            "errors": [],
+            "project": project_name,
+            "preview_url": preview_url,
+            "curl_check": curl_result,
+            "browser_check": browser_result,
+        }
+    except Exception as e:
+        save_last_error(chat_id=chat_id or "", user_id="", handler="workspace_site_feature_check_workflow", error=e, user_text=user_text)
+        return (
+            f"Не смог проверить сайт {project_name}: {e}",
+            {"detected": {"intent": "workspace_site_check", "project": project_name}, "tools_called": tools_called, "errors": [str(e)]},
+        )
+
+
 async def _check_background_live(project_name: str, base_url: str, relative_image: str) -> dict[str, Any]:
     """Read-only liveness check: confirms image/CSS are reachable over HTTP and,
     if Playwright is available, that the background-image is actually applied
@@ -3870,6 +4112,52 @@ async def _check_background_live(project_name: str, base_url: str, relative_imag
     else:
         result["ok"] = True
     return result
+
+
+def _record_media_operation(
+    project_name: str,
+    *,
+    chat_id: str | None,
+    user_text: str,
+    operations: list[dict],
+    files_changed: list[str],
+    success: bool,
+    snapshot_id: str | None = None,
+    rollback_used: bool = False,
+    error: str = "",
+) -> None:
+    """Every apply_media_to_site outcome writes project_state + learning_log,
+    same as edit_workspace_site_workflow -- task/source/target/changed_files/
+    checks/success all need to be real and queryable via /task_debug,
+    /project_state, /media_status, not just a chat reply."""
+    checks = {"success": success, "failed": [] if success else [error or "не подтверждено"]}
+    try:
+        project_state_manager.record_applied_operation(
+            project_name,
+            user_text=user_text,
+            operations=operations,
+            files_changed=files_changed,
+            checks=checks,
+            success=success,
+            snapshot_id=snapshot_id,
+        )
+    except ToolError:
+        pass
+    try:
+        learning_log.record(
+            project_name=project_name,
+            chat_id=chat_id,
+            user_text=user_text,
+            detected_intent="apply_media_to_site",
+            before_state=None,
+            operation_plan=operations,
+            files_changed=files_changed,
+            checks=checks,
+            success=success,
+            rollback_used=rollback_used,
+        )
+    except ToolError:
+        pass
 
 
 async def add_background_image_workflow(
@@ -3984,6 +4272,14 @@ async def add_background_image_workflow(
             )
 
         mark_media_used(int(media["id"]), project_name, str(out_abs))
+        _record_media_operation(
+            project_name,
+            chat_id=chat_id,
+            user_text=str(getattr(message, "text", "") or getattr(message, "caption", "") or ""),
+            operations=[{"op": "set_background", "source": "pending_media", "target": target, "image": relative_image}],
+            files_changed=["assets/css/style.css", relative_image],
+            success=True,
+        )
 
         if live["background_image_loaded"]:
             check_note = "Проверка: изображение отдаётся сайтом HTTP 200. Браузер подтвердил фон."
@@ -4021,10 +4317,115 @@ async def add_background_image_workflow(
         except Exception:
             pass
         save_last_error(chat_id=chat_id, user_id=user_id, handler="add_background_image_workflow", error=e, user_text=str(getattr(message, "text", "") or getattr(message, "caption", "") or ""))
+        _record_media_operation(
+            project_name,
+            chat_id=chat_id,
+            user_text=str(getattr(message, "text", "") or getattr(message, "caption", "") or ""),
+            operations=[{"op": "set_background", "source": "pending_media", "target": target}],
+            files_changed=[],
+            success=False,
+            error=str(e),
+        )
         if downloaded_ok:
             await message.reply_text(f"Фото скачано, но не удалось применить фон: {e}")
         else:
             await message.reply_text(f"Фото не было скачано, поэтому CSS не трогал. ({e})")
+    finally:
+        clear_current_task(chat_id)
+
+
+async def apply_existing_image_background_workflow(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    project_name: str,
+    target: str = "whole_page_background",
+) -> None:
+    """Applies an image ALREADY saved in the project's assets/img as the
+    background -- never downloads from Telegram, never calls Ollama. This is
+    task_orchestrator's media_source="existing_project_image" branch: used
+    when the user explicitly asks for "any image from the folder", or there's
+    no pending photo to fall back on (see tools_site_operations.op_set_background,
+    which always picks a real, already-existing file -- never invents one)."""
+    chat_id = str(message.chat.id) if getattr(message, "chat", None) else ""
+    user_id = str(message.from_user.id) if getattr(message, "from_user", None) else ""
+    tracker = ProgressTracker(message)
+    user_text = str(getattr(message, "text", "") or getattr(message, "caption", "") or "")
+    hero = target == "hero_background"
+    save_current_task(chat_id, "apply_existing_image_background", project_name, "starting")
+    snapshot: dict | None = None
+    try:
+        await tracker.step(f"🖼 Ищу подходящее изображение в assets/img проекта {project_name}...")
+        update_current_task_step(chat_id, "snapshotting")
+        snapshot = snapshot_project(project_name, reason="apply_existing_image_background")
+
+        update_current_task_step(chat_id, "applying_operation")
+        result = op_set_background(project_name, {"target": "hero" if hero else "whole_page"})
+        relative_image = result["image_path"]
+
+        update_current_task_step(chat_id, "verify_assets")
+        status = preview_status(project_name)
+        if not status.get("running"):
+            status = start_preview(project_name)
+        port = int(status.get("port") or 0)
+        if not port:
+            raise ToolError("Не удалось определить порт preview")
+        base_url = f"http://127.0.0.1:{port}"
+        live = await _check_background_live(project_name, base_url, relative_image)
+        if not live["ok"]:
+            raise ToolError(
+                "Не удалось подтвердить фон "
+                f"(картинка HTTP {live['image_status']}, CSS HTTP {live['css_status']}, "
+                f"фон виден в браузере: {live['background_image_loaded']})"
+            )
+
+        save_site_state(project_name, {"background_required": True})
+        _record_media_operation(
+            project_name,
+            chat_id=chat_id,
+            user_text=user_text,
+            operations=[{"op": "set_background", "source": "existing_project_image", "target": target, "image": relative_image}],
+            files_changed=result["files_changed"],
+            success=True,
+            snapshot_id=snapshot["snapshot_id"],
+        )
+
+        await tracker.step("✅ Готово.")
+        headline = "Готово. Изображение из папки проекта применено как фон" + (
+            " hero-блока." if hero else " сайта."
+        )
+        await message.reply_text(
+            "\n".join(
+                [
+                    headline,
+                    f"Проект: {project_name}",
+                    f"Изображение: {relative_image}",
+                    f"Открыть сайт: {preview_url_for_port(port)}",
+                ]
+            )
+        )
+    except Exception as e:
+        save_last_error(chat_id=chat_id, user_id=user_id, handler="apply_existing_image_background_workflow", error=e, user_text=user_text)
+        rolled_back = False
+        if snapshot:
+            try:
+                rollback_project(project_name, snapshot["snapshot_id"])
+                rolled_back = True
+            except ToolError:
+                pass
+        _record_media_operation(
+            project_name,
+            chat_id=chat_id,
+            user_text=user_text,
+            operations=[{"op": "set_background", "source": "existing_project_image", "target": target}],
+            files_changed=[],
+            success=False,
+            snapshot_id=snapshot["snapshot_id"] if snapshot else None,
+            rollback_used=rolled_back,
+            error=str(e),
+        )
+        suffix = " Откатил изменения." if rolled_back else ""
+        await message.reply_text(f"Не завершено: не удалось применить изображение из папки как фон сайта {project_name}: {e}.{suffix}")
     finally:
         clear_current_task(chat_id)
 
@@ -4324,6 +4725,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/tree_project <project> - дерево файлов проекта",
                 "/set_background <project> <image_name> - поставить изображение фоном hero-секции",
                 "/last_media - статус последнего присланного фото",
+                "/media_status - доступна ли pending_media для apply_media_to_site прямо сейчас",
+                "/task_debug - последнее решение task_orchestrator для этого чата (task_type/entity/reason)",
+                "/project_state <project> - технический dump project_state: features, snapshots, history",
                 "/retry_media_background <project> [hero] - повторить применение последнего фото без повторной отправки",
                 "/new_flask <name> - создать Flask-проект в WRITE_ROOT",
                 "/write_file <project>/<file> <content> - записать текстовый файл",
@@ -4442,6 +4846,36 @@ def project_summary_prompt(data: dict) -> list[dict[str, str]]:
             ),
         },
     ]
+
+
+
+
+async def current_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id, _ = chat_user_ids(update)
+    current = memory.get_current_project(chat_id)
+    if current and _workspace_project_exists(current):
+        await update.message.reply_text(f"Текущий workspace-проект: {current}")
+        return
+    projects = ", ".join(item["name"] for item in list_workspace().get("projects", [])) or "-"
+    await update.message.reply_text(f"Текущий workspace-проект не выбран. Доступные: {projects}")
+
+
+async def use_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /use_project <workspace_project>")
+        return
+    project = context.args[0]
+    if not _workspace_project_exists(project):
+        projects = ", ".join(item["name"] for item in list_workspace().get("projects", [])) or "-"
+        await update.message.reply_text(f"Workspace-проект {project} не найден. Доступные: {projects}")
+        return
+    chat_id, _ = chat_user_ids(update)
+    memory.set_current_project(chat_id, project)
+    await update.message.reply_text(f"Текущий workspace-проект: {project}")
 
 
 async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5040,32 +5474,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(ack)
                 return
 
-        available_media = get_latest_available_media(chat_id)
-        if _wants_background_from_latest_photo(user_text, has_pending_media=bool(available_media)):
-            if not available_media:
-                await update.message.reply_text("Я не вижу последнего фото. Пришли фото еще раз.")
-                return
-            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
+        # task_orchestrator is the single, state-driven decision point for
+        # apply_media_to_site vs edit_site vs check_site -- it resolves real
+        # entities (entity_resolver: does a workspace project by this name
+        # actually exist? is there a pending photo right now?) and picks a
+        # task_type from that state, not from several independent
+        # phrase-heuristics racing each other. This is what fixes "на сайт
+        # kiki как фон" (no photo-reference word, only target words) falling
+        # through to edit_workspace_site, and "проверь слайдер в kiki" landing
+        # in git project inspection instead of a site check. See
+        # task_orchestrator.py.
+        decision = task_orchestrator.resolve_task(user_text, chat_id)
+
+        if decision.task_type == "apply_media_to_site":
+            project = decision.workspace_project
             if not project:
-                await update.message.reply_text("На какой сайт добавить фото? Напиши имя проекта, например: hola")
+                await update.message.reply_text("На какой сайт применить фон? Напиши имя проекта, например: hola")
                 return
             target = "hero_background" if _wants_hero_target(user_text) else "whole_page_background"
-            fixed = _wants_fixed_attachment(user_text)
-            await add_background_image_workflow(
-                update.message, context, project_name=project, media=available_media, target=target, fixed=fixed
-            )
+            if decision.media_source == "pending_media":
+                available_media = get_latest_available_media(chat_id)
+                if not available_media:
+                    await update.message.reply_text("Я не вижу последнего фото. Пришли фото еще раз.")
+                    return
+                fixed = _wants_fixed_attachment(user_text)
+                await add_background_image_workflow(
+                    update.message, context, project_name=project, media=available_media, target=target, fixed=fixed
+                )
+            else:
+                await apply_existing_image_background_workflow(
+                    update.message, context, project_name=project, target=target
+                )
             return
 
-        # Status questions ("где фон?", "проверь сайт", "почему сайт сломан?")
-        # must run a deterministic, read-only site_check against the project's
-        # persisted requirements -- never just preview_start, and never a guess
-        # from Ollama about whether a feature is there.
-        if _wants_site_status_check(user_text):
-            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
+        # Status/feature questions about workspace websites must be intercepted
+        # before semantic/git routing. Example: "проверь, есть ли слайдер ...
+        # на сайте kuki" is a workspace-site check, not a git repo check.
+        if decision.task_type == "check_site":
+            project = decision.workspace_project
             if not project:
-                await update.message.reply_text("Какой сайт проверить? Напиши имя проекта, например: hola")
+                await update.message.reply_text("Какой сайт проверить? Напиши имя проекта, например: kuki")
                 return
-            answer, debug = await site_check_workflow(project, chat_id=chat_id)
+            answer, debug = await workspace_site_feature_check_workflow(project, user_text, chat_id=chat_id)
             await reply_long(update.message, answer)
             await maybe_send_intent_debug(update.message, context, debug)
             return
@@ -5278,6 +5728,9 @@ def main():
     app.add_handler(CommandHandler("write_file", write_file_command))
     app.add_handler(CommandHandler("delete_file", delete_file_command))
     app.add_handler(CommandHandler("preview_start", preview_start_command))
+    app.add_handler(CommandHandler("check_site", site_check_command))
+    app.add_handler(CommandHandler("current_project", current_project_command))
+    app.add_handler(CommandHandler("use_project", use_project_command))
     app.add_handler(CommandHandler("preview_stop", preview_stop_command))
     app.add_handler(CommandHandler("preview_stop_port", preview_stop_port_command))
     app.add_handler(CommandHandler("preview_stop_all", preview_stop_all_command))
@@ -5312,6 +5765,9 @@ def main():
     app.add_handler(CommandHandler("site_diff", site_diff_command))
     app.add_handler(CommandHandler("site_requirements", site_requirements_command))
     app.add_handler(CommandHandler("last_media", last_media_command))
+    app.add_handler(CommandHandler("media_status", media_status_command))
+    app.add_handler(CommandHandler("task_debug", task_debug_command))
+    app.add_handler(CommandHandler("project_state", project_state_command))
     app.add_handler(CommandHandler("retry_media_background", retry_media_background_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("remember", remember_command))

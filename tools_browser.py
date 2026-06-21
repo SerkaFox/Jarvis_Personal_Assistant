@@ -260,6 +260,153 @@ def check_site_with_playwright(
             return result
 
 
+async def _snapshot_elements_async(page, selectors: list[str]) -> list[dict[str, Any]] | None:
+    """Class/aria-expanded/open-attribute/display snapshot for every element
+    matching any of `selectors` -- used before/after an interaction click to
+    detect a real DOM change, generically, regardless of component kind.
+    `open` covers native <details>-based accordions, which toggle that
+    attribute instead of a class or aria-expanded."""
+    if not selectors:
+        return None
+    try:
+        return await page.evaluate(
+            """(selector) => {
+                const els = Array.from(document.querySelectorAll(selector));
+                return els.map(el => ({
+                    cls: el.className,
+                    aria: el.getAttribute('aria-expanded'),
+                    open: el.hasAttribute('open'),
+                    display: getComputedStyle(el).display,
+                }));
+            }""",
+            ", ".join(selectors),
+        )
+    except Exception:
+        return None
+
+
+async def _probe_component_async(page, component: dict[str, Any]) -> dict[str, Any]:
+    """Generic container/item/interaction probe for ONE component model
+    (see ui_component_model.py) against an already-loaded page. Works the
+    same way for any kind -- slider, accordion, tabs, hamburger menu, ... --
+    because it only ever follows the selector lists handed to it, never a
+    kind-specific code path."""
+    kind = component.get("kind", "")
+    selectors: list[str] = component.get("selectors") or []
+    item_selectors: list[str] = component.get("item_selectors") or []
+    nav_selectors: list[str] = component.get("nav_selectors") or []
+
+    result: dict[str, Any] = {
+        "kind": kind,
+        "container_found": False,
+        "container_visible": None,
+        "items_found": 0,
+        "nav_found": False,
+        "interactivity_confirmed": None,
+        "dom_changed_after_interaction": None,
+        "errors": [],
+    }
+
+    container_locator = None
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if await locator.count() > 0:
+                container_locator = locator.first
+                result["container_found"] = True
+                break
+        except Exception:
+            continue
+
+    if container_locator is not None:
+        try:
+            result["container_visible"] = await container_locator.is_visible()
+        except Exception:
+            result["container_visible"] = None
+
+    item_count = 0
+    for selector in item_selectors:
+        try:
+            count = await page.locator(selector).count()
+            item_count = max(item_count, count)
+        except Exception:
+            continue
+    result["items_found"] = item_count
+
+    snapshot_selectors = item_selectors or selectors
+    before_snapshot = await _snapshot_elements_async(page, snapshot_selectors)
+
+    nav_locator = None
+    for selector in nav_selectors:
+        try:
+            locator = page.locator(selector)
+            if await locator.count() > 0:
+                nav_locator = locator.first
+                result["nav_found"] = True
+                break
+        except Exception:
+            continue
+
+    if nav_locator is not None:
+        try:
+            await nav_locator.click(timeout=2000)
+            await page.wait_for_timeout(250)
+            after_snapshot = await _snapshot_elements_async(page, snapshot_selectors)
+            if before_snapshot is not None and after_snapshot is not None:
+                changed = before_snapshot != after_snapshot
+                result["dom_changed_after_interaction"] = changed
+                result["interactivity_confirmed"] = changed
+        except Exception as exc:
+            # A control exists but clicking it failed (not visible/actionable,
+            # JS error, ...) -- interactivity is unconfirmed, not necessarily
+            # absent; the missing-control case below already handles "no nav
+            # found" as a separate, explicit "unconfirmed" state.
+            result["errors"].append(f"interaction click failed: {exc}")
+
+    return result
+
+
+async def check_site_components_async(project_name: str, url: str, components: list[dict[str, Any]]) -> dict[str, Any]:
+    """Loads the page ONCE and probes every requested component (see
+    ui_component_model.ComponentModel.to_dict()) in a single Playwright
+    session -- cheap relative to one page load per component. Returns
+    {"results": {kind: probe_dict}, "console_errors", "failed_resources",
+    "skipped"}. Never raises just because Playwright is unavailable."""
+    if not playwright_available():
+        return {"results": {}, "console_errors": [], "failed_resources": [], "skipped": True, "reason": "Playwright не установлен"}
+
+    from playwright.async_api import async_playwright
+
+    _validate_project_name(project_name)
+    console_errors: list[str] = []
+    failed_resources: list[str] = []
+    results: dict[str, Any] = {}
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+                page.on(
+                    "response",
+                    lambda resp: failed_resources.append(f"{resp.status} {resp.url}") if resp.status >= 400 else None,
+                )
+                await page.goto(url, timeout=15000, wait_until="load")
+                for component in components:
+                    results[component["kind"]] = await _probe_component_async(page, component)
+            finally:
+                await browser.close()
+    except Exception as exc:
+        return {
+            "results": results,
+            "console_errors": console_errors,
+            "failed_resources": failed_resources,
+            "skipped": False,
+            "errors": [str(exc)],
+        }
+    return {"results": results, "console_errors": console_errors, "failed_resources": failed_resources, "skipped": False}
+
+
 async def playwright_async_smoke_check() -> dict[str, Any]:
     """Minimal liveness check for /status: can we actually launch a browser and
     load a page right now, via the async API, on this event loop?"""

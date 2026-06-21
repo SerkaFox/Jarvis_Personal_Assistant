@@ -93,6 +93,10 @@ from tools_site_operations import apply_operation_plan, op_set_background, valid
 import project_state_manager
 import learning_log
 import task_orchestrator
+import ui_component_model
+from ui_component_model import build_component_model
+from ui_component_verifier import format_verification_human, verify_component_static, verify_components_async
+from site_technology_detector import detect_technology
 from tools_write import (
     create_flask_site,
     create_project_dir,
@@ -3778,6 +3782,24 @@ async def task_debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(task_orchestrator.format_last_decision(chat_id))
 
 
+async def check_component_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        kinds = ", ".join(ui_component_model.COMPONENT_KINDS)
+        await update.message.reply_text(f"Использование: /check_component <project> <kind>\nДоступные kind: {kinds}")
+        return
+    project, kind_arg = context.args[0], context.args[1]
+    chat_id, _ = chat_user_ids(update)
+    kind = ui_component_model.normalize_kind(kind_arg) or kind_arg
+    try:
+        answer, debug = await verify_ui_component_workflow(project, kind, chat_id=chat_id)
+        await reply_long(update.message, answer)
+        await maybe_send_intent_debug(update.message, context, debug)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка /check_component: {e}")
+
+
 async def project_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fuller technical dump than /site_state: per-feature status table,
     last_successful_snapshot, last_failed_action, operation history count."""
@@ -4021,6 +4043,76 @@ def _workspace_check_feature_report(user_text: str, files: list[dict], browser_r
     if not lines:
         lines.append("Проверил HTML/CSS/JS сайта. Уточни, какую функцию искать: слайдер, языки, фон, footer, weather.")
     return lines
+
+
+async def verify_ui_component_workflow(project_name: str, kind: str, chat_id: str | None = None) -> tuple[str, dict]:
+    """Universal, read-only UI component check (ui_component_model.py /
+    ui_component_verifier.py): works the same way for slider/carousel/
+    accordion/tabs/hamburger_menu/gallery/language_switcher/form/
+    weather_block/footer/hero/background, regardless of the project's
+    server-side stack -- site_technology_detector is purely informational
+    here, the verifier only ever inspects the rendered page. Never writes
+    files, never says "Готово" (it's a check, not an edit)."""
+    tools_called: list[str] = []
+    if not config.env_bool("WRITE_MODE_ENABLED", config.WRITE_MODE_ENABLED):
+        msg = "Write mode выключен. Включи WRITE_MODE_ENABLED=true в .env"
+        return msg, {"detected": {"intent": "verify_ui_component", "project": project_name}, "tools_called": tools_called, "errors": [msg]}
+    try:
+        model = build_component_model(kind)
+        tech = detect_technology(project_name)
+        tools_called.append("detect_technology")
+
+        status = preview_status(project_name)
+        tools_called.append("preview_status")
+        if not status.get("running"):
+            start_preview(project_name)
+            tools_called.append("start_preview")
+            status = preview_status(project_name)
+            tools_called.append("preview_status")
+
+        preview_url = ""
+        if status.get("running") and status.get("port") and playwright_available():
+            preview_url = preview_url_for_port(int(status["port"]))
+            url = f"http://127.0.0.1:{status['port']}/"
+            results = await verify_components_async(project_name, url, [model])
+            tools_called.append("verify_components_async")
+            result = results[model.kind]
+        else:
+            files = read_workspace_project_files(project_name)["files"]
+            tools_called.append("read_workspace_project_files")
+            result = verify_component_static(files, model)
+            tools_called.append("verify_component_static")
+
+        project_state_manager.update_feature_from_verification(
+            project_name, model.kind, result, selectors=model.selectors, related_files=model.related_files
+        )
+        tools_called.append("update_feature_from_verification")
+
+        if chat_id:
+            memory.set_current_project(chat_id, project_name)
+
+        lines = [f"Проверка компонента «{model.kind}» на сайте {project_name}:", format_verification_human(result)]
+        lines.append(f"Технология: {tech['technology']}")
+        if result.get("items_expected"):
+            lines.append(f"Элементов: {result['items_found']} (ожидалось минимум {result['items_expected']})")
+        else:
+            lines.append(f"Элементов: {result['items_found']}")
+        if preview_url:
+            lines.append(f"Открыть сайт: {preview_url}")
+        answer = "\n".join(lines)
+
+        return answer, {
+            "detected": {"intent": "verify_ui_component", "project": project_name, "kind": model.kind},
+            "tools_called": tools_called,
+            "errors": [] if result["status"] != "missing" else [result["detail"]],
+            "result": result,
+        }
+    except Exception as e:
+        save_last_error(chat_id=chat_id or "", user_id="", handler="verify_ui_component_workflow", error=e, user_text=kind)
+        return (
+            f"Не смог проверить компонент {kind} на сайте {project_name}: {e}",
+            {"detected": {"intent": "verify_ui_component", "project": project_name}, "tools_called": tools_called, "errors": [str(e)]},
+        )
 
 
 async def workspace_site_feature_check_workflow(project_name: str, user_text: str, chat_id: str | None = None) -> tuple[str, dict]:
@@ -4727,6 +4819,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/last_media - статус последнего присланного фото",
                 "/media_status - доступна ли pending_media для apply_media_to_site прямо сейчас",
                 "/task_debug - последнее решение task_orchestrator для этого чата (task_type/entity/reason)",
+                "/check_component <project> <kind> - универсальная проверка UI-компонента (slider/accordion/tabs/...)",
                 "/project_state <project> - технический dump project_state: features, snapshots, history",
                 "/retry_media_background <project> [hero] - повторить применение последнего фото без повторной отправки",
                 "/new_flask <name> - создать Flask-проект в WRITE_ROOT",
@@ -5515,7 +5608,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not project:
                 await update.message.reply_text("Какой сайт проверить? Напиши имя проекта, например: kuki")
                 return
-            answer, debug = await workspace_site_feature_check_workflow(project, user_text, chat_id=chat_id)
+            if decision.component_kind:
+                # "проверь слайдер/карусель/меню/гармонь/форму/языки/фон" names
+                # a specific UI component -- verify_ui_component_workflow runs
+                # the universal, model-driven DOM check (ui_component_model.py/
+                # ui_component_verifier.py), never git tools, never normal chat.
+                answer, debug = await verify_ui_component_workflow(project, decision.component_kind, chat_id=chat_id)
+            else:
+                answer, debug = await workspace_site_feature_check_workflow(project, user_text, chat_id=chat_id)
             await reply_long(update.message, answer)
             await maybe_send_intent_debug(update.message, context, debug)
             return
@@ -5767,6 +5867,7 @@ def main():
     app.add_handler(CommandHandler("last_media", last_media_command))
     app.add_handler(CommandHandler("media_status", media_status_command))
     app.add_handler(CommandHandler("task_debug", task_debug_command))
+    app.add_handler(CommandHandler("check_component", check_component_command))
     app.add_handler(CommandHandler("project_state", project_state_command))
     app.add_handler(CommandHandler("retry_media_background", retry_media_background_command))
     app.add_handler(CommandHandler("memory", memory_command))

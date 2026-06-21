@@ -25,6 +25,7 @@ from typing import Any
 import config
 import entity_resolver
 import memory
+import ui_component_model
 
 TASK_TYPES = {
     "apply_media_to_site",
@@ -136,6 +137,7 @@ class TaskDecision:
     workspace_project: str | None = None
     git_repo: str | None = None
     media_source: str | None = None  # "pending_media" | "existing_project_image" | None
+    component_kind: str | None = None  # set when check_site names a specific UI component (see ui_component_model)
     reason: str = ""
     confidence: float = 1.0
     entities: dict[str, Any] = field(default_factory=dict)
@@ -194,11 +196,21 @@ def resolve_task(user_text: str, chat_id: str | None = None) -> TaskDecision:
 
     # 3) check_site -- requires a resolvable workspace project, otherwise this
     #    isn't a site check at all (could be a git/code question instead).
+    # "проверь слайдер/карусель/меню/гармонь/форму/языки/фон" names a specific
+    # UI component (ui_component_model.normalize_kind) -- this routes to
+    # verify_ui_component (a real DOM/Playwright probe), not git tools and not
+    # normal chat, regardless of which component it is or how it's built.
     if _mentions_check(user_text) and workspace_project:
+        component_kind = ui_component_model.normalize_kind(user_text)
         decision = TaskDecision(
             task_type="check_site",
             workspace_project=workspace_project,
-            reason="check phrase + resolvable workspace project",
+            component_kind=component_kind,
+            reason=(
+                f"check phrase + component kind={component_kind} + resolvable workspace project"
+                if component_kind
+                else "check phrase + resolvable workspace project"
+            ),
             entities=entities,
         )
         _save_last_decision(chat_id, decision)

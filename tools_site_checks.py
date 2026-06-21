@@ -13,6 +13,8 @@ from typing import Any
 from tools_edit import read_workspace_project_files
 from tools_site_state import LANGUAGE_CODES
 from tools_write import _validate_project_name, resolve_write_path
+from ui_component_model import build_component_model
+from ui_component_verifier import verify_component_static
 
 LOCAL_REF_RE = re.compile(r'(?:src|href)=["\']([^"\']+)["\']')
 SKIP_REF_PREFIXES = ("http://", "https://", "data:", "mailto:", "tel:", "#", "javascript:")
@@ -71,7 +73,6 @@ def run_acceptance_checks(
     html_text = "\n".join(f["content"] for f in files if f["path"].lower().endswith(".html"))
     css_text = "\n".join(f["content"] for f in files if f["path"].lower().endswith(".css"))
     js_text = "\n".join(f["content"] for f in files if f["path"].lower().endswith(".js"))
-    full_text_lower = (html_text + "\n" + css_text + "\n" + js_text).lower()
 
     checks: dict[str, dict[str, Any]] = {}
     failed: list[str] = []
@@ -151,12 +152,12 @@ def run_acceptance_checks(
             record_skipped("single_language_visible", "требует браузерной проверки")
 
     if requirements.get("slider_required"):
-        ok = any(marker in full_text_lower for marker in ("slider", "carousel", "swiper", "data-slide"))
-        record("slider_present", ok, "ok" if ok else "не найден slider/carousel в HTML/CSS/JS")
+        slider_result = verify_component_static(files, build_component_model("slider"))
+        record("slider_present", slider_result["status"] != "missing", slider_result["detail"])
 
     if requirements.get("footer_required"):
-        ok = "<footer" in full_text_lower or 'class="footer' in full_text_lower or "class='footer" in full_text_lower
-        record("footer_present", ok, "ok" if ok else "не найден <footer>")
+        footer_result = verify_component_static(files, build_component_model("footer"))
+        record("footer_present", footer_result["status"] != "missing", footer_result["detail"])
 
     if requirements.get("weather_required"):
         ok = "fetch" in js_text.lower() and ("weather" in js_text.lower() or "open-meteo" in js_text.lower())

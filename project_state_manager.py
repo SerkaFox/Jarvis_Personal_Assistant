@@ -17,7 +17,23 @@ import tools_site_state as site_state
 from tools_edit import read_workspace_project_files
 from tools_write import _validate_project_name
 
-FEATURE_NAMES = ("background", "language_switcher", "slider", "weather", "footer", "media_assets", "sections")
+FEATURE_NAMES = (
+    "background",
+    "language_switcher",
+    "slider",
+    "weather",
+    "footer",
+    "media_assets",
+    "sections",
+    # ui_component_model.COMPONENT_KINDS not already covered above -- features
+    # discovered/verified via verify_ui_component_workflow get a slot here too.
+    "accordion",
+    "tabs",
+    "hamburger_menu",
+    "gallery",
+    "form",
+    "hero",
+)
 MAX_HISTORY_ENTRIES = 50
 
 DEFAULT_FEATURE_ENTRY: dict[str, Any] = {
@@ -109,6 +125,28 @@ def update_feature_status(
     raw["features"] = features
     _write_raw(project, raw)
     return entry
+
+
+def update_feature_from_verification(
+    project_name: str,
+    kind: str,
+    verification_result: dict[str, Any],
+    *,
+    selectors: list[str] | None = None,
+    related_files: list[str] | None = None,
+) -> dict[str, Any]:
+    """Stores a ui_component_verifier.py result (see verify_component_static/
+    verify_components_async) against project_state's feature table, so
+    /project_state and /site_history show real component verification
+    history (container/items/interactivity), not just a boolean."""
+    return update_feature_status(
+        project_name,
+        kind,
+        status=verification_result.get("status", "unknown"),
+        selectors=selectors,
+        related_files=related_files,
+        verification_result=verification_result,
+    )
 
 
 def _features_from_inspection(inspected: dict[str, Any]) -> dict[str, str]:

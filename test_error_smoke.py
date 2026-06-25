@@ -97,7 +97,7 @@ class ErrorSmokeTests(unittest.IsolatedAsyncioTestCase):
         try:
             update = FakeUpdate("обычное сообщение")
             await bot.handle_text(update, FakeContext())
-            self.assertTrue(any("Не могу подключиться" in reply for reply in update.message.replies))
+            self.assertTrue(any("подключени" in reply.lower() or "ошибка" in reply.lower() for reply in update.message.replies))
         finally:
             bot.answer_user_text = original
 

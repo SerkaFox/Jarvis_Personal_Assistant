@@ -175,7 +175,7 @@ def get_system_prompt() -> str:
         "Ты работаешь через Telegram-бота. "
         f"Текущая дата и время в Испании: {current_time}. "
         "Если пользователь спрашивает дату, день недели или время — используй эту дату, а не свои старые знания. "
-        "Помогай с Linux, Django, Python, сервером, Telegram-ботами, Ollama, Codex и администрированием. "
+        "Помогай с Linux, Django, Python, сервером, Telegram-ботами, API и администрированием. "
         "У тебя есть локальная память SQLite: используй историю диалога, memories и project_notes, когда они добавлены в контекст. "
         "Не говори, что у тебя нет доступа, если доступны read-only tools. "
         "Если tools доступны, никогда не говори 'у меня нет доступа к файловой системе'. "
@@ -187,8 +187,7 @@ def get_system_prompt() -> str:
         "Не выдумывай команды вроде ls -la, если реально использовался tree_summary/project_structure/safe_code_check. "
         "Не говори 'создал', 'записал', 'удалил', 'остановил' или 'запустил', если write/preview tool не вернул успешный результат с подтвержденной проверкой (process/port/curl/exists). "
         "После write/preview действия всегда показывай tools_called, actual_path и созданные/измененные/удаленные файлы или preview_url. "
-        "Для опасных действий, таких как удаление файлов, миграции, рестарт сервисов, deploy, git push или изменения nginx/systemd, требуй явное подтверждение. "
-        "Не говори, что ты облачный сервис. Ты локальный Jarvis, подключенный к Ollama."
+        "Для опасных действий, таких как удаление файлов, миграции, рестарт сервисов, deploy, git push или изменения nginx/systemd, требуй явное подтверждение."
     )
 
 
@@ -221,15 +220,8 @@ def ask_ollama(user_text: str, chat_id: str | None = None) -> str:
 
 
 def ask_ollama_messages(messages: list[dict[str, str]]) -> str:
-    payload = {
-        "model": MODEL,
-        "stream": False,
-        "messages": messages,
-    }
-
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=180)
-    r.raise_for_status()
-    return r.json()["message"]["content"]
+    from tools_claude import ask_claude_messages
+    return ask_claude_messages(messages)
 
 
 def memory_status_answer(user_text: str) -> str | None:
@@ -5390,10 +5382,13 @@ async def maybe_send_intent_debug(message, context: ContextTypes.DEFAULT_TYPE, d
 
 def _check_ollama() -> str:
     try:
-        response = requests.get(f"{OLLAMA_URL}/api/version", timeout=5)
-        response.raise_for_status()
-        version = response.json().get("version", "unknown")
-        return f"ok ({version})"
+        import anthropic
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return "error (ANTHROPIC_API_KEY не задан)"
+        client = anthropic.Anthropic(api_key=api_key)
+        client.models.list(limit=1)
+        return f"ok (Claude, model={os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-6')})"
     except Exception as e:
         return f"error ({e})"
 
@@ -5460,9 +5455,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 "Jarvis status:",
                 "Polling ok: yes",
-                f"Ollama: {_check_ollama()}",
-                f"Ollama URL: {OLLAMA_URL}",
-                f"Ollama model: {MODEL}",
+                f"Claude API: {_check_ollama()}",
                 f"STT: {_check_stt()}",
                 f"STT URL: {STT_URL}",
                 f"TTS: {_check_tts()}",
@@ -5676,17 +5669,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     debug_info = intercepted_debug
         except requests.exceptions.ConnectionError as e:
             save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
-            answer = (
-                "Не могу подключиться к Ollama на AI-ПК.\n\n"
-                f"Проверь с сервера:\n"
-                f"curl {OLLAMA_URL}/api/version\n\n"
-                "Возможные причины: Windows-ПК выключен/уснул, сменился IP, "
-                "Ollama не запущена или firewall блокирует порт 11434."
-            )
+            answer = "Ошибка подключения к внешнему сервису. Детали: " + str(e)
             debug_info = {"detected": {"intent": "connection_error"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
         except requests.exceptions.Timeout as e:
             save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
-            answer = "Ollama не ответила вовремя. Возможно, модель грузится или AI-ПК занят."
+            answer = "Сервис не ответил вовремя. Попробуй ещё раз."
             debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
 
         if tracker:
@@ -5782,14 +5769,13 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     except requests.exceptions.ConnectionError as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_voice_or_audio", error=e, user_text=recognized_text)
         await message.reply_text(
-            "Ошибка STT/Ollama: не могу подключиться к локальному сервису.\n\n"
-            f"STT: {STT_URL}\n"
-            f"Ollama: {OLLAMA_URL}\n\n"
+            "Ошибка STT: не могу подключиться к локальному сервису.\n\n"
+            f"STT: {STT_URL}\n\n"
             f"Детали: {e}"
         )
     except requests.exceptions.Timeout as e:
         save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_voice_or_audio", error=e, user_text=recognized_text)
-        await message.reply_text("STT/Ollama не ответили вовремя.")
+        await message.reply_text("STT не ответил вовремя.")
     except Exception as e:
         await _report_handler_error(update=update, handler="handle_voice_or_audio", error=e, user_text=recognized_text)
 

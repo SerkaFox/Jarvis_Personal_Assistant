@@ -15,7 +15,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "8192"))
+_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "16384"))
 
 _client = None
 
@@ -49,9 +49,10 @@ def ask_claude_messages(messages: list[dict[str, str]]) -> str:
 
     system_text = "\n\n".join(system_parts) if system_parts else None
 
+    max_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", "16384"))
     kwargs: dict[str, Any] = {
-        "model": _CLAUDE_MODEL,
-        "max_tokens": _MAX_TOKENS,
+        "model": os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"),
+        "max_tokens": max_tokens,
         "messages": turns,
     }
     if system_text:

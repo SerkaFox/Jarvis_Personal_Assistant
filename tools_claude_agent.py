@@ -251,8 +251,9 @@ def _make_dispatcher(chat_id: str | None) -> Callable[[str, dict], Any]:
             return {**result, "ok": True}
 
         elif name == "delete_project":
-            from tools_write import delete_workspace_dir
-            return delete_workspace_dir(args["project_name"], confirm_token="CONFIRMED")
+            from tools_write import delete_workspace_dir, _validate_project_name
+            project = _validate_project_name(args["project_name"])
+            return delete_workspace_dir(project, confirm_token=f"DELETE:{project}")
 
         elif name == "start_preview":
             from tools_preview import start_preview, detect_lan_ip

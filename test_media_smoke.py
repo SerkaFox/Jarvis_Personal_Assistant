@@ -157,103 +157,41 @@ class MediaSmokeTests(unittest.IsolatedAsyncioTestCase):
         conn.close()
         self.assertEqual(row[0], "failed")
 
-    async def test_text_after_pending_photo_routes_to_background_workflow(self):
-        from tools_pending_media import save_pending_media
-        from tools_write import create_static_site
+    async def test_handle_text_calls_agent_with_user_text(self):
+        """handle_text must pass the user text to run_claude_agent."""
         import bot
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        create_static_site("hola")
-        save_pending_media("456", "123", "file_1", file_unique_id="u1", mime_type="image/jpeg", size_bytes=100)
+        received = {}
 
-        called = {}
+        async def fake_agent(text, chat_id, **kwargs):
+            received["text"] = text
+            return "ok"
 
-        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
-            called["project"] = project_name
-            called["media_id"] = media["id"]
-            called["target"] = target
-            await message.reply_text("ok")
-
-        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow):
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
             update = FakeUpdate("добавь это фото на фон сайта hola")
             await bot.handle_text(update, FakeContext())
-        self.assertEqual(called["project"], "hola")
-        self.assertTrue(any("ok" in reply for reply in update.message.replies))
 
-    async def test_background_request_without_pending_photo_prompts_for_project(self):
-        # No pending photo, no project mentioned that actually exists --
-        # task_orchestrator can't resolve a workspace_project, so it must ask
-        # which site, not guess.
-        import bot
-        from test_error_smoke import FakeContext, FakeUpdate
+        self.assertEqual(received.get("text"), "добавь это фото на фон сайта hola")
+        self.assertIn("ok", update.message.replies)
 
-        update = FakeUpdate("помести на фон сайта doesnotexist")
-        await bot.handle_text(update, FakeContext())
-        self.assertTrue(any("на какой сайт" in reply.lower() for reply in update.message.replies))
-
-    async def test_background_request_without_pending_photo_falls_back_to_existing_image_source(self):
-        # No pending photo but a real project -- task_orchestrator picks
-        # media_source=existing_project_image (spec item 5). No image saved
-        # yet, so it must fail honestly, never claim "Готово".
-        import bot
-        from tools_write import create_static_site
-        from test_error_smoke import FakeContext, FakeUpdate
-
-        create_static_site("hola")
-        update = FakeUpdate("помести на фон сайта hola")
-        await bot.handle_text(update, FakeContext())
-        self.assertTrue(any("не завершено" in reply.lower() for reply in update.message.replies))
-        self.assertFalse(any("готово" in reply.lower() for reply in update.message.replies))
-
-    async def test_hero_phrase_with_pending_photo_routes_to_media_workflow_not_edit(self):
+    async def test_get_pending_media_tool_returns_available_photo(self):
+        """Agent dispatcher get_pending_media must return latest available photo."""
         from tools_pending_media import save_pending_media
-        import bot
-        import memory
-        from test_error_smoke import FakeContext, FakeUpdate
+        import tools_claude_agent
 
-        save_pending_media("456", "123", "file_hero1", file_unique_id="uh1", mime_type="image/jpeg", size_bytes=100)
-        memory.set_current_project("456", "hola")
+        save_pending_media("456", "123", "file_1", file_unique_id="u1", mime_type="image/jpeg", size_bytes=100)
+        dispatch = tools_claude_agent._make_dispatcher("456")
+        result = dispatch("get_pending_media", {})
+        self.assertTrue(result.get("available"))
+        self.assertIn("file_path", result)
 
-        called = {}
-
-        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
-            called["project"] = project_name
-            called["target"] = target
-            await message.reply_text("ok")
-
-        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow), \
-             patch.object(bot, "edit_workspace_site_workflow") as edit_mock:
-            update = FakeUpdate("вот фото, поставь его фоном на блок херо на сайте")
-            await bot.handle_text(update, FakeContext())
-
-        self.assertEqual(called.get("project"), "hola")
-        self.assertEqual(called.get("target"), "hero_background")
-        edit_mock.assert_not_called()
-
-    async def test_hero_phrase_with_explicit_project_extracts_project_and_hero_target(self):
-        from tools_pending_media import save_pending_media
-        from tools_write import create_static_site
-        import bot
-        from test_error_smoke import FakeContext, FakeUpdate
-
-        create_static_site("hola")
-        save_pending_media("456", "123", "file_hero2", file_unique_id="uh2", mime_type="image/jpeg", size_bytes=100)
-
-        called = {}
-
-        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
-            called["project"] = project_name
-            called["target"] = target
-            await message.reply_text("ok")
-
-        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow), \
-             patch.object(bot, "edit_workspace_site_workflow") as edit_mock:
-            update = FakeUpdate("поставь фото фоном на hero сайта hola")
-            await bot.handle_text(update, FakeContext())
-
-        self.assertEqual(called.get("project"), "hola")
-        self.assertEqual(called.get("target"), "hero_background")
-        edit_mock.assert_not_called()
+    async def test_get_pending_media_tool_returns_unavailable_when_empty(self):
+        import tools_claude_agent
+        dispatch = tools_claude_agent._make_dispatcher("999_no_photo")
+        result = dispatch("get_pending_media", {})
+        self.assertFalse(result.get("available"))
 
     def test_failed_media_can_be_retried_via_get_latest_available_media(self):
         from tools_pending_media import (

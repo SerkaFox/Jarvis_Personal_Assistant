@@ -168,37 +168,27 @@ class WorkspaceInspectorRoutingTests(unittest.IsolatedAsyncioTestCase):
         config.JARVIS_DB_PATH = self.old_config_db_path
         self.tmp.cleanup()
 
-    async def test_file_listing_question_routes_through_plugin_not_normal_chat(self):
+    async def test_handle_text_calls_agent_for_any_text(self):
+        """handle_text must reach run_claude_agent for all text messages."""
         from unittest.mock import patch
         import bot
+        import tools_claude_agent
         import memory
         from test_error_smoke import FakeContext, FakeUpdate
 
         memory.set_current_project("456", "hola")
+        reached = {"n": 0}
 
-        with patch.object(bot, "answer_user_text") as mock_answer:
-            update = FakeUpdate("какие фото для фона у тебя есть?")
-            await bot.handle_text(update, FakeContext())
+        async def fake_agent(text, chat_id, **kwargs):
+            reached["n"] += 1
+            return "agent reply"
 
-        mock_answer.assert_not_called()
-        replies = update.message.replies
-        self.assertTrue(any("background-1781991661.webp" in r for r in replies))
-        for invented in ("bg_ru.jpg", "bg_en.jpg", "bg_es.jpg", "default_bg.jpg"):
-            self.assertFalse(any(invented in r for r in replies))
+        for msg in ["какие фото для фона у тебя есть?", "привет, как у тебя дела?"]:
+            with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
+                update = FakeUpdate(msg)
+                await bot.handle_text(update, FakeContext())
 
-    async def test_normal_chat_text_is_not_intercepted_by_plugin(self):
-        from unittest.mock import patch
-        import bot
-        from test_error_smoke import FakeContext, FakeUpdate
-
-        def fake_answer_user_text(*args, **kwargs):
-            return "обычный ответ", {"detected": {"intent": "normal_chat"}, "tools_called": [], "errors": []}
-
-        with patch.object(bot, "answer_user_text", side_effect=fake_answer_user_text) as mock_answer:
-            update = FakeUpdate("привет, как у тебя дела?")
-            await bot.handle_text(update, FakeContext())
-
-        mock_answer.assert_called_once()
+        self.assertEqual(reached["n"], 2)
 
 
 if __name__ == "__main__":

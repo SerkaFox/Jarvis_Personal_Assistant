@@ -136,70 +136,48 @@ class FileListingRoutingTests(unittest.IsolatedAsyncioTestCase):
         config.JARVIS_DB_PATH = self.old_config_db_path
         self.tmp.cleanup()
 
-    async def test_image_question_with_current_project_routes_to_image_listing(self):
+    async def test_agent_tool_read_project_files_returns_project_files(self):
+        """read_project_files tool must return real project files."""
+        import tools_claude_agent
+
+        dispatch = tools_claude_agent._make_dispatcher("456")
+        result = dispatch("read_project_files", {"project_name": "hola"})
+        files = [f["path"] for f in result.get("files", [])]
+        self.assertTrue(any("index.html" in f for f in files))
+
+    async def test_agent_tool_list_workspace_shows_hola_project(self):
+        """list_workspace tool must include the hola project."""
+        import tools_claude_agent
+
+        dispatch = tools_claude_agent._make_dispatcher(None)
+        result = dispatch("list_workspace", {})
+        names = [p["name"] for p in result.get("projects", [])]
+        self.assertIn("hola", names)
+
+    async def test_handle_text_always_calls_agent(self):
+        """All text messages must reach run_claude_agent — no bypasses."""
         import bot
+        import tools_claude_agent
         import memory
         from test_error_smoke import FakeContext, FakeUpdate
 
         memory.set_current_project("456", "hola")
+        called = {"n": 0}
 
-        with patch.object(bot, "answer_user_text") as mock_answer, patch.object(
-            bot, "semantic_router_answer"
-        ) as mock_router:
-            update = FakeUpdate("какие фото для фона у тебя есть?")
-            await bot.handle_text(update, FakeContext())
+        async def fake_agent(text, chat_id, **kwargs):
+            called["n"] += 1
+            return "ok"
 
-        mock_answer.assert_not_called()
-        mock_router.assert_not_called()
-        replies = update.message.replies
-        self.assertTrue(any("background-1781991661.webp" in r for r in replies))
-        self.assertTrue(any("hola" in r for r in replies))
-        for invented in ("bg_ru.jpg", "bg_en.jpg", "bg_es.jpg", "default_bg.jpg"):
-            self.assertFalse(any(invented in r for r in replies))
+        for msg in [
+            "какие фото для фона у тебя есть?",
+            "найди файлы в папке сайта hola",
+            "какие файлы у тебя есть?",
+        ]:
+            with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
+                update = FakeUpdate(msg)
+                await bot.handle_text(update, FakeContext())
 
-    async def test_file_question_mentioning_project_routes_to_file_listing(self):
-        import bot
-        from test_error_smoke import FakeContext, FakeUpdate
-
-        with patch.object(bot, "answer_user_text") as mock_answer:
-            update = FakeUpdate("найди файлы в папке сайта hola")
-            await bot.handle_text(update, FakeContext())
-
-        mock_answer.assert_not_called()
-        replies = update.message.replies
-        self.assertTrue(any("index.html" in r for r in replies))
-        self.assertTrue(any("style.css" in r for r in replies))
-
-    async def test_empty_image_dir_says_not_found_honestly(self):
-        import bot
-        import memory
-        from test_error_smoke import FakeContext, FakeUpdate
-
-        memory.set_current_project("456", "hola")
-        img_dir = Path(self.tmp.name) / "hola" / "assets" / "img"
-        for item in img_dir.glob("*"):
-            item.unlink()
-
-        update = FakeUpdate("какие изображения у тебя есть?")
-        await bot.handle_text(update, FakeContext())
-
-        replies = update.message.replies
-        self.assertTrue(any("изображений не найдено" in r.lower() for r in replies))
-
-    async def test_normal_question_without_project_does_not_trigger_listing(self):
-        import bot
-        from test_error_smoke import FakeContext, FakeUpdate
-
-        def fake_answer_user_text(*args, **kwargs):
-            return "обычный ответ", {"detected": {"intent": "normal_chat"}, "tools_called": [], "errors": []}
-
-        with patch.object(bot, "answer_user_text", side_effect=fake_answer_user_text) as mock_answer:
-            update = FakeUpdate("какие файлы у тебя есть?")
-            await bot.handle_text(update, FakeContext())
-
-        # No project resolvable from text/current_project/last_action -> falls
-        # through to the normal router instead of guessing a project.
-        mock_answer.assert_called_once()
+        self.assertEqual(called["n"], 3)
 
 
 if __name__ == "__main__":

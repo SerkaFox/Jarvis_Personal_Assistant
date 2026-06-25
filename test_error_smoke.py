@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 os.environ.setdefault("ALLOWED_USER_ID", "123")
@@ -87,35 +88,30 @@ class ErrorSmokeTests(unittest.IsolatedAsyncioTestCase):
         latest = latest_error()
         self.assertNotIn("ABCdef_123", latest["traceback"])
 
-    async def test_handle_text_connection_error_keeps_debug_info_initialized(self):
-        original = bot.answer_user_text
+    async def test_handle_text_error_is_caught_and_reported(self):
+        import bot
+        import tools_claude_agent
 
-        def raise_connection(*args, **kwargs):
-            raise bot.requests.exceptions.ConnectionError("offline")
+        async def raise_error(*args, **kwargs):
+            raise RuntimeError("simulated agent error")
 
-        bot.answer_user_text = raise_connection
-        try:
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=raise_error):
             update = FakeUpdate("обычное сообщение")
             await bot.handle_text(update, FakeContext())
-            self.assertTrue(any("подключени" in reply.lower() or "ошибка" in reply.lower() for reply in update.message.replies))
-        finally:
-            bot.answer_user_text = original
+        # _report_handler_error sends an error message to the user
+        self.assertTrue(len(update.message.replies) > 0)
 
-    async def test_create_project_intent_sends_progress_before_answer(self):
-        original = bot.answer_user_text
+    async def test_handle_text_calls_agent_and_returns_its_answer(self):
+        import bot
+        import tools_claude_agent
 
-        def fake_answer(*args, **kwargs):
-            return "done", {"detected": {"intent": "create_workspace_project"}, "tools_called": ["fake"], "errors": []}
+        async def fake_agent(text, chat_id, **kwargs):
+            return "ответ агента"
 
-        bot.answer_user_text = fake_answer
-        try:
-            update = FakeUpdate("создай сайт в папке Demo")
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
+            update = FakeUpdate("создай сайт Demo")
             await bot.handle_text(update, FakeContext())
-            self.assertIn("⏳ Принял задачу...", update.message.replies[0])
-            self.assertTrue(any("Генерирую сайт" in reply for reply in update.message.replies))
-            self.assertEqual(update.message.replies[-1], "done")
-        finally:
-            bot.answer_user_text = original
+        self.assertIn("ответ агента", update.message.replies)
 
 
 if __name__ == "__main__":

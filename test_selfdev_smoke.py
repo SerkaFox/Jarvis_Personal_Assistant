@@ -364,40 +364,37 @@ class SelfdevRunCommandTests(IsolatedDataDirMixin, unittest.IsolatedAsyncioTestC
 
 
 class RoutingFallbackTests(IsolatedDataDirMixin, unittest.IsolatedAsyncioTestCase):
-    async def test_unknown_intent_with_action_like_text_triggers_selfdev_proposal(self):
+    async def test_handle_text_reaches_agent_for_action_text(self):
+        """Action-like text must reach run_claude_agent."""
         import bot
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        def fake_answer_user_text(*args, **kwargs):
-            return "Не понял запрос", {"detected": {"intent": "normal_chat"}, "tools_called": [], "errors": []}
+        reached = {"called": False}
 
-        spec = _valid_spec("autoplug")
+        async def fake_agent(text, chat_id, **kwargs):
+            reached["called"] = True
+            return "Сделал."
 
-        with patch.object(bot, "answer_user_text", side_effect=fake_answer_user_text), \
-             patch.object(bot.plugin_manager, "select_plugin", return_value=None), \
-             patch.object(bot.self_improvement, "propose_plugin", return_value=spec), \
-             patch.object(bot.self_improvement, "write_plugin_to_sandbox", return_value={}), \
-             patch.object(bot.self_improvement, "new_job_id", return_value="job-routing-1"):
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
             update = FakeUpdate("создай мне функцию, которой раньше никогда не было")
             await bot.handle_text(update, FakeContext())
 
-        replies = update.message.replies
-        self.assertTrue(any("Я пока не умею это делать сам" in r for r in replies))
-        self.assertTrue(any("job-routing-1" in r for r in replies))
+        self.assertTrue(reached["called"])
 
-    async def test_normal_small_talk_is_not_intercepted_by_selfdev(self):
+    async def test_handle_text_reaches_agent_for_small_talk(self):
+        """Even small talk must go through run_claude_agent."""
         import bot
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        def fake_answer_user_text(*args, **kwargs):
-            return "Привет! Как дела?", {"detected": {"intent": "normal_chat"}, "tools_called": [], "errors": []}
+        async def fake_agent(text, chat_id, **kwargs):
+            return "Привет! Как дела?"
 
-        with patch.object(bot, "answer_user_text", side_effect=fake_answer_user_text), \
-             patch.object(bot.self_improvement, "propose_plugin") as mock_propose:
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
             update = FakeUpdate("привет, как дела?")
             await bot.handle_text(update, FakeContext())
 
-        mock_propose.assert_not_called()
         self.assertTrue(any("Привет! Как дела?" in r for r in update.message.replies))
 
 

@@ -153,84 +153,73 @@ class TaskOrchestratorHandleTextIntegrationTests(unittest.IsolatedAsyncioTestCas
         config.JARVIS_DB_PATH = self.old_config_db_path
         self.tmp.cleanup()
 
-    async def test_kiki_phrase_with_pending_media_routes_to_apply_media_not_edit_site(self):
+    async def test_handle_text_passes_message_to_agent(self):
+        """handle_text must call run_claude_agent with the user text."""
         import bot
-        from tools_write import create_static_site
-        from tools_pending_media import save_pending_media
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        create_static_site("kiki")
-        save_pending_media("456", "123", "file_1", file_unique_id="u1", mime_type="image/jpeg", size_bytes=100)
+        received = {}
 
-        called = {}
+        async def fake_agent(text, chat_id, **kwargs):
+            received["text"] = text
+            return "agent answer"
 
-        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
-            called["project"] = project_name
-            await message.reply_text("ok")
-
-        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow), patch.object(
-            bot, "edit_workspace_site_workflow"
-        ) as edit_mock:
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
             update = FakeUpdate("на сайт kiki как фон")
             await bot.handle_text(update, FakeContext())
 
-        self.assertEqual(called.get("project"), "kiki")
-        edit_mock.assert_not_called()
+        self.assertEqual(received.get("text"), "на сайт kiki как фон")
+        self.assertIn("agent answer", update.message.replies)
 
-    async def test_vot_foto_phrase_with_pending_media_does_not_call_edit_site(self):
+    async def test_vot_foto_phrase_reaches_agent(self):
+        """Any text message must reach run_claude_agent — no early routing exit."""
         import bot
-        from tools_write import create_static_site
-        from tools_pending_media import save_pending_media
-        import memory
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        create_static_site("kiki")
-        memory.set_current_project("456", "kiki")
-        save_pending_media("456", "123", "file_2", file_unique_id="u2", mime_type="image/jpeg", size_bytes=100)
+        reached = {"called": False}
 
-        async def fake_workflow(message, context, *, project_name, media, target="whole_page_background", fixed=False):
-            await message.reply_text("ok")
+        async def fake_agent(text, chat_id, **kwargs):
+            reached["called"] = True
+            return "ok"
 
-        with patch.object(bot, "add_background_image_workflow", side_effect=fake_workflow), patch.object(
-            bot, "edit_workspace_site_workflow"
-        ) as edit_mock:
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
             update = FakeUpdate("вот фото, поставь на фон")
             await bot.handle_text(update, FakeContext())
 
-        edit_mock.assert_not_called()
+        self.assertTrue(reached["called"])
 
-    async def test_check_slider_in_kiki_routes_to_check_site_not_git_tools(self):
+    async def test_check_slider_phrase_reaches_agent_not_git(self):
+        """'проверь слайдер' must not call git tools directly."""
         import bot
-        from tools_write import create_static_site
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        create_static_site("kiki")
+        async def fake_agent(text, chat_id, **kwargs):
+            return "slider status"
 
-        with patch.object(bot, "find_git_repos") as git_mock, patch.object(
-            bot, "edit_workspace_site_workflow"
-        ) as edit_mock:
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent), \
+             patch.object(bot, "find_git_repos") as git_mock:
             update = FakeUpdate("проверь слайдер в kiki")
             await bot.handle_text(update, FakeContext())
 
         git_mock.assert_not_called()
-        edit_mock.assert_not_called()
-        replies = update.message.replies
-        self.assertTrue(any("kiki" in r.lower() for r in replies))
 
-    async def test_failed_verification_never_returns_gotovo(self):
+    async def test_agent_answer_is_sent_to_user(self):
+        """Final answer from run_claude_agent must be sent to the user."""
         import bot
-        from tools_write import create_static_site
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        # Real project, no image saved anywhere -- set_background must fail
-        # honestly via apply_existing_image_background_workflow.
-        create_static_site("kiki")
-        update = FakeUpdate("поставь любое изображение из папки на фон сайта kiki")
-        await bot.handle_text(update, FakeContext())
+        async def fake_agent(text, chat_id, **kwargs):
+            return "Сайт создан и доступен по адресу http://192.168.0.10:8700/"
 
-        replies = update.message.replies
-        self.assertTrue(any("не завершено" in r.lower() for r in replies))
-        self.assertFalse(any("готово" in r.lower() for r in replies))
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
+            update = FakeUpdate("создай сайт kiki")
+            await bot.handle_text(update, FakeContext())
+
+        self.assertTrue(any("http" in r for r in update.message.replies))
 
 
 if __name__ == "__main__":

@@ -214,39 +214,41 @@ class DynamicVerificationTests(_BaseUiComponentTest):
 
 
 class HandleTextIntegrationTests(_BaseUiComponentTest):
-    async def test_check_slider_in_kuki_does_not_call_git_tools(self):
+    async def test_handle_text_does_not_call_git_tools_directly(self):
+        """All routing goes through run_claude_agent — git tools are never
+        called directly from handle_text regardless of the message text."""
         import bot
-        from tools_write import create_static_site
-        import tools_site_operations as ops
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        create_static_site("kuki")
-        ops.op_add_slider("kuki", {})
+        async def fake_agent(text, chat_id, **kwargs):
+            return "slider result"
 
-        with patch.object(bot, "find_git_repos") as git_mock:
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent), \
+             patch.object(bot, "find_git_repos") as git_mock:
             update = FakeUpdate("проверь слайдер в kuki")
             await bot.handle_text(update, FakeContext())
 
         git_mock.assert_not_called()
-        replies = update.message.replies
-        self.assertTrue(any("slider" in r.lower() for r in replies))
-        for r in replies:
-            self.assertNotIn("tools_called", r)
+        self.assertIn("slider result", update.message.replies)
 
-    async def test_failed_component_check_never_says_gotovo(self):
+    async def test_handle_text_passes_message_to_agent(self):
+        """Agent receives the exact user text."""
         import bot
-        from tools_write import create_static_site
+        import tools_claude_agent
         from test_error_smoke import FakeContext, FakeUpdate
 
-        # No accordion markup anywhere -- container_found must be False, and
-        # the reply must say so honestly, never claim "Готово".
-        create_static_site("kuki2")
-        update = FakeUpdate("проверь гармошку в kuki2")
-        await bot.handle_text(update, FakeContext())
+        received = {}
 
-        replies = update.message.replies
-        self.assertTrue(any("не найден" in r.lower() for r in replies))
-        self.assertFalse(any("готово" in r.lower() for r in replies))
+        async def fake_agent(text, chat_id, **kwargs):
+            received["text"] = text
+            return "ok"
+
+        with patch.object(tools_claude_agent, "run_claude_agent", side_effect=fake_agent):
+            update = FakeUpdate("проверь гармошку в kuki2")
+            await bot.handle_text(update, FakeContext())
+
+        self.assertIn("kuki2", received.get("text", ""))
 
 
 if __name__ == "__main__":

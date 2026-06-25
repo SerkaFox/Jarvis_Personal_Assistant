@@ -5531,27 +5531,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = ""
-    debug_info = {"detected": {"intent": "unknown"}, "tools_called": [], "errors": []}
     try:
+        from tools_claude_agent import run_claude_agent
+
         user_text = update.message.text or ""
         chat_id, user_id = chat_user_ids(update)
-        running = get_current_task(chat_id)
-        if running and any(p in user_text.lower() for p in ("ты получил", "получил сообщение", "получил?", "ты здесь")):
-            await update.message.reply_text(
-                f"Да, получил. Сейчас выполняю задачу: {running.get('step') or '-'}.\nПрогресс: /progress"
-            )
-            return
 
-        # "что делаешь сейчас?" must read real current_task/project_state, never
-        # improvise an activity Jarvis isn't actually doing.
-        if _wants_current_activity(user_text):
-            project = _workspace_project_from_context(user_text, chat_id) or memory.get_current_project(chat_id)
-            await update.message.reply_text(project_state_manager.format_current_activity_answer(project, running))
-            return
-
-        # A quiet "да, правильно"/"нет, сломал" after a site edit retroactively
-        # tags the most recent learning_log entry for this chat -- raw material
-        # for future self-improvement, doesn't change behavior live.
+        # Feedback tag on the last learning_log entry ("да, правильно" / "нет, сломал")
         feedback_status = _detect_feedback(user_text)
         if feedback_status:
             project = memory.get_current_project(chat_id)
@@ -5560,126 +5546,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(ack)
                 return
 
-        # task_orchestrator is the single, state-driven decision point for
-        # apply_media_to_site vs edit_site vs check_site -- it resolves real
-        # entities (entity_resolver: does a workspace project by this name
-        # actually exist? is there a pending photo right now?) and picks a
-        # task_type from that state, not from several independent
-        # phrase-heuristics racing each other. This is what fixes "на сайт
-        # kiki как фон" (no photo-reference word, only target words) falling
-        # through to edit_workspace_site, and "проверь слайдер в kiki" landing
-        # in git project inspection instead of a site check. See
-        # task_orchestrator.py.
-        decision = task_orchestrator.resolve_task(user_text, chat_id)
-
-        if decision.task_type == "apply_media_to_site":
-            project = decision.workspace_project
-            if not project:
-                await update.message.reply_text("На какой сайт применить фон? Напиши имя проекта, например: hola")
-                return
-            target = "hero_background" if _wants_hero_target(user_text) else "whole_page_background"
-            if decision.media_source == "pending_media":
-                available_media = get_latest_available_media(chat_id)
-                if not available_media:
-                    await update.message.reply_text("Я не вижу последнего фото. Пришли фото еще раз.")
-                    return
-                fixed = _wants_fixed_attachment(user_text)
-                await add_background_image_workflow(
-                    update.message, context, project_name=project, media=available_media, target=target, fixed=fixed
-                )
-            else:
-                await apply_existing_image_background_workflow(
-                    update.message, context, project_name=project, target=target
-                )
-            return
-
-        # Status/feature questions about workspace websites must be intercepted
-        # before semantic/git routing. Example: "проверь, есть ли слайдер ...
-        # на сайте kuki" is a workspace-site check, not a git repo check.
-        if decision.task_type == "check_site":
-            project = decision.workspace_project
-            if not project:
-                await update.message.reply_text("Какой сайт проверить? Напиши имя проекта, например: kuki")
-                return
-            if decision.component_kind:
-                # "проверь слайдер/карусель/меню/гармонь/форму/языки/фон" names
-                # a specific UI component -- verify_ui_component_workflow runs
-                # the universal, model-driven DOM check (ui_component_model.py/
-                # ui_component_verifier.py), never git tools, never normal chat.
-                answer, debug = await verify_ui_component_workflow(project, decision.component_kind, chat_id=chat_id)
-            else:
-                answer, debug = await workspace_site_feature_check_workflow(project, user_text, chat_id=chat_id)
-            await reply_long(update.message, answer)
-            await maybe_send_intent_debug(update.message, context, debug)
-            return
-
-        # Installed plugins (plugin_manager) get first refusal on free text via
-        # their own can_handle() score -- this is the general extension point
-        # for "Jarvis doesn't know how to do X yet" cases (see
-        # plugins/workspace_inspector.py for the reference pattern: semantic
-        # routing decides applicability, a safe deterministic tool does the
-        # work, never an LLM guessing). Only dispatches when some plugin is
-        # confident; otherwise falls through to the normal router below.
-        plugin_answer = await _try_installed_plugin(user_text, update, context, chat_id)
-        if plugin_answer:
-            answer, _plugin_debug_info = plugin_answer
-            await reply_long(update.message, answer)
-            return
-
-        recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
         message_id = memory.save_message(chat_id, user_id, "user", user_text, "text")
-        use_agent = bool(context.user_data.get("agent_enabled"))
-        pending_task = pending_task_for_text(user_text)
-        debug_info["pending_task"] = pending_task
 
-        tracker = ProgressTracker(update.message) if pending_task else None
-        if pending_task and tracker:
-            await tracker.step("⏳ Принял задачу...")
-            if pending_task == "create_workspace_project":
-                project_name = _slug_from_text(user_text)
-                await tracker.step(f"🧠 Генерирую сайт {project_name}...")
-                await tracker.step("💾 Записываю файлы...")
-                if _wants_preview(user_text):
-                    await tracker.step("🧪 Проверяю сайт...")
-            elif pending_task == "edit_workspace_site":
-                await tracker.step("🧠 Генерирую изменения...")
-                await tracker.step("💾 Записываю файлы...")
-                await tracker.step("🧪 Проверяю сайт...")
-            else:
-                await tracker.step("🧠 Определяю проект и контекст...")
+        async def _progress(step: str) -> None:
+            try:
+                await update.message.reply_text(step)
+            except Exception:
+                pass
 
-        try:
-            answer, debug_info = answer_user_text(
-                user_text,
-                use_agent,
-                chat_id=chat_id,
-                recent_messages=recent,
-                debug=bool(context.user_data.get("agent_debug")),
-            )
-            if not isinstance(debug_info, dict):
-                debug_info = {}
-            debug_info.setdefault("pending_task", pending_task)
-            if (debug_info.get("detected") or {}).get("intent") in ("normal_chat", "unknown") and semantic_router.is_action_like(
-                user_text
-            ):
-                intercepted = await _maybe_handle_via_plugin_or_selfdev(user_text, update, context, chat_id)
-                if intercepted:
-                    answer, intercepted_debug = intercepted
-                    intercepted_debug.setdefault("pending_task", pending_task)
-                    debug_info = intercepted_debug
-        except requests.exceptions.ConnectionError as e:
-            save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
-            answer = "Ошибка подключения к внешнему сервису. Детали: " + str(e)
-            debug_info = {"detected": {"intent": "connection_error"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
-        except requests.exceptions.Timeout as e:
-            save_last_error(chat_id=chat_id, user_id=user_id, handler="handle_text", error=e, user_text=user_text)
-            answer = "Сервис не ответил вовремя. Попробуй ещё раз."
-            debug_info = {"detected": {"intent": "timeout"}, "tools_called": [], "errors": [str(e)], "pending_task": pending_task}
+        answer = await run_claude_agent(user_text, chat_id, progress_callback=_progress)
 
-        if tracker:
-            await tracker.step("✅ Готово.")
-
-        await maybe_send_intent_debug(update.message, context, debug_info)
         memory.save_message(chat_id, user_id, "assistant", answer, "text")
         memory.save_memory_candidates(user_text, answer, message_id)
         await reply_long(update.message, answer)
@@ -5732,25 +5608,8 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
         message_id = memory.save_message(chat_id, user_id, "user", recognized_text, "voice")
         await message.reply_text(f"🎙 Распознал:\n{memory.mask_secrets(recognized_text)[:1000]}")
 
-        use_agent = bool(context.user_data.get("agent_enabled"))
-        recent = memory.recent_messages(chat_id, config.HISTORY_LIMIT)
-        pending_task = pending_task_for_text(recognized_text)
-        if pending_task:
-            await progress(message, f"Принял задачу: {pending_task}")
-            await progress(message, "Шаг 1/4: определяю проект и контекст...")
-            await progress(message, "Шаг 2/4: вызываю безопасные tools...")
-        answer, debug_info = answer_user_text(
-            recognized_text,
-            use_agent,
-            chat_id=chat_id,
-            recent_messages=recent,
-            debug=bool(context.user_data.get("agent_debug")),
-        )
-        if pending_task:
-            debug_info["pending_task"] = pending_task
-            await progress(message, "Шаг 3/4: проверяю результат...")
-            await progress(message, "Шаг 4/4: готовлю ответ...")
-        await maybe_send_intent_debug(message, context, debug_info)
+        from tools_claude_agent import run_claude_agent
+        answer = await run_claude_agent(recognized_text, chat_id)
         memory.save_message(chat_id, user_id, "assistant", answer, "voice")
         memory.save_memory_candidates(recognized_text, answer, message_id)
         await reply_long(message, answer)

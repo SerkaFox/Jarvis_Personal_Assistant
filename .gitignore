@@ -37,3 +37,10 @@ jarvis_workspace/
 server_tools.py
 
 .DS_Store
+
+# Local backups and runtime state
+.env.bak*
+*.bak-*
+*.bak
+data/email_seen_uids*.json
+data/task_orchestrator_decisions.json

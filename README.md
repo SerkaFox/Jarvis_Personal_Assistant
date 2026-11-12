@@ -2,6 +2,15 @@
 
 Telegram bot for local Jarvis responses through Ollama, STT, and optional local TTS.
 
+<!-- readme-screenshots -->
+## How it works
+
+<p align="center">
+  <img src="docs/screenshots/jarvis.jpg" alt="Voice in → local LLM → voice out, plus e-mail alerts (AI-generated illustration)" width="100%">
+</p>
+<p align="center"><em>Voice in → local LLM → voice out, plus e-mail alerts <sub>(AI-generated illustration)</sub></em></p>
+<!-- readme-screenshots -->
+
 ## Local TTS with Piper
 
 The bot can synthesize voice replies for incoming Telegram `voice` and `audio` messages. Text messages still receive text-only replies.
